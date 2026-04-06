@@ -1,0 +1,7 @@
+.{
+    .fingerprint = 0xf5d14abed9827457,
+    .paths = .{""},
+    .minimum_zig_version = "0.16.0-dev.3131+8bd0af5eb",
+    .name = .doggystyle,
+    .version = "0.0.0",
+}
