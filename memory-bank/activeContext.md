@@ -1,15 +1,18 @@
-# Active Context: Scaling to OS-Truth
+# Active Context: Surgical Packet Filter Refactor
 
 ## Current Work
-Implementing dynamic OS-specific network signatures (JA4/JA4T) and ensuring handshake stability through manual ACK injection.
+Implemented strict 3-field packet validation in the raw socket listener to eliminate global background noise capture. The completeHandshake loop now only processes packets that pass: IPv4 Protocol==TCP, Source IP==Target IP, Destination Port==Our Bound Port.
 
 ## Recent Decisions
-- **JA4S Verification Loop**: Refactored to dynamically calculate TCP Data Offset, correctly handling variable-length TCP options (e.g., Timestamps) for Server Hello parsing.
-- **TLS Record Layer**: Added missing 5-byte Record Header (0x16 0x03 0x01 + 2-byte Length) to Client Hello to prevent server-side rejection.
-- **PacketWriter Discipline**: Introduced `PacketWriter` struct with `std.debug.assert` bounds checking for all packet construction to replace manual buffer management.
-- **MTU/DF Handling**: Cleared the IP `Don't Fragment` (DF) bit and increased `tls_client_hello_mss_limit` to 1500 to handle larger packets/fragmentation gracefully.
+- **Source IP Filtering Enabled**: Reversed the `null` source IP decision. Now strictly validates `Source IP == ctx.dst_ip` in both the handshake loop and JA4S verification loop. This eliminates all non-target traffic.
+- **Post-Handshake TCP Options Fixed**: ACK and DATA packets now use standard `NOP+NOP+Timestamps` (12 bytes), not SYN-only options (SACK Permitted, Window Scale). Per RFC 793/7323, SACK and WS are SYN-only and cause server-side state confusion when present in post-handshake packets.
+- **MTU Raised to 1500**: Changed from 1492 (PPPoE-safe) to 1500 (standard Ethernet MTU) per user requirement.
+- **Jitter Range 8-15ms**: Changed from 5-12ms to 8-15ms organic jitter between ACK and TLS Client Hello.
+- **Logging After Filter**: `INBOUND PACKET` log moved after the surgical filter. Non-matching packets are silently dropped — no noise in output.
+- **TLS Alert Parsing**: Added `parseTlsAlertDescription()` with full RFC 8446 alert code lookup table.
+- **verify.sh Rewrite**: Fully autonomous, zero-intervention verification script matching new log patterns.
 
 ## Open Questions/Tasks
-- **Windows Porting**: Implementation for `getInterfaceIp` and `WindowsRawSocket` is pending.
-- **Memory Safety Hardening**: Continue replacing manual pointer arithmetic with `PacketWriter` methods across the engine.
-- **TLS Extensions**: Further refinement of extension order (SNI, ALPN, Renegotiation, etc.) to match Chrome exactly.
+- **Anycast Compatibility**: Source IP filtering may reject legitimate responses from Cloudflare anycast IPs that differ from the target. Monitor for false negatives against CDN targets.
+- **Windows Porting**: `WindowsRawSocket` still returns `error.NotImplemented`.
+- **TLS Extension Order**: Further refinement possible to exactly match Chrome's current JA4 signature.
