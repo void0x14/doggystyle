@@ -458,14 +458,75 @@ fn fillHybridKeyShare(buffer: *[hybrid_keyshare_len]u8) !void {
     try fillEntropy(buffer[mlkem768_share_len..]);
 }
 
-fn tlsHelloAllocator() std.mem.Allocator {
-    return if (builtin.is_test) std.testing.allocator else std.heap.page_allocator;
-}
-
 fn appendInt(list: *std.array_list.Managed(u8), comptime T: type, value: T) !void {
     var bytes: [@divExact(@typeInfo(T).int.bits, 8)]u8 = undefined;
     mem.writeInt(T, &bytes, value, .big);
     try list.appendSlice(&bytes);
+}
+
+const FixedTlsWriter = struct {
+    buffer: []u8,
+    index: usize = 0,
+
+    fn ensureCapacity(self: *const FixedTlsWriter, count: usize) void {
+        if (self.index + count > self.buffer.len) {
+            @panic("Buffer overflow detected before corruption");
+        }
+    }
+
+    fn writeByte(self: *FixedTlsWriter, value: u8) void {
+        self.ensureCapacity(1);
+        self.buffer[self.index] = value;
+        self.index += 1;
+    }
+
+    fn writeSlice(self: *FixedTlsWriter, value: []const u8) void {
+        self.ensureCapacity(value.len);
+        @memcpy(self.buffer[self.index .. self.index + value.len], value);
+        self.index += value.len;
+    }
+
+    fn writeInt(self: *FixedTlsWriter, comptime T: type, value: T) void {
+        const len = @divExact(@typeInfo(T).int.bits, 8);
+        var bytes: [len]u8 = undefined;
+        mem.writeInt(T, &bytes, value, .big);
+        self.ensureCapacity(len);
+        @memcpy(self.buffer[self.index .. self.index + len], &bytes);
+        self.index += len;
+    }
+
+    fn patchInt(self: *FixedTlsWriter, comptime T: type, offset: usize, value: T) void {
+        const len = @divExact(@typeInfo(T).int.bits, 8);
+        var bytes: [len]u8 = undefined;
+        mem.writeInt(T, &bytes, value, .big);
+        if (offset + len > self.buffer.len) {
+            @panic("Buffer overflow detected before corruption");
+        }
+        @memcpy(self.buffer[offset .. offset + len], &bytes);
+    }
+};
+
+fn tlsClientHelloExtensionsLen(server_name_len: usize) usize {
+    return 4 +
+        (9 + server_name_len) +
+        4 +
+        5 +
+        14 +
+        6 +
+        4 +
+        18 +
+        9 +
+        30 +
+        4 +
+        (4 + 2 + 2 + 2 + hybrid_keyshare_len) +
+        6 +
+        9 +
+        7 +
+        (4 + ech_grease_payload_len);
+}
+
+fn tlsClientHelloLen(server_name: []const u8) usize {
+    return 4 + 2 + 32 + 1 + 0 + 2 + (15 * 2) + 1 + 1 + 2 + tlsClientHelloExtensionsLen(server_name.len);
 }
 
 // ------------------------------------------------------------
@@ -477,7 +538,18 @@ const TcpOption = struct {
     data: []const u8,
 };
 
-pub fn buildTCPSyn(
+fn tcpOptionsLen(options: []const TcpOption) usize {
+    var len: usize = 0;
+    for (options) |opt| len += opt.len;
+    return len;
+}
+
+fn tcpOptionsPadding(options_len: usize) usize {
+    return (4 - (options_len % 4)) % 4;
+}
+
+pub fn buildTCPSynAlloc(
+    allocator: std.mem.Allocator,
     io: std.Io,
     src_ip: u32,
     dst_ip: u32,
@@ -516,82 +588,76 @@ pub fn buildTCPSyn(
         .{ .kind = 8, .len = 10, .data = &ts_data },
     };
 
-    // Calculate total options length
-    var opt_len: u8 = 0;
-    for (options) |opt| {
-        opt_len += opt.len;
-    }
-    // TCP header without options is 20 bytes
-    const tcp_len = 20 + opt_len;
-    const tcp_off = (tcp_len / 4) << 4; // data offset in 32-bit words
+    const options_len = tcpOptionsLen(&options);
+    const options_padding = tcpOptionsPadding(options_len);
+    const tcp_len = 20 + options_len + options_padding;
+    const total_len = 20 + tcp_len;
+    const tcp_data_offset: u8 = @intCast((tcp_len / 4) << 4);
 
-    // Build packet (simplified IP + TCP)
-    // IP header (20 bytes no options)
-    var ip_header = [_]u8{
-        0x45, 0x00, 0x00, 0x00, // version, IHL, TOS, total len (fill later)
-        0x00, 0x00, // ID
-        0x40, 0x00, // flags+frag offset (DF)
-        0x40, // TTL (64 for Linux, 128 for Windows)
-        0x06, // protocol TCP
-        0x00, 0x00, // checksum (calc later)
-        0x00, 0x00, 0x00, 0x00, // src IP
-        0x00, 0x00, 0x00, 0x00, // dst IP
-    };
-    if (is_linux) ip_header[8] = 64 else ip_header[8] = 128; // TTL
+    const packet = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(packet);
+    @memset(packet, 0);
+
+    const ip_header = packet[0..20];
+    ip_header[0] = 0x45;
+    ip_header[1] = 0x00;
+    ip_header[4] = 0x00;
+    ip_header[5] = 0x00;
+    ip_header[6] = 0x40;
+    ip_header[7] = 0x00;
+    ip_header[8] = if (is_linux) 64 else 128;
+    ip_header[9] = 0x06;
+    mem.writeInt(u16, ip_header[2..4], @as(u16, @intCast(total_len)), .big);
     mem.writeInt(u32, ip_header[12..16], src_ip, .big);
     mem.writeInt(u32, ip_header[16..20], dst_ip, .big);
 
-    // TCP header
-    var tcp_header = [_]u8{
-        0x00, 0x00, // src port
-        0x00, 0x00, // dst port
-        0x00, 0x00, 0x00, 0x00, // seq
-        0x00, 0x00, 0x00, 0x00, // ack (0 for SYN)
-        (tcp_off << 4) | 0x02, // data offset + flags (SYN)
-        0x00, 0x00, // window (dynamic)
-        0x00, 0x00, // checksum
-        0x00, 0x00, // urgent pointer
-    };
+    const tcp_header = packet[20 .. 20 + 20];
     mem.writeInt(u16, tcp_header[0..2], src_port, .big);
     mem.writeInt(u16, tcp_header[2..4], dst_port, .big);
     mem.writeInt(u32, tcp_header[4..8], seq_num, .big);
-    // Window size: dynamic (not hardcoded) - typical Chrome uses 65535, but we'll fetch from OS
-    const win_size = try getWindowSize();
-    mem.writeInt(u16, tcp_header[14..16], win_size, .big);
+    mem.writeInt(u32, tcp_header[8..12], 0, .big);
+    tcp_header[12] = tcp_data_offset;
+    tcp_header[13] = 0x02;
+    mem.writeInt(u16, tcp_header[14..16], try getWindowSize(), .big);
+    mem.writeInt(u16, tcp_header[16..18], 0, .big);
+    mem.writeInt(u16, tcp_header[18..20], 0, .big);
 
-    // Concatenate options
-    var tcp_with_opts = std.array_list.Managed(u8).init(std.heap.page_allocator);
-    defer tcp_with_opts.deinit();
-    try tcp_with_opts.appendSlice(&tcp_header);
+    var option_index: usize = 40;
     for (options) |opt| {
-        try tcp_with_opts.append(opt.kind);
+        packet[option_index] = opt.kind;
+        option_index += 1;
         if (opt.len > 1) {
-            try tcp_with_opts.append(opt.len);
-            try tcp_with_opts.appendSlice(opt.data);
+            packet[option_index] = opt.len;
+            option_index += 1;
+            @memcpy(packet[option_index .. option_index + opt.data.len], opt.data);
+            option_index += opt.data.len;
         }
     }
+    for (0..options_padding) |_| {
+        packet[option_index] = 0;
+        option_index += 1;
+    }
+    if (option_index != total_len) {
+        @panic("SYN packet serialized length mismatch");
+    }
 
-    // Final packet = IP header + TCP segment
-    const total_len = ip_header.len + tcp_with_opts.items.len;
-    mem.writeInt(u16, ip_header[2..4], @as(u16, @intCast(total_len)), .big);
-    // IP checksum
-    const ip_checksum = computeChecksum(&ip_header);
-    mem.writeInt(u16, ip_header[10..12], ip_checksum, .big);
+    mem.writeInt(u16, ip_header[10..12], computeChecksum(ip_header), .big);
 
-    var packet = try std.array_list.Managed(u8).initCapacity(std.heap.page_allocator, total_len);
-    errdefer packet.deinit();
-    packet.appendSliceAssumeCapacity(&ip_header);
-    packet.appendSliceAssumeCapacity(tcp_with_opts.items);
+    const tcp_segment = packet[20..];
+    mem.writeInt(u16, tcp_segment[16..18], computeTcpChecksum(src_ip, dst_ip, tcp_segment), .big);
 
-    // TCP pseudo header checksum
-    const tcp_segment = packet.items[ip_header.len..];
-    const tcp_checksum = computeTcpChecksum(src_ip, dst_ip, tcp_segment);
-    mem.writeInt(u16, tcp_segment[16..18], tcp_checksum, .big);
-    // Update the packet buffer
-    packet.items[ip_header.len + 16] = @truncate((tcp_checksum >> 8) & 0xFF);
-    packet.items[ip_header.len + 17] = @truncate(tcp_checksum & 0xFF);
+    return packet;
+}
 
-    return packet.toOwnedSlice();
+pub fn buildTCPSyn(
+    io: std.Io,
+    src_ip: u32,
+    dst_ip: u32,
+    src_port: u16,
+    dst_port: u16,
+    seq_num: u32,
+) ![]u8 {
+    return buildTCPSynAlloc(std.heap.page_allocator, io, src_ip, dst_ip, src_port, dst_port, seq_num);
 }
 
 fn getWindowSize() !u16 {
@@ -693,7 +759,7 @@ const ExtensionType = enum(u16) {
     ech_grease = ech_grease_extension,
 };
 
-pub fn buildTLSClientHello(server_name: []const u8) ![]u8 {
+pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []const u8) ![]u8 {
     if (server_name.len > max_supported_server_name_len) return error.ServerNameTooLong;
 
     const cipher_suites = [_]CipherSuite{
@@ -714,8 +780,6 @@ pub fn buildTLSClientHello(server_name: []const u8) ![]u8 {
         .TLS_RSA_WITH_AES_256_GCM_SHA384,
     };
 
-    const allocator = tlsHelloAllocator();
-
     var random: [32]u8 = undefined;
     try fillEntropy(&random);
     var ech_grease_payload = [_]u8{0} ** ech_grease_payload_len;
@@ -726,96 +790,102 @@ pub fn buildTLSClientHello(server_name: []const u8) ![]u8 {
 
     const session_id = &[_]u8{};
 
-    var ch = std.array_list.Managed(u8).init(allocator);
-    const len_pos = ch.items.len;
-    try ch.append(0x01);
-    try appendInt(&ch, u24, 0);
-    try appendInt(&ch, u16, 0x0303);
-    try ch.appendSlice(&random);
-    try ch.append(0);
-    try ch.appendSlice(session_id);
+    const total_len = tlsClientHelloLen(server_name);
+    if (total_len > tls_client_hello_mss_limit) return error.ClientHelloTooLarge;
+
+    const buffer = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(buffer);
+    var ch = FixedTlsWriter{ .buffer = buffer };
+
+    const len_pos = ch.index;
+    ch.writeByte(0x01);
+    ch.writeInt(u24, 0);
+    ch.writeInt(u16, 0x0303);
+    ch.writeSlice(&random);
+    ch.writeByte(0);
+    ch.writeSlice(session_id);
 
     const cs_len: u16 = @intCast(cipher_suites.len * 2);
-    try appendInt(&ch, u16, cs_len);
+    ch.writeInt(u16, cs_len);
     for (cipher_suites) |cs| {
-        try appendInt(&ch, u16, @intFromEnum(cs));
+        ch.writeInt(u16, @intFromEnum(cs));
     }
 
-    try ch.append(0x01);
-    try ch.append(0x00);
+    ch.writeByte(0x01);
+    ch.writeByte(0x00);
 
-    const ext_len_pos = ch.items.len;
-    try appendInt(&ch, u16, 0);
+    const ext_len_pos = ch.index;
+    ch.writeInt(u16, 0);
 
     // 1. GREASE placeholder
-    try appendInt(&ch, u16, grease_value);
-    try appendInt(&ch, u16, 0);
+    ch.writeInt(u16, grease_value);
+    ch.writeInt(u16, 0);
 
     // 2. server_name
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.server_name));
-    const sn_len_pos = ch.items.len;
-    try appendInt(&ch, u16, 0);
-    try appendInt(&ch, u16, @as(u16, @intCast(server_name.len + 3)));
-    try ch.append(0);
-    try appendInt(&ch, u16, @as(u16, @intCast(server_name.len)));
-    try ch.appendSlice(server_name);
-    const sn_total_len = @as(u16, @intCast(ch.items.len - sn_len_pos - 2));
-    mem.writeInt(u16, ch.items[sn_len_pos .. sn_len_pos + 2][0..2], sn_total_len, .big);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.server_name));
+    const sn_len_pos = ch.index;
+    ch.writeInt(u16, 0);
+    ch.writeInt(u16, @as(u16, @intCast(server_name.len + 3)));
+    ch.writeByte(0);
+    ch.writeInt(u16, @as(u16, @intCast(server_name.len)));
+    ch.writeSlice(server_name);
+    const sn_total_len = @as(u16, @intCast(ch.index - sn_len_pos - 2));
+    ch.patchInt(u16, sn_len_pos, sn_total_len);
 
     // 3. extended_master_secret (empty)
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.extended_master_secret));
-    try appendInt(&ch, u16, 0);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.extended_master_secret));
+    ch.writeInt(u16, 0);
 
     // 4. renegotiation_info (empty)
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.renegotiation_info));
-    try appendInt(&ch, u16, 1);
-    try ch.append(0x00);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.renegotiation_info));
+    ch.writeInt(u16, 1);
+    ch.writeByte(0x00);
 
     // 5. supported_groups
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.supported_groups));
-    const sg_len_pos = ch.items.len;
-    try appendInt(&ch, u16, 0);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.supported_groups));
+    const sg_len_pos = ch.index;
+    ch.writeInt(u16, 0);
     const groups = [_]u16{ grease_value, x25519_mlkem768_group, 0x001D, 0x0017 };
-    try appendInt(&ch, u16, @as(u16, @intCast(groups.len * 2)));
+    ch.writeInt(u16, @as(u16, @intCast(groups.len * 2)));
     for (groups) |g| {
-        try appendInt(&ch, u16, g);
+        ch.writeInt(u16, g);
     }
-    const sg_total_len = @as(u16, @intCast(ch.items.len - sg_len_pos - 2));
-    mem.writeInt(u16, ch.items[sg_len_pos .. sg_len_pos + 2][0..2], sg_total_len, .big);
+    const sg_total_len = @as(u16, @intCast(ch.index - sg_len_pos - 2));
+    ch.patchInt(u16, sg_len_pos, sg_total_len);
 
     // 6. ec_point_formats (uncompressed)
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.ec_point_formats));
-    try appendInt(&ch, u16, 2);
-    try ch.append(1);
-    try ch.append(0x00);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.ec_point_formats));
+    ch.writeInt(u16, 2);
+    ch.writeByte(1);
+    ch.writeByte(0x00);
 
     // 7. session_ticket (empty)
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.session_ticket));
-    try appendInt(&ch, u16, 0);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.session_ticket));
+    ch.writeInt(u16, 0);
 
     // 8. ALPN (h2, http/1.1)
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.application_layer_protocol_negotiation));
-    const alpn_len_pos = ch.items.len;
-    try appendInt(&ch, u16, 0);
-    try appendInt(&ch, u16, 12);
-    try ch.append(2);
-    try ch.appendSlice("h2");
-    try ch.append(8);
-    try ch.appendSlice("http/1.1");
-    const alpn_total_len = @as(u16, @intCast(ch.items.len - alpn_len_pos - 2));
-    mem.writeInt(u16, ch.items[alpn_len_pos .. alpn_len_pos + 2][0..2], alpn_total_len, .big);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.application_layer_protocol_negotiation));
+    const alpn_len_pos = ch.index;
+    ch.writeInt(u16, 0);
+    ch.writeInt(u16, 12);
+    ch.writeByte(2);
+    ch.writeSlice("h2");
+    ch.writeByte(8);
+    ch.writeSlice("http/1.1");
+    const alpn_total_len = @as(u16, @intCast(ch.index - alpn_len_pos - 2));
+    ch.patchInt(u16, alpn_len_pos, alpn_total_len);
 
     // 9. status_request (OCSP)
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.status_request));
-    try appendInt(&ch, u16, 5);
-    try ch.append(0x01); // OCSP
-    try appendInt(&ch, u16, 0); // responder id list length
-    try appendInt(&ch, u16, 0); // request extensions length
+    ch.writeInt(u16, @intFromEnum(ExtensionType.status_request));
+    ch.writeInt(u16, 5);
+    ch.writeByte(0x01);
+    ch.writeInt(u16, 0);
+    ch.writeInt(u16, 0);
 
     // 10. signature_algorithms
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.signature_algorithms));
-    const sig_len_pos = ch.items.len;
-    try appendInt(&ch, u16, 0);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.signature_algorithms));
+    const sig_len_pos = ch.index;
+    ch.writeInt(u16, 0);
     const sig_algs = [_]u16{
         0x0403, // ecdsa_secp256r1_sha256
         0x0503, // ecdsa_secp384r1_sha384
@@ -830,64 +900,70 @@ pub fn buildTLSClientHello(server_name: []const u8) ![]u8 {
         0x0202, // rsa_pkcs1_sha384
         0x0203, // rsa_pkcs1_sha512
     };
-    try appendInt(&ch, u16, @as(u16, @intCast(sig_algs.len * 2)));
+    ch.writeInt(u16, @as(u16, @intCast(sig_algs.len * 2)));
     for (sig_algs) |sa| {
-        try appendInt(&ch, u16, sa);
+        ch.writeInt(u16, sa);
     }
-    const sig_total_len = @as(u16, @intCast(ch.items.len - sig_len_pos - 2));
-    mem.writeInt(u16, ch.items[sig_len_pos .. sig_len_pos + 2][0..2], sig_total_len, .big);
+    const sig_total_len = @as(u16, @intCast(ch.index - sig_len_pos - 2));
+    ch.patchInt(u16, sig_len_pos, sig_total_len);
 
     // 11. signed_certificate_timestamp (empty)
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.signed_certificate_timestamp));
-    try appendInt(&ch, u16, 0);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.signed_certificate_timestamp));
+    ch.writeInt(u16, 0);
 
     // 12. key_share (single X25519MLKEM768 hybrid block)
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.key_share));
-    const ks_len_pos = ch.items.len;
-    try appendInt(&ch, u16, 0);
-    try appendInt(&ch, u16, @as(u16, @intCast(2 + 2 + hybrid_keyshare_len)));
-    try appendInt(&ch, u16, x25519_mlkem768_group);
-    try appendInt(&ch, u16, @as(u16, @intCast(hybrid_keyshare_len)));
-    try ch.appendSlice(&hybrid_keyshare);
-    const ks_total_len = @as(u16, @intCast(ch.items.len - ks_len_pos - 2));
-    mem.writeInt(u16, ch.items[ks_len_pos .. ks_len_pos + 2][0..2], ks_total_len, .big);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.key_share));
+    const ks_len_pos = ch.index;
+    ch.writeInt(u16, 0);
+    ch.writeInt(u16, @as(u16, @intCast(2 + 2 + hybrid_keyshare_len)));
+    ch.writeInt(u16, x25519_mlkem768_group);
+    ch.writeInt(u16, @as(u16, @intCast(hybrid_keyshare_len)));
+    ch.writeSlice(&hybrid_keyshare);
+    const ks_total_len = @as(u16, @intCast(ch.index - ks_len_pos - 2));
+    ch.patchInt(u16, ks_len_pos, ks_total_len);
 
     // 13. psk_key_exchange_modes
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.psk_key_exchange_modes));
-    try appendInt(&ch, u16, 2);
-    try ch.append(1);
-    try ch.append(0x01); // psk_ke
+    ch.writeInt(u16, @intFromEnum(ExtensionType.psk_key_exchange_modes));
+    ch.writeInt(u16, 2);
+    ch.writeByte(1);
+    ch.writeByte(0x01);
 
     // 14. supported_versions
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.supported_versions));
-    try appendInt(&ch, u16, 5);
-    try ch.append(4); // versions length
-    try appendInt(&ch, u16, 0x0304); // TLS 1.3
-    try appendInt(&ch, u16, 0x0303); // TLS 1.2
+    ch.writeInt(u16, @intFromEnum(ExtensionType.supported_versions));
+    ch.writeInt(u16, 5);
+    ch.writeByte(4);
+    ch.writeInt(u16, 0x0304);
+    ch.writeInt(u16, 0x0303);
 
     // 15. compress_certificate (brotli)
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.compress_certificate));
-    try appendInt(&ch, u16, 3);
-    try ch.append(2);
-    try appendInt(&ch, u16, 0x0002);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.compress_certificate));
+    ch.writeInt(u16, 3);
+    ch.writeByte(2);
+    ch.writeInt(u16, 0x0002);
 
     // 16. ECH GREASE placeholder
-    try appendInt(&ch, u16, @intFromEnum(ExtensionType.ech_grease));
-    try appendInt(&ch, u16, ech_grease_payload_len);
-    try ch.appendSlice(&ech_grease_payload);
+    ch.writeInt(u16, @intFromEnum(ExtensionType.ech_grease));
+    ch.writeInt(u16, ech_grease_payload_len);
+    ch.writeSlice(&ech_grease_payload);
 
-    // Finalize extension total length
-    const ext_total_len = @as(u16, @intCast(ch.items.len - ext_len_pos - 2));
-    mem.writeInt(u16, ch.items[ext_len_pos .. ext_len_pos + 2][0..2], ext_total_len, .big);
+    const ext_total_len = @as(u16, @intCast(ch.index - ext_len_pos - 2));
+    ch.patchInt(u16, ext_len_pos, ext_total_len);
 
-    // Fill handshake length
-    const handshake_len = ch.items.len - 4;
-    mem.writeInt(u24, ch.items[len_pos + 1 .. len_pos + 4][0..3], @as(u24, @intCast(handshake_len)), .big);
+    const handshake_len = ch.index - 4;
+    ch.patchInt(u24, len_pos + 1, @as(u24, @intCast(handshake_len)));
 
-    if (ch.items.len > tls_client_hello_mss_limit) {
+    if (ch.index != total_len) {
+        @panic("TLS ClientHello serialized length mismatch");
+    }
+
+    if (total_len > tls_client_hello_mss_limit) {
         return error.ClientHelloTooLarge;
     }
-    return ch.toOwnedSlice();
+    return buffer;
+}
+
+pub fn buildTLSClientHello(server_name: []const u8) ![]u8 {
+    return buildTLSClientHelloAlloc(std.heap.page_allocator, server_name);
 }
 
 // ------------------------------------------------------------
@@ -945,7 +1021,7 @@ pub fn main(init: std.process.Init) !void {
     const seq_num = @as(u32, @intCast(current_ms));
 
     // Build TCP SYN
-    const syn_packet = try buildTCPSyn(init.io, src_ip, dst_ip, src_port, dest_port, seq_num);
+    const syn_packet = try buildTCPSynAlloc(allocator, init.io, src_ip, dst_ip, src_port, dest_port, seq_num);
     defer allocator.free(syn_packet);
 
     // Send SYN
@@ -953,7 +1029,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Sent {} bytes SYN packet\n", .{sent});
 
     // Build TLS Client Hello (for demonstration)
-    const tls_ch = try buildTLSClientHello("www.example.com");
+    const tls_ch = try buildTLSClientHelloAlloc(allocator, "www.example.com");
     defer allocator.free(tls_ch);
     std.debug.print("TLS Client Hello size: {} bytes\n", .{tls_ch.len});
 }
@@ -1060,7 +1136,7 @@ test "hybrid key share length matches X25519MLKEM768" {
 }
 
 test "client hello matches JA4 structural counts" {
-    const hello = try buildTLSClientHello("www.example.com");
+    const hello = try buildTLSClientHelloAlloc(std.testing.allocator, "www.example.com");
     defer std.testing.allocator.free(hello);
 
     const summary = try summarizeTlsHello(hello);
@@ -1071,6 +1147,26 @@ test "client hello matches JA4 structural counts" {
     try std.testing.expect(summary.has_alpn);
     try std.testing.expect(summary.has_ech_placeholder);
     try std.testing.expect(hello.len <= 1460);
+}
+
+test "client hello exact size matches serializer output" {
+    const expected_len = tlsClientHelloLen("www.example.com");
+    const hello = try buildTLSClientHelloAlloc(std.testing.allocator, "www.example.com");
+    defer std.testing.allocator.free(hello);
+
+    try std.testing.expectEqual(expected_len, hello.len);
+}
+
+test "syn packet exact size matches serializer output" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    const packet = try buildTCPSynAlloc(std.testing.allocator, threaded.io(), 0x7F000001, 0x01010101, 50000, 443, 1);
+    defer std.testing.allocator.free(packet);
+
+    try std.testing.expectEqual(@as(usize, 64), packet.len);
+    try std.testing.expectEqual(@as(u8, 0xB0), packet[32]);
+    try std.testing.expectEqual(@as(u8, 0x02), packet[33]);
 }
 
 test "parse default route interface from proc table" {

@@ -68,5 +68,23 @@ Bu dosya, projede standart Zig stdlib veya tipik Zig iskeleti disinda bizim elle
 - Bunlar proje tarafinda JA4/Chrome hizalama hedefi icin manuel secildi.
 
 12. Halen dikkat edilmesi gereken konu
-- Runtime'da `buildTLSClientHello()` donen buffer'in hangi allocator ile ayrildigi ve hangi allocator ile free edildigi birebir eslesmeli.
-- Bu alan memory ownership acisindan kritik oldugu icin ayrica debug edilmesi gerekiyor.
+ - Runtime'da `buildTLSClientHelloAlloc(allocator, ...)` donen buffer, ayni allocator ile free edilmelidir.
+ - `main` artik TLS buffer'ini `init.gpa` ile ayirip yine `init.gpa` ile free eder.
+
+13. Exact-size TLS allocation ve overflow korumasi
+- `tlsClientHelloLen(server_name)` ile ClientHello boyutu onceden tam hesaplanir.
+- `buildTLSClientHelloAlloc()` dogrudan o boy kadar `allocator.alloc()` yapar.
+- `FixedTlsWriter` icinde her yazimdan once sinir kontrolu vardir.
+- Tasma riski gorulurse `@panic("Buffer overflow detected before corruption")` cagrilir.
+- Sonunda serialize edilen uzunluk ile beklenen toplam uzunluk esit degilse `@panic("TLS ClientHello serialized length mismatch")` cagrilir.
+
+14. Exact-size SYN allocation ve ownership duzeltmesi
+- `buildTCPSynAlloc(allocator, ...)` eklendi.
+- `main` artik `syn_packet` icin `init.gpa` kullanir ve ayni allocator ile free eder.
+- Boylece onceki `page_allocator` vs `init.gpa` mismatch'i kapatildi.
+- SYN serializer artik exact-size packet ayirir ve son uzunlugu kontrol eder.
+- TCP header iki byte olarak duzeltildi:
+  - byte 12: data offset
+  - byte 13: flags
+- TCP options 4-byte alignment icin pad edilir.
+- Son serialize uzunlugu beklenen boyla uyusmazsa `@panic("SYN packet serialized length mismatch")` cagrilir.
