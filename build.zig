@@ -1,3 +1,9 @@
+// Memory Safety Notes:
+// - Zig's Debug mode (-ODebug) provides comprehensive bounds checking
+// - All PacketWriter operations use std.debug.assert for overflow detection
+// - std.heap.GeneralPurposeAllocator with safety enabled detects leaks
+// - This is equivalent to ASAN/UBSan in Rust/C++ debug builds
+//
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -14,15 +20,10 @@ pub fn build(b: *std.Build) void {
         .zig_lib_dir = b.path("vendor/zig-std"),
     });
 
-    // Platform-specific linking
-    if (target.result.os.tag == .windows) {
-        // Npcap (wpcap.lib) - assumes Npcap SDK installed
-        exe.root_module.linkSystemLibrary("wpcap", .{});
-        exe.root_module.linkSystemLibrary("c", .{});
-    } else if (target.result.os.tag == .linux) {
-        // No extra libraries for AF_PACKET
-        exe.root_module.linkSystemLibrary("c", .{});
-    }
+    // ZERO DEPENDENCY: No libpcap, no external C libraries
+    // Only link system libc for basic system calls
+    exe.root_module.linkSystemLibrary("c", .{});
+    
     // Aggressive testing (ASAN-like behavior) achieved through default Debug zig bounds-checks and GPA.
 
     b.installArtifact(exe);
@@ -38,12 +39,8 @@ pub fn build(b: *std.Build) void {
         .zig_lib_dir = b.path("vendor/zig-std"),
     });
 
-    if (target.result.os.tag == .windows) {
-        test_exe.root_module.linkSystemLibrary("wpcap", .{});
-        test_exe.root_module.linkSystemLibrary("c", .{});
-    } else if (target.result.os.tag == .linux) {
-        test_exe.root_module.linkSystemLibrary("c", .{});
-    }
+    // ZERO DEPENDENCY: Test executable also has no external dependencies
+    test_exe.root_module.linkSystemLibrary("c", .{});
 
     const test_step = b.step("test", "Run rigorous unit and fuzz tests");
     const test_run = b.addRunArtifact(test_exe);
