@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
     // ZERO DEPENDENCY: No libpcap, no external C libraries
     // Only link system libc for basic system calls
     exe.root_module.linkSystemLibrary("c", .{});
-    
+
     // Aggressive testing (ASAN-like behavior) achieved through default Debug zig bounds-checks and GPA.
 
     b.installArtifact(exe);
@@ -51,7 +51,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-
 
     const run_step = b.step("run", "Run the ghost engine");
     run_step.dependOn(&run_cmd.step);

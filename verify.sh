@@ -80,19 +80,31 @@ else
     log_warn "Handshake ACK not confirmed"
 fi
 
-# 3.3  Ghost Jitter (8-15ms)
-if grep -q '\[GHOST JITTER\]' "$ENGINE_OUTPUT"; then
-    JITTER_MS=$(grep -oP '\[GHOST JITTER\] Delaying \K[0-9]+' "$ENGINE_OUTPUT" | tail -1)
-    if [ -n "$JITTER_MS" ] && [ "$JITTER_MS" -ge 8 ] && [ "$JITTER_MS" -le 15 ]; then
-        log_ok "Ghost Jitter: ${JITTER_MS}ms (within 8-15ms organic range)"
+# 3.3  Ghost Jitter — Pre-ACK (2-8ms)
+if grep -q '\[GHOST JITTER\] Delaying [0-9]*ms before sending ACK' "$ENGINE_OUTPUT"; then
+    PRE_ACK_JITTER=$(grep -oP '\[GHOST JITTER\] Delaying \K[0-9]+(?=ms before sending ACK)' "$ENGINE_OUTPUT" | tail -1)
+    if [ -n "$PRE_ACK_JITTER" ] && [ "$PRE_ACK_JITTER" -ge 2 ] && [ "$PRE_ACK_JITTER" -le 8 ]; then
+        log_ok "Ghost Jitter Pre-ACK: ${PRE_ACK_JITTER}ms (within 2-8ms range)"
     else
-        log_warn "Ghost Jitter: ${JITTER_MS:-?}ms (outside 8-15ms)"
+        log_warn "Ghost Jitter Pre-ACK: ${PRE_ACK_JITTER:-?}ms (outside 2-8ms)"
     fi
 else
-    log_warn "Ghost Jitter marker not found"
+    log_warn "Ghost Jitter Pre-ACK marker not found"
 fi
 
-# 3.4  MTU compliance (<= 1500)
+# 3.4  Ghost Jitter — Pre-TLS (5-15ms)
+if grep -q '\[GHOST JITTER\] Delaying [0-9]*ms before TLS Client Hello' "$ENGINE_OUTPUT"; then
+    PRE_TLS_JITTER=$(grep -oP '\[GHOST JITTER\] Delaying \K[0-9]+(?=ms before TLS Client Hello)' "$ENGINE_OUTPUT" | tail -1)
+    if [ -n "$PRE_TLS_JITTER" ] && [ "$PRE_TLS_JITTER" -ge 5 ] && [ "$PRE_TLS_JITTER" -le 15 ]; then
+        log_ok "Ghost Jitter Pre-TLS: ${PRE_TLS_JITTER}ms (within 5-15ms range)"
+    else
+        log_warn "Ghost Jitter Pre-TLS: ${PRE_TLS_JITTER:-?}ms (outside 5-15ms)"
+    fi
+else
+    log_warn "Ghost Jitter Pre-TLS marker not found"
+fi
+
+# 3.5  MTU compliance (<= 1500)
 if grep -q '\[MTU\] Packet size' "$ENGINE_OUTPUT"; then
     PKT_SIZE=$(grep -oP '\[MTU\] Packet size \K[0-9]+' "$ENGINE_OUTPUT" | tail -1)
     if [ -n "$PKT_SIZE" ] && [ "$PKT_SIZE" -le 1500 ]; then
@@ -106,7 +118,7 @@ else
     log_warn "MTU marker not found"
 fi
 
-# 3.5  TCP Checksum
+# 3.6  TCP Checksum
 if grep -q '\[CHECKSUM\]' "$ENGINE_OUTPUT"; then
     CSUM=$(grep -oP 'checksum=0x\K[0-9a-fA-F]+' "$ENGINE_OUTPUT" | tail -1)
     log_ok "TCP Checksum pseudo-header computed: 0x${CSUM}"
@@ -114,7 +126,7 @@ else
     log_warn "TCP Checksum marker not found"
 fi
 
-# 3.6  TLS Client Hello sent
+# 3.7  TLS Client Hello sent
 if grep -q 'TLS Client Hello sent' "$ENGINE_OUTPUT"; then
     log_ok "TLS Stage: Client Hello transmitted"
     ((STAGES++))
@@ -122,13 +134,13 @@ else
     log_warn "TLS Client Hello not sent"
 fi
 
-# 3.7  TLS Alert parsing
+# 3.8  TLS Alert parsing
 if grep -q '\[TLS ALERT\]' "$ENGINE_OUTPUT"; then
     ALERT_LINE=$(grep '\[TLS ALERT\]' "$ENGINE_OUTPUT" | tail -1)
     log_info "TLS Alert received: $ALERT_LINE"
 fi
 
-# 3.8  JA4S confirmation
+# 3.9  JA4S confirmation
 if grep -q '\[SUCCESS\] JA4S Confirmed' "$ENGINE_OUTPUT"; then
     log_ok "JA4S Verification: Server Hello cipher suite match"
     ((STAGES++))
@@ -136,7 +148,7 @@ elif grep -q 'JA4S Verification Failed' "$ENGINE_OUTPUT"; then
     log_warn "JA4S: No valid Server Hello (may be dropped by CDN)"
 fi
 
-# 3.9  No kernel RST leak
+# 3.10  No kernel RST leak
 if grep -q 'Kernel Leak Detected' "$ENGINE_OUTPUT"; then
     log_fail "Kernel RST leak detected"
     RESULT=1
@@ -144,11 +156,11 @@ else
     log_ok "No kernel RST leak"
 fi
 
-# 3.10  No global noise (INBOUND PACKET should only appear for validated packets)
+# 3.11  No global noise (INBOUND PACKET should only appear for validated packets)
 INBOUND_COUNT=$(grep -c 'INBOUND PACKET' "$ENGINE_OUTPUT" 2>/dev/null || echo 0)
 log_info "Validated inbound packets logged: $INBOUND_COUNT"
 
-# 3.11  Hex dump packet analysis
+# 3.12  Hex dump packet analysis
 DUMP_COUNT=$(grep -c 'RAW HEX DUMP BEFORE SEND' "$ENGINE_OUTPUT" 2>/dev/null || echo 0)
 if [ "$DUMP_COUNT" -gt 0 ]; then
     log_ok "Raw socket transmission: $DUMP_COUNT packet(s) sent"

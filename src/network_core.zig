@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const mem = std.mem;
+const jitter_core = @import("jitter_core.zig");
 
 const NetworkError = error{
     ServerNameTooLong,
@@ -45,7 +46,7 @@ const ACK_TCP_OPTS_LEN: usize = 12;
 
 // ECH GREASE payload: RFC 9446 structured format
 // [type(1) + config_id(1) + cipher_suite(2) + payload_len(2) + payload(N)]
-const ech_grease_payload_len: usize = 11; 
+const ech_grease_payload_len: usize = 11;
 
 const PacketSizer = struct {
     server_name_len: usize,
@@ -93,7 +94,6 @@ const MTUEnforcer = struct {
 /// - Cipher suite order, key share, and extension order remain unchanged
 /// - JA4 signature computed from these unchanged components
 /// - Therefore JA4 signature remains valid after MTU enforcement
-
 var cleanup_port: u16 = 0;
 
 fn signalHandler(sig: std.os.linux.SIG) callconv(.c) void {
@@ -502,7 +502,7 @@ fn sendPacketFd(fd: posix.socket_t, packet: []const u8, dst_ip: u32) !usize {
 fn recvPacketFd(fd: posix.socket_t, buffer: []u8) !usize {
     var addr: posix.sockaddr.in = undefined;
     var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-    
+
     while (true) {
         const rc = posix.system.recvfrom(fd, buffer.ptr, buffer.len, 0, @ptrCast(&addr), &addr_len);
         switch (posix.errno(rc)) {
@@ -548,7 +548,9 @@ const WindowsRawSocket = struct {
         return error.NotImplemented;
     }
 
-    pub fn deinit(self: *const WindowsRawSocket) void { _ = self; }
+    pub fn deinit(self: *const WindowsRawSocket) void {
+        _ = self;
+    }
 };
 
 // ------------------------------------------------------------
@@ -733,7 +735,7 @@ fn tlsClientHelloExtensionsLen(server_name_len: usize) usize {
         4 +
         18 +
         9 +
-        14 +  // signature_algorithms: 4 ext header + 2 len + 8 (4 algs * 2) = 14
+        14 + // signature_algorithms: 4 ext header + 2 len + 8 (4 algs * 2) = 14
         4 +
         (4 + 2 + 2 + 2 + hybrid_keyshare_len) +
         6 +
@@ -859,7 +861,7 @@ pub fn buildTCPSynAlloc(
     for (0..options_padding) |_| {
         pw.writeByte(0);
     }
-    
+
     std.debug.assert(pw.index == total_len);
 
     const ip_csum = computeChecksum(packet[0..20]);
@@ -1057,7 +1059,7 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
 
     var random: [32]u8 = undefined;
     try fillEntropy(&random);
-    
+
     // ECH GREASE: proper ECHClientHello outer wire format (draft-ietf-tls-esni).
     // 0xFE0D is the ACTUAL ECH extension type assigned by IANA — NOT a GREASE type.
     // Cloudflare on 1.1.1.1 implements ECH and strictly parses this extension.
@@ -1075,16 +1077,16 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
     var ech_grease_payload = [_]u8{0} ** ech_grease_payload_len;
     var ech_random: [2]u8 = undefined;
     try fillEntropy(&ech_random);
-    ech_grease_payload[0] = 0x01;        // type = outer
-    ech_grease_payload[1] = 0x00;        // KDF id high
-    ech_grease_payload[2] = 0x01;        // KDF id low  (HKDF-SHA256)
-    ech_grease_payload[3] = 0x00;        // AEAD id high
-    ech_grease_payload[4] = 0x01;        // AEAD id low (AES-128-GCM)
+    ech_grease_payload[0] = 0x01; // type = outer
+    ech_grease_payload[1] = 0x00; // KDF id high
+    ech_grease_payload[2] = 0x01; // KDF id low  (HKDF-SHA256)
+    ech_grease_payload[3] = 0x00; // AEAD id high
+    ech_grease_payload[4] = 0x01; // AEAD id low (AES-128-GCM)
     ech_grease_payload[5] = ech_random[0]; // config_id (random)
-    ech_grease_payload[6] = 0x00;        // enc length high
-    ech_grease_payload[7] = 0x00;        // enc length low (empty enc)
-    ech_grease_payload[8] = 0x00;        // payload length high
-    ech_grease_payload[9] = 0x01;        // payload length low (1 byte)
+    ech_grease_payload[6] = 0x00; // enc length high
+    ech_grease_payload[7] = 0x00; // enc length low (empty enc)
+    ech_grease_payload[8] = 0x00; // payload length high
+    ech_grease_payload[9] = 0x01; // payload length low (1 byte)
     ech_grease_payload[10] = ech_random[1]; // payload (random byte)
     var hybrid_keyshare = [_]u8{0} ** hybrid_keyshare_len;
     try fillHybridKeyShare(&hybrid_keyshare);
@@ -1109,7 +1111,7 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
     ch.writeByte(0x01); // Client Hello
     const hs_len_pos = ch.index;
     ch.writeInt(u24, 0); // Patched later
-    
+
     // Client Hello Data
     ch.writeInt(u16, 0x0303); // Legacy Version TLS 1.2
     ch.writeSlice(&random);
@@ -1255,12 +1257,12 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
 
     const record_payload_len = ch.index - hs_start;
     ch.patchInt(u16, record_len_pos, @as(u16, @intCast(record_payload_len)));
-    
+
     // MTU Compliance: TLS data + IP(20) + TCP(20) + TCP_Opts(12) = total IP packet
     // Max TLS data = 1500 - 52 = 1448 bytes
     const tls_record_len = @as(u16, @intCast(record_payload_len));
     std.debug.assert(tls_record_len <= 1448);
-    
+
     const handshake_payload_len = record_payload_len - 4;
     ch.patchInt(u24, hs_len_pos, @as(u24, @intCast(handshake_payload_len)));
 
@@ -1308,9 +1310,9 @@ pub fn buildTCPAckAlloc(
 
     // Standard post-SYN TCP options: NOP(1) + NOP(1) + Timestamps(10) = 12 bytes
     const ack_options = [_]TcpOption{
-        .{ .kind = 1, .len = 1, .data = &[_]u8{} },           // NOP
-        .{ .kind = 1, .len = 1, .data = &[_]u8{} },           // NOP
-        .{ .kind = 8, .len = 10, .data = &ts_data },          // Timestamps
+        .{ .kind = 1, .len = 1, .data = &[_]u8{} }, // NOP
+        .{ .kind = 1, .len = 1, .data = &[_]u8{} }, // NOP
+        .{ .kind = 8, .len = 10, .data = &ts_data }, // Timestamps
     };
 
     const options_len = tcpOptionsLen(&ack_options);
@@ -1405,9 +1407,9 @@ pub fn buildTCPDataAlloc(
 
     // Standard post-SYN TCP options: NOP(1) + NOP(1) + Timestamps(10) = 12 bytes
     const data_options = [_]TcpOption{
-        .{ .kind = 1, .len = 1, .data = &[_]u8{} },           // NOP
-        .{ .kind = 1, .len = 1, .data = &[_]u8{} },           // NOP
-        .{ .kind = 8, .len = 10, .data = &ts_data },          // Timestamps
+        .{ .kind = 1, .len = 1, .data = &[_]u8{} }, // NOP
+        .{ .kind = 1, .len = 1, .data = &[_]u8{} }, // NOP
+        .{ .kind = 8, .len = 10, .data = &ts_data }, // Timestamps
     };
 
     const options_len = tcpOptionsLen(&data_options);
@@ -1481,8 +1483,7 @@ pub fn buildTCPDataAlloc(
     const tcp_csum = computeTcpChecksumWithData(src_ip, dst_ip, packet[20..tcp_header_end], data);
     pw.patchInt(u16, 36, tcp_csum);
 
-    std.debug.print("[CHECKSUM] TCP Data packet: total={}, data_len={}, opts_len={}, checksum=0x{x:04}\n",
-        .{total_len, data.len, tcp_len - 20, tcp_csum});
+    std.debug.print("[CHECKSUM] TCP Data packet: total={}, data_len={}, opts_len={}, checksum=0x{x:04}\n", .{ total_len, data.len, tcp_len - 20, tcp_csum });
 
     return packet;
 }
@@ -1599,28 +1600,9 @@ fn filterRawPacket(
     return true;
 }
 
-/// GHOST JITTER: Introduce 8-15ms organic delay (nanosleep) between ACK and TLS Client Hello
-fn ghostJitter() void {
-    var random_buf: [1]u8 = undefined;
-    fillEntropy(&random_buf) catch {
-        // Fallback: 10ms delay using nanosleep if entropy fails
-        const fallback_ts = posix.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-        _ = posix.system.nanosleep(&fallback_ts, null);
-        return;
-    };
-
-    // Map random byte to 8-15ms organic range
-    const jitter_ms = 8 + (random_buf[0] % 8);
-    std.debug.print("[GHOST JITTER] Delaying {}ms before TLS Client Hello...\n", .{jitter_ms});
-
-    // Use POSIX nanosleep for precise timing
-    const ts = posix.timespec{ .sec = 0, .nsec = @as(i32, @intCast(jitter_ms)) * std.time.ns_per_ms };
-    _ = posix.system.nanosleep(&ts, null);
-}
-
 /// Extended hex dump for debugging - logs full packet content
 fn hexDumpFull(label: []const u8, data: []const u8) void {
-    std.debug.print("\n=== {s} [len={}] ===\n", .{label, data.len});
+    std.debug.print("\n=== {s} [len={}] ===\n", .{ label, data.len });
     var i: usize = 0;
     while (i < data.len) {
         const line_end = @min(i + 16, data.len);
@@ -1702,13 +1684,7 @@ pub fn completeHandshake(ctx: HandshakeContext) void {
         });
 
         // Log TCP flags
-        const flag_str = if ((flags & 0x12) == 0x12) "SYN-ACK"
-            else if ((flags & 0x14) == 0x14) "RST-ACK"
-            else if ((flags & 0x10) == 0x10) "ACK"
-            else if ((flags & 0x02) == 0x02) "SYN"
-            else if ((flags & 0x04) == 0x04) "RST"
-            else if ((flags & 0x01) == 0x01) "FIN"
-            else "OTHER";
+        const flag_str = if ((flags & 0x12) == 0x12) "SYN-ACK" else if ((flags & 0x14) == 0x14) "RST-ACK" else if ((flags & 0x10) == 0x10) "ACK" else if ((flags & 0x02) == 0x02) "SYN" else if ((flags & 0x04) == 0x04) "RST" else if ((flags & 0x01) == 0x01) "FIN" else "OTHER";
         std.debug.print("[TCP FLAGS] {s}\n", .{flag_str});
 
         if (sport == ctx.dst_port and dport == ctx.src_port) {
@@ -1731,14 +1707,14 @@ pub fn completeHandshake(ctx: HandshakeContext) void {
                 std.debug.print("[SUCCESS] Targeted SYN-ACK Captured\n", .{});
 
                 const server_seq = (@as(u32, tcp_header[4]) << 24) |
-                                 (@as(u32, tcp_header[5]) << 16) |
-                                 (@as(u32, tcp_header[6]) << 8) |
-                                 @as(u32, tcp_header[7]);
+                    (@as(u32, tcp_header[5]) << 16) |
+                    (@as(u32, tcp_header[6]) << 8) |
+                    @as(u32, tcp_header[7]);
 
                 const server_ack = (@as(u32, tcp_header[8]) << 24) |
-                                 (@as(u32, tcp_header[9]) << 16) |
-                                 (@as(u32, tcp_header[10]) << 8) |
-                                 @as(u32, tcp_header[11]);
+                    (@as(u32, tcp_header[9]) << 16) |
+                    (@as(u32, tcp_header[10]) << 8) |
+                    @as(u32, tcp_header[11]);
 
                 // Extract Timestamps from SYN-ACK options if present
                 var server_tsval: u32 = 0;
@@ -1747,25 +1723,35 @@ pub fn completeHandshake(ctx: HandshakeContext) void {
                 while (opt_idx + 1 < tcp_off and opt_idx < tcp_header.len) {
                     const kind = tcp_header[opt_idx];
                     if (kind == 0) break; // EOL
-                    if (kind == 1) { opt_idx += 1; continue; } // NOP
+                    if (kind == 1) {
+                        opt_idx += 1;
+                        continue;
+                    } // NOP
                     const len = tcp_header[opt_idx + 1];
                     if (len < 2) break;
                     if (kind == 8 and len == 10) { // Timestamp
                         server_tsval = (@as(u32, tcp_header[opt_idx + 2]) << 24) |
-                                       (@as(u32, tcp_header[opt_idx + 3]) << 16) |
-                                       (@as(u32, tcp_header[opt_idx + 4]) << 8) |
-                                       @as(u32, tcp_header[opt_idx + 5]);
+                            (@as(u32, tcp_header[opt_idx + 3]) << 16) |
+                            (@as(u32, tcp_header[opt_idx + 4]) << 8) |
+                            @as(u32, tcp_header[opt_idx + 5]);
                     }
                     opt_idx += len;
                 }
 
                 // Handshake State Validation: ACK number must match seq+1
                 if (server_ack != ctx.client_seq + 1) {
-                    std.debug.print("Handshake MISMATCH: Server ACK {} != client_seq+1 {}\n", .{server_ack, ctx.client_seq + 1});
+                    std.debug.print("Handshake MISMATCH: Server ACK {} != client_seq+1 {}\n", .{ server_ack, ctx.client_seq + 1 });
                     return;
                 }
 
-                std.debug.print("SYN-ACK verified. Seq: {}, TSval: {}. Injecting ACK...\n", .{server_seq, server_tsval});
+                std.debug.print("SYN-ACK verified. Seq: {}, TSval: {}. Injecting ACK...\n", .{ server_seq, server_tsval });
+
+                // INJECTION POINT 1 (Pre-ACK): Organic delay BEFORE constructing and sending ACK.
+                // Simulates OS TCP stack processing latency between SYN-ACK receipt and ACK emission.
+                // SOURCE: jitter_core.zig — exactSleepMs uses nanosleep with EINTR retry loop
+                const pre_ack_jitter = jitter_core.JitterEngine.getRandomJitter(2, 8);
+                std.debug.print("[GHOST JITTER] Delaying {d}ms before sending ACK...\n", .{pre_ack_jitter});
+                jitter_core.exactSleepMs(pre_ack_jitter);
 
                 // Final ACK with mirrored timestamps
                 const ack_packet = buildTCPAckAlloc(
@@ -1784,8 +1770,12 @@ pub fn completeHandshake(ctx: HandshakeContext) void {
                 _ = ctx.sock.sendPacket(ack_packet, ctx.dst_ip) catch return;
                 std.debug.print("Handshake Completed. Scaling to TLS Client Hello...\n", .{});
 
-                // GHOST JITTER: 8-15ms organic delay to simulate browser processing
-                ghostJitter();
+                // INJECTION POINT 2 (Pre-TLS): Organic delay AFTER sending ACK, BEFORE TLS Client Hello.
+                // Simulates browser-side TLS stack initialization and ClientHello construction latency.
+                // SOURCE: jitter_core.zig — exactSleepMs uses nanosleep with EINTR retry loop
+                const pre_tls_jitter = jitter_core.JitterEngine.getRandomJitter(5, 15);
+                std.debug.print("[GHOST JITTER] Delaying {d}ms before TLS Client Hello...\n", .{pre_tls_jitter});
+                jitter_core.exactSleepMs(pre_tls_jitter);
 
                 // Hardcoded SNI: github.com (required for MTU compliance)
                 const tls_ch = buildTLSClientHelloAlloc(ctx.allocator, "github.com") catch return;
@@ -1808,7 +1798,7 @@ pub fn completeHandshake(ctx: HandshakeContext) void {
 
                 // MTU enforcement assert
                 std.debug.assert(data_packet.len <= MTU_LIMIT);
-                std.debug.print("[MTU] Packet size {} bytes (within {} limit)\n", .{data_packet.len, MTU_LIMIT});
+                std.debug.print("[MTU] Packet size {} bytes (within {} limit)\n", .{ data_packet.len, MTU_LIMIT });
 
                 _ = ctx.sock.sendPacket(data_packet, ctx.dst_ip) catch return;
                 std.debug.print("TLS Client Hello sent. Waiting for Server Hello...\n", .{});
@@ -1841,7 +1831,7 @@ pub fn completeHandshake(ctx: HandshakeContext) void {
                             const alert_level = payload[5];
                             const alert_desc = payload[6];
                             const alert_name = parseTlsAlertDescription(alert_desc);
-                            std.debug.print("[TLS ALERT] Level={} Code=0x{x:02} ({s})\n", .{alert_level, alert_desc, alert_name});
+                            std.debug.print("[TLS ALERT] Level={} Code=0x{x:02} ({s})\n", .{ alert_level, alert_desc, alert_name });
                             if (alert_level == 2) {
                                 std.debug.print("[FATAL] TLS Fatal Alert - connection will be closed\n", .{});
                             }
@@ -1911,7 +1901,7 @@ fn verifyServerHelloCipher(payload: []const u8) bool {
     const cipher_suite_offset = 43 + 1 + session_id_len;
 
     if (payload.len < cipher_suite_offset + 2) return false;
-    const cipher = (@as(u16, payload[cipher_suite_offset]) << 8) | payload[cipher_suite_offset+1];
+    const cipher = (@as(u16, payload[cipher_suite_offset]) << 8) | payload[cipher_suite_offset + 1];
 
     const ja4_ciphers = [_]u16{
         0x1301, 0x1302, 0x1303, // TLS 1.3
@@ -1933,7 +1923,11 @@ fn verifyServerHelloCipher(payload: []const u8) bool {
 pub fn main(init: std.process.Init) !void {
     // ATOMIC BIND-BEFORE-ACTION
     const current_ms = nowMs(init.io);
-    
+
+    // Initialize Jitter Engine (idempotent — safe to call once at startup)
+    // SOURCE: jitter_core.zig — initJitterEngine uses monotonic clock + getrandom for seeding
+    try jitter_core.JitterEngine.initJitterEngine();
+
     // Register signal handlers for robust cleanup
     if (is_linux) {
         var sa = std.mem.zeroes(std.os.linux.Sigaction);
@@ -2005,11 +1999,7 @@ pub fn main(init: std.process.Init) !void {
     try applyRstSuppression(allocator, src_port);
     defer removeRstSuppression(allocator, src_port);
 
-    std.debug.print("Absolute Integrity Context: {}.{}.{}.{} -> {}.{}.{}.{} [{d}]\n", .{
-        (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF, src_ip & 0xFF,
-        (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF,
-        dest_port
-    });
+    std.debug.print("Absolute Integrity Context: {}.{}.{}.{} -> {}.{}.{}.{} [{d}]\n", .{ (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF, src_ip & 0xFF, (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF, dest_port });
 
     const seq_num = @as(u32, @intCast(current_ms));
     const tsval = generateTSval(init.io);
@@ -2039,7 +2029,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ATOMIC EXECUTION: Send SYN only after all locks are engaged
     _ = try sock.sendPacket(syn_packet, dst_ip);
-    
+
     // Wait for state machine to complete verification
     handshake_thread.join();
 }
@@ -2216,11 +2206,11 @@ test "ip argument classifier accepts IPv4 and rejects interface names" {
 test "PacketWriter basics and bounds checking" {
     var buffer: [10]u8 = undefined;
     var pw = PacketWriter.init(&buffer);
-    
+
     pw.writeByte(0x12);
     pw.writeInt(u32, 0x34567890);
-    pw.writeSlice(&[_]u8{0xAB, 0xCD});
-    
+    pw.writeSlice(&[_]u8{ 0xAB, 0xCD });
+
     try std.testing.expect(pw.index == 7);
     try std.testing.expect(buffer[0] == 0x12);
     try std.testing.expect(buffer[1] == 0x34);
@@ -2234,7 +2224,7 @@ test "MTU compliance for github.com SNI" {
     // Total IP packet = IP(20) + TCP(20) + TCP_opts(12, NOP+NOP+TS) + TLS data
     const total_packet_size = IP_HEADER_LEN + TCP_HEADER_LEN + ACK_TCP_OPTS_LEN + hello.len;
     try std.testing.expect(total_packet_size <= MTU_LIMIT);
-    std.debug.print("[MTU TEST] github.com total IP packet: {} bytes (TLS data: {})\n", .{total_packet_size, hello.len});
+    std.debug.print("[MTU TEST] github.com total IP packet: {} bytes (TLS data: {})\n", .{ total_packet_size, hello.len });
 }
 
 test "verifyServerHelloCipher rejects short server hello records" {
