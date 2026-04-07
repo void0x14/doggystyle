@@ -4,3 +4,8 @@ zig-out/
 sextape/
 in-memoria.db
 Gemini-GitHub Token ve Güvenlik Açığı Taraması.json
+network_core
+tests/
+logs/
+.qwen/
+docs/
