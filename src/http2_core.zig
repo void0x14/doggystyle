@@ -621,3 +621,643 @@ test "parseFrameHeader: stream ID MSB stripping" {
     // MSB should be stripped: 0xFFFFFFFF & 0x7FFFFFFF = 0x7FFFFFFF
     try std.testing.expectEqual(@as(u32, 0x7FFFFFFF), header.stream_id);
 }
+
+// ============================================================
+// Module 2.3 — HPACK Engine for HTTP/2 Headers
+// RFC 7541 — HPACK: Header Compression for HTTP/2
+// ============================================================
+
+// ------------------------------------------------------------
+// HPACK Integer Encoding (Section 5.1)
+// ------------------------------------------------------------
+
+/// HPACK integer encoding: N-bit prefix ile variable-length encoding.
+///
+/// SOURCE: RFC 7541, Section 5.1 — Integer Representation
+/// Algorithm:
+///   if I < 2^N - 1, encode I on N bits
+///   else
+///     encode (2^N - 1) on N bits
+///     I = I - (2^N - 1)
+///     while I >= 128
+///       encode (I % 128 + 128) on 8 bits
+///       I = I / 128
+///     encode I on 8 bits
+///
+/// prefix_bits: N (0-8), prefix_value: prefix'e yerleştirilecek başlangıç değeri
+/// Döndürülen: allocator ile allocate edilmiş buffer, caller free eder.
+pub fn encodeInteger(
+    allocator: mem.Allocator,
+    value: u64,
+    prefix_bits: u4, // RFC 7541 §5.1: N is 1-8. u3 can only hold 0-7, so we use u4.
+    prefix_value: u8,
+) ![]u8 {
+    const prefix_bits_int: u6 = @intCast(prefix_bits);
+    std.debug.assert(prefix_bits_int >= 1 and prefix_bits_int <= 8);
+    const available_bits: u4 = @intCast(8 - prefix_bits_int);
+    const max_prefix_value_for_check: u16 = @as(u16, 1) << available_bits;
+    std.debug.assert(prefix_value < max_prefix_value_for_check); // prefix_value N-bit alana sığmalı
+
+    const max_prefix_value: u64 = (@as(u64, 1) << @as(u6, @intCast(prefix_bits_int))) - 1;
+
+    // Geçici buffer: worst case 1 (prefix byte) + 10 (u64 max ~10 continuation bytes)
+    var temp_buf: [11]u8 = undefined;
+    var temp_len: usize = 0;
+
+    if (value < max_prefix_value) {
+        // Doğrudan prefix'e sığar
+        temp_buf[0] = prefix_value | @as(u8, @intCast(value));
+        temp_len = 1;
+    } else {
+        // Prefix'i max value ile doldur, kalanı continuation bytes ile kodla
+        temp_buf[0] = prefix_value | @as(u8, @intCast(max_prefix_value));
+        temp_len = 1;
+
+        var remaining: u64 = value - max_prefix_value;
+
+        while (remaining >= 128) {
+            temp_buf[temp_len] = @as(u8, @intCast(remaining % 128)) + 128;
+            temp_len += 1;
+            remaining = remaining / 128;
+        }
+
+        temp_buf[temp_len] = @as(u8, @intCast(remaining));
+        temp_len += 1;
+    }
+
+    const result = try allocator.alloc(u8, temp_len);
+    @memcpy(result, temp_buf[0..temp_len]);
+    return result;
+}
+
+// ------------------------------------------------------------
+// HPACK String Literal Encoding (Section 5.2)
+// ------------------------------------------------------------
+
+/// HPACK string literal encoding: Huffman flag'i 0 (No Huffman) + 7-bit prefix length + raw bytes.
+///
+/// SOURCE: RFC 7541, Section 5.2 — String Literal Representation
+/// Format:
+///   0 1 2 3 4 5 6 7
+///   +---+---+---+---+---+---+---+---+
+///   | H | String Length (7+)       |
+///   +---+---------------------------+
+///   | String Data (Length octets)   |
+///   +-------------------------------+
+/// H = 0 (No Huffman kullanıyoruz)
+/// String Length = 7-bit prefix integer (Section 5.1)
+pub fn encodeStringLiteral(allocator: mem.Allocator, str: []const u8) ![]u8 {
+    // Length'i 7-bit prefix ile encode et
+    const length_encoded = try encodeInteger(allocator, str.len, 7, 0);
+    defer allocator.free(length_encoded);
+
+    // Total: encoded_length + string_data
+    const total_len = length_encoded.len + str.len;
+    const result = try allocator.alloc(u8, total_len);
+
+    @memcpy(result[0..length_encoded.len], length_encoded);
+    if (str.len > 0) {
+        @memcpy(result[length_encoded.len..], str);
+    }
+
+    return result;
+}
+
+// ------------------------------------------------------------
+// HPACK Header Representation (Section 6)
+// ------------------------------------------------------------
+
+/// HPACK Header Field Representation tipleri
+/// SOURCE: RFC 7541, Section 6 — Compressed Header Block Format
+/// Indexed Header Field (Section 6.1)
+/// 0 1 2 3 4 5 6 7
+/// +---+---+---+---+---+---+---+---+
+/// | 1 |        Index (7+)         |
+/// +---+---------------------------+
+/// prefix: 1 bit ('1'), 7-bit index
+pub const IndexedHeaderField = struct {
+    index: u64,
+
+    pub fn encode(self: *const IndexedHeaderField, allocator: mem.Allocator) ![]u8 {
+        // Section 6.1: 1xxxxxxx prefix (high bit set, 7-bit index)
+        // encodeInteger ile prefix_value=0, sonra high bit'i set et
+        var result = try encodeInteger(allocator, self.index, 7, 0);
+        result[0] = result[0] | 0x80; // Set the high bit
+        return result;
+    }
+};
+
+/// Literal Header Field with Incremental Indexing — New Name (Section 6.2.1)
+/// 0 1 2 3 4 5 6 7
+/// +---+---+---+---+---+---+---+---+
+/// | 0 | 1 |      Index (7+)       |
+/// +---+---+-----------------------+
+/// prefix: 01xxxxxx (0x40)
+pub const LiteralHeaderFieldIncrementalIndexing = struct {
+    name_index: u64, // Static table index (0 = yeni isim)
+    name: ?[]const u8, // name_index == 0 ise kullanılır
+    value: []const u8,
+
+    pub fn encode(self: *const LiteralHeaderFieldIncrementalIndexing, allocator: mem.Allocator) ![]u8 {
+        // Name: index veya literal
+        const name_encoded = if (self.name_index > 0) blk: {
+            // Section 6.2.1: 01xxxxxx prefix (high 2 bits = 01)
+            var result = try encodeInteger(allocator, self.name_index, 6, 0);
+            result[0] = result[0] | 0x40; // Set 01 prefix
+            break :blk result;
+        } else blk: {
+            const name_str = self.name.?;
+            const encoded_name = try encodeStringLiteral(allocator, name_str);
+            defer allocator.free(encoded_name);
+
+            // Prefix: 01 000000 (0x40)
+            const prefix = [_]u8{0x40};
+            const total = try allocator.alloc(u8, 1 + encoded_name.len);
+            @memcpy(total[0..1], &prefix);
+            @memcpy(total[1..], encoded_name);
+            break :blk total;
+        };
+        defer allocator.free(name_encoded);
+
+        // Value: literal string
+        const value_encoded = try encodeStringLiteral(allocator, self.value);
+        defer allocator.free(value_encoded);
+
+        const total = try allocator.alloc(u8, name_encoded.len + value_encoded.len);
+        @memcpy(total[0..name_encoded.len], name_encoded);
+        @memcpy(total[name_encoded.len..], value_encoded);
+        return total;
+    }
+};
+
+/// Literal Header Field Never Indexed (Section 6.2.3)
+/// 0 1 2 3 4 5 6 7
+/// +---+---+---+---+---+---+---+---+
+/// | 0 | 0 | 0 | 1 |  Index (4+)   |
+/// +---+---+-----------------------+
+/// prefix: 0001xxxx (0x10)
+pub const LiteralHeaderFieldNeverIndexed = struct {
+    name_index: u64, // Static table index (0 = yeni isim)
+    name: ?[]const u8, // name_index == 0 ise kullanılır
+    value: []const u8,
+
+    pub fn encode(self: *const LiteralHeaderFieldNeverIndexed, allocator: mem.Allocator) ![]u8 {
+        // Name: index veya literal
+        const name_encoded = if (self.name_index > 0) blk: {
+            // Section 6.2.3: 0001xxxx prefix (high 4 bits = 0001)
+            var result = try encodeInteger(allocator, self.name_index, 4, 0);
+            result[0] = result[0] | 0x10; // Set 0001 prefix
+            break :blk result;
+        } else blk: {
+            const name_str = self.name.?;
+            const encoded_name = try encodeStringLiteral(allocator, name_str);
+            defer allocator.free(encoded_name);
+
+            // Prefix: 0001 0000 (0x10)
+            const prefix = [_]u8{0x10};
+            const total = try allocator.alloc(u8, 1 + encoded_name.len);
+            @memcpy(total[0..1], &prefix);
+            @memcpy(total[1..], encoded_name);
+            break :blk total;
+        };
+        defer allocator.free(name_encoded);
+
+        // Value: literal string
+        const value_encoded = try encodeStringLiteral(allocator, self.value);
+        defer allocator.free(value_encoded);
+
+        const total = try allocator.alloc(u8, name_encoded.len + value_encoded.len);
+        @memcpy(total[0..name_encoded.len], name_encoded);
+        @memcpy(total[name_encoded.len..], value_encoded);
+        return total;
+    }
+};
+
+// ------------------------------------------------------------
+// HPACK Static Table Referansları (Appendix A)
+// ------------------------------------------------------------
+
+/// SOURCE: RFC 7541, Appendix A — Static Table Definitions
+/// Static table indeksleri (sadece kullanılanlar):
+///   Index 3  -> :method: POST
+///   Index 7  -> :scheme: https
+///   Index 58 -> user-agent (name only, value empty)
+///   Index 19 -> accept (name only, value empty)
+
+// ------------------------------------------------------------
+// GitHub Headers Builder (Module 2.3 Core)
+// ------------------------------------------------------------
+
+/// GitHub'a yönelik HTTP/2 header bloğunu HPACK ile oluşturur.
+///
+/// SOURCE: RFC 7541, Appendix A — Static Table
+/// Kullanılan Indexed Header Fields:
+///   - :method: POST (Index 3) → 1 0000011 = 0x83
+///   - :scheme: https (Index 7) → 1 0000111 = 0x87
+///
+/// Kullanılan Literal Header Fields with Incremental Indexing:
+///   - :path: [path değeri] (name Index 4 = :path, value dinamik)
+///   - :authority: [authority değeri] (name Index 1 = :authority, value dinamik)
+///   - user-agent: Chrome v146 Linux Signature
+///   - accept: */*
+///
+/// Chrome v146 Linux User-Agent string:
+/// SOURCE: Chrome 146 UA pattern (common Chrome UA database)
+/// "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+pub fn buildGitHubHeaders(
+    allocator: mem.Allocator,
+    path: []const u8,
+    authority: []const u8,
+) ![]u8 {
+    const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+    const accept_value = "*/*";
+
+    // 1. :method: POST (Indexed, Index 3)
+    // SOURCE: RFC 7541, Appendix A, Index 3
+    const indexed_method = IndexedHeaderField{ .index = 3 };
+    const encoded_method = try indexed_method.encode(allocator);
+    defer allocator.free(encoded_method);
+
+    // 2. :scheme: https (Indexed, Index 7)
+    // SOURCE: RFC 7541, Appendix A, Index 7
+    const indexed_scheme = IndexedHeaderField{ .index = 7 };
+    const encoded_scheme = try indexed_scheme.encode(allocator);
+    defer allocator.free(encoded_scheme);
+
+    // 3. :path: [path değeri] (Literal with Incremental Indexing — Name Indexed)
+    // SOURCE: RFC 7541, Section 6.2.1
+    // Name Index 4 = :path (RFC 7541, Appendix A, Index 4)
+    const literal_path = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 4,
+        .name = null,
+        .value = path,
+    };
+    const encoded_path = try literal_path.encode(allocator);
+    defer allocator.free(encoded_path);
+
+    // 4. :authority: [authority değeri] (Literal with Incremental Indexing — Name Indexed)
+    // SOURCE: RFC 7541, Appendix A, Index 1 = :authority
+    const literal_authority = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 1,
+        .name = null,
+        .value = authority,
+    };
+    const encoded_authority = try literal_authority.encode(allocator);
+    defer allocator.free(encoded_authority);
+
+    // 5. user-agent: Chrome v146 Linux (Literal with Incremental Indexing — Name Indexed)
+    // SOURCE: RFC 7541, Appendix A, Index 58 = user-agent (name only)
+    const literal_ua = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 58,
+        .name = null,
+        .value = user_agent,
+    };
+    const encoded_ua = try literal_ua.encode(allocator);
+    defer allocator.free(encoded_ua);
+
+    // 6. accept: */* (Literal with Incremental Indexing — Name Indexed)
+    // SOURCE: RFC 7541, Appendix A, Index 19 = accept (name only)
+    const literal_accept = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 19,
+        .name = null,
+        .value = accept_value,
+    };
+    const encoded_accept = try literal_accept.encode(allocator);
+    defer allocator.free(encoded_accept);
+
+    // Tüm parçaları birleştir
+    const total_len = encoded_method.len + encoded_scheme.len +
+        encoded_path.len + encoded_authority.len +
+        encoded_ua.len + encoded_accept.len;
+
+    const result = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+
+    @memcpy(result[offset .. offset + encoded_method.len], encoded_method);
+    offset += encoded_method.len;
+
+    @memcpy(result[offset .. offset + encoded_scheme.len], encoded_scheme);
+    offset += encoded_scheme.len;
+
+    @memcpy(result[offset .. offset + encoded_path.len], encoded_path);
+    offset += encoded_path.len;
+
+    @memcpy(result[offset .. offset + encoded_authority.len], encoded_authority);
+    offset += encoded_authority.len;
+
+    @memcpy(result[offset .. offset + encoded_ua.len], encoded_ua);
+    offset += encoded_ua.len;
+
+    @memcpy(result[offset .. offset + encoded_accept.len], encoded_accept);
+    offset += encoded_accept.len;
+
+    std.debug.assert(offset == total_len);
+    return result;
+}
+
+// ------------------------------------------------------------
+// HEADERS Frame Integration (RFC 7540 Section 6.2)
+// ------------------------------------------------------------
+
+/// HPACK block'u HEADERS frame içine yerleştirir.
+///
+/// SOURCE: RFC 7540, Section 6.2 — HEADERS Frame Format
+/// "The HEADERS frame (type=0x1) is used to open a stream..."
+/// Frame Format:
+///   +---------------+
+///   |Pad Length? (8)|
+///   +---------------+---------------------------------------+
+///   |E|                 Stream Dependency? (31)             |
+///   +-+-----------------------------------------------------+
+///   |  Weight? (8)  |
+///   +-+-----------------------------------------------------+
+///   |                   Header Block Fragment (*)         ...
+///   +-------------------------------------------------------+
+///   |                   Padding (*)                       ...
+///   +-------------------------------------------------------+
+///
+/// Flags:
+///   END_STREAM (0x1): Bit 0
+///   END_HEADERS (0x4): Bit 2
+///
+/// Bu implementasyonda: Pad Length, Stream Dependency, Weight, Padding yok.
+/// Sadece Header Block Fragment var.
+pub fn packInHeadersFrame(
+    allocator: mem.Allocator,
+    hpack_block: []u8,
+    stream_id: u31,
+) ![]u8 {
+    std.debug.assert(stream_id > 0); // HEADERS frame MUST use non-zero stream ID (RFC 7540, Section 5.1.1)
+    std.debug.assert(hpack_block.len <= 16777215); // Max frame size: 2^24 - 1 (RFC 7540, Section 4.2)
+
+    const total_len = HTTP2_FRAME_HEADER_LEN + hpack_block.len;
+    const result = try allocator.alloc(u8, total_len);
+
+    // Frame Header serialize
+    // Length: 24-bit big-endian (RFC 7540, Section 4.1)
+    {
+        var len_buf: [3]u8 = undefined;
+        std.mem.writeInt(u24, &len_buf, @intCast(hpack_block.len), .big);
+        @memcpy(result[HTTP2_FRAME_HDR_LENGTH .. HTTP2_FRAME_HDR_LENGTH + 3], &len_buf);
+    }
+
+    // Type: HEADERS = 0x01 (RFC 7540, Section 6.2)
+    result[HTTP2_FRAME_HDR_TYPE] = @intFromEnum(Http2FrameType.HEADERS);
+
+    // Flags: END_STREAM (0x1) | END_HEADERS (0x4) = 0x05
+    // END_HEADERS: Header Block Fragment tam, CONTINUATION frame gelmeyecek
+    // END_STREAM: Bu stream'de başka veri gelmeyecek (typical for simple GET/POST)
+    result[HTTP2_FRAME_HDR_FLAGS] = 0x01 | 0x04; // END_STREAM | END_HEADERS
+
+    // Stream ID: 31-bit big-endian, MSB reserved (0)
+    {
+        var sid_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &sid_buf, stream_id, .big);
+        // MSB'yi temizle (reserved bit)
+        sid_buf[0] = sid_buf[0] & 0x7F;
+        @memcpy(result[HTTP2_FRAME_HDR_STREAM_ID .. HTTP2_FRAME_HDR_STREAM_ID + 4], &sid_buf);
+    }
+
+    // Payload: HPACK block
+    @memcpy(result[HTTP2_FRAME_HEADER_LEN..], hpack_block);
+
+    // Doğrulama
+    std.debug.assert(result[HTTP2_FRAME_HDR_TYPE] == 0x01); // HEADERS type
+    std.debug.assert(result[HTTP2_FRAME_HDR_FLAGS] == 0x05); // END_STREAM | END_HEADERS
+
+    return result;
+}
+
+// ============================================================
+// HPACK TESTS
+// ============================================================
+
+test "encodeInteger: RFC 7541 Section 5.1 — value 10, 5-bit prefix" {
+    // SOURCE: RFC 7541, Section 5.1, Example 1
+    // 10 < 31 (2^5 - 1), doğrudan 5-bit prefix'e sığar
+    // Expected: 0000 1010 = 0x0A
+    const allocator = std.testing.allocator;
+
+    const encoded = try encodeInteger(allocator, 10, 5, 0);
+    defer allocator.free(encoded);
+
+    try std.testing.expectEqual(@as(usize, 1), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0x0A), encoded[0]);
+}
+
+test "encodeInteger: RFC 7541 Section 5.1 — value 1337, 5-bit prefix" {
+    // SOURCE: RFC 7541, Section 5.1, Example 2
+    // 1337 >= 31 (2^5 - 1)
+    // Prefix: 11111 = 0x1F (31)
+    // I = 1337 - 31 = 1306
+    // 1306 >= 128 → (1306 % 128) + 128 = 154 = 0x9A
+    // I = 1306 / 128 = 10 → 10 < 128 → 0x0A
+    // Expected: [0x1F, 0x9A, 0x0A]
+    const allocator = std.testing.allocator;
+
+    const encoded = try encodeInteger(allocator, 1337, 5, 0);
+    defer allocator.free(encoded);
+
+    try std.testing.expectEqual(@as(usize, 3), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0x1F), encoded[0]); // Prefix = 31
+    try std.testing.expectEqual(@as(u8, 0x9A), encoded[1]); // 1306 % 128 + 128 = 154
+    try std.testing.expectEqual(@as(u8, 0x0A), encoded[2]); // 1306 / 128 = 10
+}
+
+test "encodeInteger: value 0, herhangi prefix" {
+    const allocator = std.testing.allocator;
+
+    const encoded = try encodeInteger(allocator, 0, 5, 0);
+    defer allocator.free(encoded);
+
+    try std.testing.expectEqual(@as(usize, 1), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0x00), encoded[0]);
+}
+
+test "encodeInteger: value 31, 5-bit prefix (max prefix value)" {
+    // 31 == 2^5 - 1, prefix'e tam sığar ama doymuş durumda
+    // Aslında 31 < 31 yanlış, yani 31 >= 31 → continuation gerekir
+    const allocator = std.testing.allocator;
+
+    const encoded = try encodeInteger(allocator, 31, 5, 0);
+    defer allocator.free(encoded);
+
+    // 31 >= 31 → prefix = 31, I = 31 - 31 = 0 → [0x1F, 0x00]
+    try std.testing.expectEqual(@as(usize, 2), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0x1F), encoded[0]);
+    try std.testing.expectEqual(@as(u8, 0x00), encoded[1]);
+}
+
+test "encodeInteger: prefix_value ile birleştirme" {
+    // Indexed Header Field için: prefix_value = 0, sonra 0x80 ile OR yapılır
+    // Index 3 encode: 00000011 | 10000000 = 10000011 = 0x83
+    const allocator = std.testing.allocator;
+
+    const encoded = try encodeInteger(allocator, 3, 7, 0);
+    defer allocator.free(encoded);
+
+    try std.testing.expectEqual(@as(usize, 1), encoded.len);
+    // High bit'i manuel set et (IndexedHeaderField.encode gibi)
+    try std.testing.expectEqual(@as(u8, 0x03), encoded[0]);
+}
+
+test "encodeStringLiteral: RFC 7541 Section 5.2 — basit string" {
+    // "test" → length=4, 7-bit prefix, H=0
+    // Length encoded: 0000 0100 = 0x04
+    // Result: [0x04, 't', 'e', 's', 't']
+    const allocator = std.testing.allocator;
+
+    const encoded = try encodeStringLiteral(allocator, "test");
+    defer allocator.free(encoded);
+
+    try std.testing.expectEqual(@as(usize, 5), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0x04), encoded[0]); // Length = 4, H=0
+    try std.testing.expectEqual(@as(u8, 't'), encoded[1]);
+    try std.testing.expectEqual(@as(u8, 'e'), encoded[2]);
+    try std.testing.expectEqual(@as(u8, 's'), encoded[3]);
+    try std.testing.expectEqual(@as(u8, 't'), encoded[4]);
+}
+
+test "encodeStringLiteral: boş string" {
+    const allocator = std.testing.allocator;
+
+    const encoded = try encodeStringLiteral(allocator, "");
+    defer allocator.free(encoded);
+
+    try std.testing.expectEqual(@as(usize, 1), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0x00), encoded[0]); // Length = 0
+}
+
+test "IndexedHeaderField: :method: POST (Index 3)" {
+    // SOURCE: RFC 7541, Appendix A, Index 3
+    const allocator = std.testing.allocator;
+
+    const indexed = IndexedHeaderField{ .index = 3 };
+    const encoded = try indexed.encode(allocator);
+    defer allocator.free(encoded);
+
+    // 1 0000011 = 0x83
+    try std.testing.expectEqual(@as(usize, 1), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0x83), encoded[0]);
+}
+
+test "IndexedHeaderField: :scheme: https (Index 7)" {
+    // SOURCE: RFC 7541, Appendix A, Index 7
+    const allocator = std.testing.allocator;
+
+    const indexed = IndexedHeaderField{ .index = 7 };
+    const encoded = try indexed.encode(allocator);
+    defer allocator.free(encoded);
+
+    // 1 0000111 = 0x87
+    try std.testing.expectEqual(@as(usize, 1), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0x87), encoded[0]);
+}
+
+test "LiteralHeaderFieldIncrementalIndexing: name indexed, value literal" {
+    // :path: /github (name Index 4, value "/github")
+    const allocator = std.testing.allocator;
+
+    const literal = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 4,
+        .name = null,
+        .value = "/github",
+    };
+    const encoded = try literal.encode(allocator);
+    defer allocator.free(encoded);
+
+    // Name: 01 000100 = 0x44 (Index 4 with 01 prefix)
+    // Value: length=7 (0000 0111 = 0x07) + "/github"
+    try std.testing.expectEqual(@as(u8, 0x44), encoded[0]);
+    try std.testing.expectEqual(@as(u8, 0x07), encoded[1]); // Length = 7
+    try std.testing.expectEqualStrings("/github", encoded[2..]);
+}
+
+test "buildGitHubHeaders: HPACK block structure doğrulaması" {
+    const allocator = std.testing.allocator;
+
+    const block = try buildGitHubHeaders(allocator, "/octocat/repo", "github.com");
+    defer allocator.free(block);
+
+    // İlk byte: Indexed :method: POST (0x83)
+    try std.testing.expectEqual(@as(u8, 0x83), block[0]);
+
+    // İkinci byte: Indexed :scheme: https (0x87)
+    try std.testing.expectEqual(@as(u8, 0x87), block[1]);
+
+    // Üçüncü byte: Literal :path with incremental indexing (0x44 prefix)
+    try std.testing.expectEqual(@as(u8, 0x44), block[2]);
+
+    // HPACK block en az 6 header'dan oluşmalı (her biri en az 1-2 byte)
+    try std.testing.expect(block.len >= 10);
+}
+
+test "packInHeadersFrame: HEADERS frame byte-alignment" {
+    const allocator = std.testing.allocator;
+
+    // Basit HPACK block
+    const hpack_block = try allocator.alloc(u8, 5);
+    defer allocator.free(hpack_block);
+    @memset(hpack_block, 0xAA);
+
+    const frame = try packInHeadersFrame(allocator, hpack_block, 1);
+    defer allocator.free(frame);
+
+    // Toplam: 9 (header) + 5 (payload) = 14 byte
+    try std.testing.expectEqual(@as(usize, 14), frame.len);
+
+    // Length: 24-bit big-endian = 5
+    const length_field: u24 = (@as(u24, frame[0]) << 16) |
+        (@as(u24, frame[1]) << 8) |
+        @as(u24, frame[2]);
+    try std.testing.expectEqual(@as(u24, 5), length_field);
+
+    // Type: HEADERS = 0x01
+    try std.testing.expectEqual(@as(u8, 0x01), frame[HTTP2_FRAME_HDR_TYPE]);
+
+    // Flags: END_STREAM (0x1) | END_HEADERS (0x4) = 0x05
+    try std.testing.expectEqual(@as(u8, 0x05), frame[HTTP2_FRAME_HDR_FLAGS]);
+
+    // Stream ID: 1 (31-bit big-endian)
+    const stream_id: u32 = (@as(u32, frame[5]) << 24) |
+        (@as(u32, frame[6]) << 16) |
+        (@as(u32, frame[7]) << 8) |
+        @as(u32, frame[8]);
+    try std.testing.expectEqual(@as(u32, 1), stream_id);
+
+    // Payload: HPACK block
+    try std.testing.expectEqualSlices(u8, hpack_block, frame[HTTP2_FRAME_HEADER_LEN..]);
+}
+
+test "packInHeadersFrame: stream_id 0 assertion" {
+    // assert failure = panic, error değil
+    // stream_id 0 verildiğinde assert tetiklenir
+    // Bu testi skip ediyoruz çünkü assert panic üretir, error döndürmez
+}
+
+test "round-trip: buildGitHubHeaders → packInHeadersFrame → parse" {
+    const allocator = std.testing.allocator;
+
+    // 1. HPACK block oluştur
+    const hpack_block = try buildGitHubHeaders(allocator, "/test/repo", "github.com");
+    defer allocator.free(hpack_block);
+
+    // 2. HEADERS frame'e yerleştir
+    const frame = try packInHeadersFrame(allocator, hpack_block, 3);
+    defer allocator.free(frame);
+
+    // 3. Parse header
+    const header = try parseFrameHeader(frame);
+    try std.testing.expectEqual(@as(u32, @intCast(hpack_block.len)), header.length);
+    try std.testing.expectEqual(@as(u8, 0x01), header.frame_type); // HEADERS
+    try std.testing.expectEqual(@as(u8, 0x05), header.flags); // END_STREAM | END_HEADERS
+    try std.testing.expectEqual(@as(u32, 3), header.stream_id);
+
+    // 4. Payload doğrulama
+    const payload = frame[HTTP2_FRAME_HEADER_LEN..];
+    try std.testing.expectEqualSlices(u8, hpack_block, payload);
+
+    // 5. HPACK block içeriği doğrulama
+    try std.testing.expectEqual(@as(u8, 0x83), payload[0]); // :method: POST
+    try std.testing.expectEqual(@as(u8, 0x87), payload[1]); // :scheme: https
+}
