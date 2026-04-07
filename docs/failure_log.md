@@ -305,6 +305,129 @@ Hipotez üretme konusunda başarılı, empirik doğrulama konusunda başarısız
 
 ---
 
+## [2026-04-07] — `zig build test` "failed command" (Zig 0.16-dev uyumluluk)
+
+**Tetikleyici:** Red Team Audit sonrası `zig build test` "failed command" hatası
+**Dosyalar:** `build.zig`
+**Zig Versiyonu:** 0.16.0-dev.3135
+
+---
+
+### Hata: Test runner --listen=- ile donuyor, exit code yanlış algılanıyor
+
+**Hata:** `b.addRunArtifact(test_exe)` ile test binary'si çalıştırıldığında Zig 0.16-dev
+`--listen=-` flag'i enjekte ediyor. Bu flag test runner'ın stdin/stdout üzerinden
+IPC yapmasını bekliyor. Ancak bu modda test runner **donuyor** (hang).
+
+Dolaylı olarak `zig test` doğrudan çalıştırıldığında exit code 0 dönüyor ama
+`addSystemCommand` + `expectExitCode(0)` kombinasyonu da Zig 0.16-dev'de
+"failed command" mesajı üretiyor.
+
+**Kök Sebep:** Zig 0.16-dev'de `RunStep`'in test binary handling'ı değişmiş.
+`--listen=-` IPC protokolü test binary'leri ile düzgün çalışmıyor.
+
+**Düzeltme:**
+```zig
+// ÖNCEKİ: b.addRunArtifact(test_exe) -- donuyor
+const test_run = b.addRunArtifact(test_exe);
+
+// SONRAKİ: zig test doğrudan system command olarak çalıştır
+const test_run = b.addSystemCommand(&.{
+    "zig", "test", "src/network_core.zig",
+    "--zig-lib-dir", "vendor/zig-std", "-lc",
+});
+test_run.has_side_effects = true;  // Exit code 0 olduğunda step başarılı sayılır
+```
+
+---
+
 *Son güncelleme: 2026-04-07*
-*Güncelleyen: Claude Sonnet 4.6 (Thinking) + void0x14*
-*Tetikleyen: 20 saatlik SYN-ACK yakalama başarısızlığı + TLS decode_error*
+*Güncelleyen: Red Team Audit + void0x14*
+*Tetikleyen: Column A statik audit sonrası build test fix*
+
+---
+
+## [2026-04-07] — Red Team Audit: RST Cleanup Bypass + MTU 5-Byte Hesaplama Hatası
+
+**Tetikleyici:** Column A (network_core.zig + jitter_core.zig) statik analiz auditi
+**Dosyalar:** `src/network_core.zig`
+**Tip:** Proaktif audit — runtime hatası henüz gözlemlenmedi
+
+---
+
+### Hata 1: RST Packet Durumunda `std.process.exit(1)` Defer'ları Bypass Ediyor
+
+**Hata:** `completeHandshake` içinde RST packet görüldüğünde `std.process.exit(1)` çağrılıyor.
+Zig'de `exit(2)` syscall defer bloklarını ÇALIŞTIRMAZ.
+Sonuç: `iptables` kuralları (`OUTPUT DROP`, `PREROUTING NOTRACK`, `INPUT ACCEPT`) temizlenmeden kalır.
+
+**Kök Sebep:** `std.process.exit(1)` process'i anında sonlandırır, cleanup kodu atlanır.
+
+**Kaynak:** Zig error handling semantics — `defer` runs on `return` and `error return`, NOT on `exit()`.
+POSIX.1-2017 — `exit()` vs `_Exit()`: Zig `std.process.exit` = `_Exit` semantics.
+
+**Düzeltme:**
+```zig
+// ÖNCEKİ:
+std.process.exit(1);
+
+// SONRAKİ:
+return; // defer removeRstSuppression() main thread'de çalışır
+```
+
+---
+
+### Hata 2: MTU Assert'ında 5 Byte TLS Record Header Hesaplanmamış
+
+**Hata:** `buildTLSClientHelloAlloc` içinde `std.debug.assert(tls_record_len <= 1448)` kullanılıyor.
+Ancak `1448 = 1500 - 52(IP/TCP)` TLS record payload limitidir.
+TLS record header (5 byte) bu hesaba dahil değil.
+
+Gerçek max packet: `52(IP/TCP) + 5(TLS header) + 1448(handshake) = 1505 > 1500`
+
+**Kök Sebep:** `record_payload_len` = handshake header(4) + content. TLS record header(5) ayrıca eklenmeli.
+
+**Kaynak:** RFC 8446, Section 5.1 — TLSPlaintext structure: `opaque content[TLSPlaintext.length]` + 5 byte header.
+
+**Düzeltme:**
+```zig
+// ÖNCEKİ:
+std.debug.assert(tls_record_len <= 1448);
+
+// SONRAKİ:
+const tls_total_record = TLS_RECORD_HEADER_LEN + tls_record_len;
+std.debug.assert(tls_total_record <= 1448);
+```
+
+---
+
+### Hata 3: `buildTCPDataAlloc` MTU Assert'ı Panic Üretiyor (Düzeltildi)
+
+**Hata:** `std.debug.assert(total_len <= MTU_LIMIT)` panic üretir, defer'lar çalışmaz.
+
+**Düzeltme:**
+```zig
+// ÖNCEKİ:
+std.debug.assert(total_len <= MTU_LIMIT);
+
+// SONRAKİ:
+if (total_len > MTU_LIMIT) {
+    return error.MTUExceeded;
+}
+```
+
+---
+
+### Değişiklik Özeti
+
+| Konum | Değişiklik |
+|---|---|
+| `completeHandshake` satır ~1705 | `std.process.exit(1)` → `return` (cleanup defer ile çalışır) |
+| `buildTLSClientHelloAlloc` satır ~1262 | TLS record header (5 byte) hesaba katıldı |
+| `buildTCPDataAlloc` satır ~1425 | `assert` → `if (total_len > MTU_LIMIT) return error.MTUExceeded` |
+
+---
+
+*Son güncelleme: 2026-04-07*
+*Güncelleyen: Red Team Audit + void0x14*
+*Tetikleyen: Column A holistic statik analiz*

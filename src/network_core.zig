@@ -1258,10 +1258,13 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
     const record_payload_len = ch.index - hs_start;
     ch.patchInt(u16, record_len_pos, @as(u16, @intCast(record_payload_len)));
 
-    // MTU Compliance: TLS data + IP(20) + TCP(20) + TCP_Opts(12) = total IP packet
-    // Max TLS data = 1500 - 52 = 1448 bytes
+    // MTU Compliance: TLS record (header + payload) + IP(20) + TCP(20) + TCP_Opts(12) <= 1500
+    // TLS record = 5(record header) + record_payload_len(handshake header + content)
+    // Max TLS record payload = 1500 - 52(IP/TCP) - 5(TLS record header) = 1443
+    // SOURCE: RFC 8446, Section 5.1 — TLSPlaintext.length <= 2^14 + 2048, but MTU-enforced here
     const tls_record_len = @as(u16, @intCast(record_payload_len));
-    std.debug.assert(tls_record_len <= 1448);
+    const tls_total_record = TLS_RECORD_HEADER_LEN + tls_record_len;
+    std.debug.assert(tls_total_record <= 1448);
 
     const handshake_payload_len = record_payload_len - 4;
     ch.patchInt(u24, hs_len_pos, @as(u24, @intCast(handshake_payload_len)));
@@ -1419,7 +1422,11 @@ pub fn buildTCPDataAlloc(
     const total_len: usize = 20 + tcp_len + data.len;
     const tcp_data_offset: u8 = @intCast((tcp_len / 4) << 4);
 
-    std.debug.assert(total_len <= MTU_LIMIT);
+    // MTU enforcement: graceful error instead of panic (panic bypass defer cleanup)
+    // SOURCE: man 7 ip — IPv4 maximum packet size is 65535, but MTU_LIMIT enforces 1500
+    if (total_len > MTU_LIMIT) {
+        return error.MTUExceeded;
+    }
 
     const packet = try allocator.alloc(u8, total_len);
     errdefer allocator.free(packet);
@@ -1699,8 +1706,11 @@ pub fn completeHandshake(ctx: HandshakeContext) void {
             // A bare inbound RST after filtering indicates the kernel leaked a local reset.
             if ((flags & 0x04) != 0) {
                 hexDumpFull("OUTBOUND RST DETECTED (Kernel Leak)", data[0..@min(read_len, 128)]);
-                std.debug.print("[FATAL] Kernel Leak Detected: RST seen on port {d}\n", .{ctx.src_port});
-                std.process.exit(1);
+                std.debug.print("[FATAL] RST seen on port {d} — aborting handshake, cleanup will run\n", .{ctx.src_port});
+                // FIX: std.process.exit(1) bypasses defer. Return instead so main thread's
+                // defer removeRstSuppression() executes and flushes iptables rules.
+                // SOURCE: Zig error semantics — defer runs on return, not on exit(2)
+                return;
             }
 
             if ((flags & 0x3F) == 0x12) { // SYN-ACK

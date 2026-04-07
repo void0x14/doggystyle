@@ -33,9 +33,10 @@ log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 # ---- Phase 1: Build ----
 echo -e "${BLUE}[*] Ghost Engine Zero-Dependency Verification${NC}"
 echo -e "${BLUE}[*] Target: $TARGET:$PORT${NC}"
+echo -e "${BLUE}[*] Zig Version: $(./vendor/zig/zig version 2>&1)${NC}"
 echo -e "${BLUE}[*] Building Ghost Engine...${NC}"
 
-if ! zig build 2>&1 | tee "$BUILD_LOG"; then
+if ! ./vendor/zig/zig build 2>&1 | tee "$BUILD_LOG"; then
     log_fail "Build failed"
     cat "$BUILD_LOG"
     exit 1
