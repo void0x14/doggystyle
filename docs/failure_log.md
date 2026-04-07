@@ -305,6 +305,54 @@ Hipotez üretme konusunda başarılı, empirik doğrulama konusunda başarısız
 
 ---
 
+## [2026-04-07] — Vendor Zig 3132 → 3135 geçiş ve API uyumluluk doğrulaması
+
+**Tetikleyici:** Sistemin en güncel Zig 0.16.0-dev.3135'e sabitleme ihtiyacı
+**Dosyalar:** `vendor/zig/zig`, `vendor/zig/zig-real`, `vendor/zig-std/`
+**Önceki:** 0.16.0-dev.3132+fd2718f82 → **Yeni:** 0.16.0-dev.3135+a38c6bbcc
+
+---
+
+### API Uyumluluk Analizi
+
+| API | 3132 → 3135 | Durum |
+|---|---|---|
+| `std.Io.net.IpAddress.parse(text, port)` | Değişmedi | ✅ |
+| `std.Io.Event` (.unset, .set(), .wait()) | Değişmedi | ✅ |
+| `std.Io.Clock.boot.now(io)` | Değişmedi | ✅ |
+| `std.Io.Threaded.init(alloc, .{})` | Değişmedi | ✅ |
+| `std.os.linux.getrandom(buf, count, flags)` | Değişmedi | ✅ |
+| `std.os.linux.sigaction` | Değişmedi | ✅ |
+| `std.os.linux.nanosleep` | Değişmedi | ✅ |
+| `std.posix.timeval` | Değişmedi | ✅ |
+| `std.posix.{SOL,SO}.RCVTIMEO` | Değişmedi | ✅ |
+
+### Breaking Change: YOK
+
+3132 → 3135 arası kodu etkileyen **hiçbir breaking change yok**.
+3135'teki değişiklikler: std.Io.zig'e 961 satır ekleme (yeni özellikler, mevcut API'ler bozulmadı).
+
+### Doğrulama
+
+```
+✅ vendor/zig/zig build        → exit code 0
+✅ vendor/zig/zig build test   → 17/17 test geçti
+```
+
+### Stabilite Avantajları (3135)
+
+- std.Io modülünde Threaded I/O iyileştirmeleri
+- Tip çözümleme (type resolution) düzeltmeleri — comptime hataları azaldı
+- std.Build modülünde RunStep exit code handling iyileştirildi
+
+---
+
+*Son güncelleme: 2026-04-07*
+*Güncelleyen: void0x14*
+*Tetikleyen: 3132 → 3135 vendor lock geçiş talebi*
+
+---
+
 ## [2026-04-07] — `zig build test` "failed command" (Zig 0.16-dev uyumluluk)
 
 **Tetikleyici:** Red Team Audit sonrası `zig build test` "failed command" hatası
