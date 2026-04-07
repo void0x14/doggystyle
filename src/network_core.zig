@@ -2805,3 +2805,900 @@ test "HandshakeResult.isJa4Cipher correctly identifies JA4 ciphers" {
     };
     try std.testing.expect(!non_ji4_result.isJa4Cipher());
 }
+
+// ============================================================
+// MODULE 2.1 (continued) — TLS 1.3 AEAD Record Encryption
+// ============================================================
+
+// SOURCE: RFC 8446, Section 5.2 — TLSCiphertext structure
+//   struct {
+//       ContentType opaque_type = application_data;  // 0x17
+//       ProtocolVersion legacy_record_version = 0x0303;
+//       uint16 length;
+//       opaque encrypted_record[length];
+//   } TLSCiphertext;
+//
+// SOURCE: RFC 8446, Section 5.3 — Per-Record Nonne
+//   nonce = write_iv XOR (0-padding || seq_num)
+//   where seq_num is 64-bit, padded to left to match write_iv length (12 bytes for AES-GCM)
+//
+// SOURCE: RFC 8446, Section 5.4 — TLSInnerPlaintext structure
+//   struct {
+//       opaque content[TLSPlaintext.length];
+//       ContentType type;
+//       uint8 zeros[length_of_padding];
+//   } TLSInnerPlaintext;
+//
+// SOURCE: RFC 8446, Section 5.2 — Additional Data (AAD)
+//   AAD = opaque_type || legacy_record_version || length
+//   (the 5-byte record header, NOT including the encrypted_record)
+
+/// TLS 1.3 session state for AEAD encryption/decryption.
+///
+/// SOURCE: RFC 8446, Section 7.3 — Key Update
+/// SOURCE: RFC 8446, Section 5.3 — Sequence Number (64-bit, per-direction)
+pub const TlsSession = struct {
+    /// AES-128 key for encrypting records sent by the client
+    client_write_key: [16]u8,
+    /// 12-byte IV for constructing per-record nonces (client → server)
+    client_write_iv: [12]u8,
+    /// AES-128 key for decrypting records received from the server
+    server_write_key: [16]u8,
+    /// 12-byte IV for constructing per-record nonces (server ← client)
+    server_write_iv: [12]u8,
+    /// 64-bit sequence number for outgoing records (incremented after each encryptRecord call)
+    seq_send: u64 = 0,
+    /// 64-bit sequence number for incoming records (incremented after each decryptRecord call)
+    seq_recv: u64 = 0,
+};
+
+/// Compute the per-record nonce for TLS 1.3 AEAD operations.
+///
+/// SOURCE: RFC 8446, Section 5.3 — Per-Record Nonce
+///   The per-record nonce is computed as: write_iv XOR (0-padding || seq_num)
+///   where seq_num is treated as a 64-bit big-endian integer and zero-padded
+///   on the left to the length of write_iv (12 bytes for AES-128-GCM).
+fn computeNonce(write_iv: [12]u8, seq_num: u64) [12]u8 {
+    var nonce: [12]u8 = undefined;
+    // seq_num as big-endian 8 bytes, XOR'd with write_iv[4..12]
+    // write_iv[0..4] XOR'd with 0x00 (seq_num padding) = write_iv[0..4]
+    nonce[0] = write_iv[0];
+    nonce[1] = write_iv[1];
+    nonce[2] = write_iv[2];
+    nonce[3] = write_iv[3];
+    nonce[4] = write_iv[4] ^ @as(u8, @truncate((seq_num >> 56) & 0xFF));
+    nonce[5] = write_iv[5] ^ @as(u8, @truncate((seq_num >> 48) & 0xFF));
+    nonce[6] = write_iv[6] ^ @as(u8, @truncate((seq_num >> 40) & 0xFF));
+    nonce[7] = write_iv[7] ^ @as(u8, @truncate((seq_num >> 32) & 0xFF));
+    nonce[8] = write_iv[8] ^ @as(u8, @truncate((seq_num >> 24) & 0xFF));
+    nonce[9] = write_iv[9] ^ @as(u8, @truncate((seq_num >> 16) & 0xFF));
+    nonce[10] = write_iv[10] ^ @as(u8, @truncate((seq_num >> 8) & 0xFF));
+    nonce[11] = write_iv[11] ^ @as(u8, @truncate(seq_num & 0xFF));
+    return nonce;
+}
+
+/// Encrypt a TLS 1.3 record using AES-128-GCM.
+///
+/// SOURCE: RFC 8446, Section 5.2 — Record Payload Protection
+/// SOURCE: RFC 8446, Section 5.4 — TLSInnerPlaintext (content + type + zeros)
+/// SOURCE: RFC 5116, Section 5.1 — AEAD_AES_128_GCM (nonce=12, tag=16)
+/// SOURCE: IANA AEAD Algorithms — https://www.iana.org/assignments/aead-parameters/aead-parameters.xhtml
+///
+/// STEP 1: Build TLSInnerPlaintext = plaintext || type(0x17) || zeros(padding)
+/// STEP 2: Compute AAD = 0x17 || 0x0303 || length (5-byte header)
+/// STEP 3: Compute nonce = write_iv XOR (0-padding || seq_send)
+/// STEP 4: AEAD-Encrypt(key, nonce, AAD, TLSInnerPlaintext) → ciphertext + 16-byte tag
+/// STEP 5: Prepend record header → full TLSCiphertext
+///
+/// Returns: allocated slice containing the complete TLSCiphertext (header + encrypted_record).
+/// Caller owns the returned slice.
+pub fn encryptRecord(
+    allocator: mem.Allocator,
+    session: *TlsSession,
+    plaintext: []const u8,
+) ![]u8 {
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const TAG_LEN: usize = Aes128Gcm.tag_length; // 16 bytes
+
+    // STEP 1: Build TLSInnerPlaintext
+    // For simplicity, no padding (zeros length = 0).
+    // TLSInnerPlaintext = content || type(0x17 = application_data)
+    const inner_plaintext_len = plaintext.len + 1; // +1 for ContentType byte
+    const inner_plaintext = try allocator.alloc(u8, inner_plaintext_len);
+    defer allocator.free(inner_plaintext);
+    @memcpy(inner_plaintext[0..plaintext.len], plaintext);
+    inner_plaintext[plaintext.len] = 0x17; // ContentType = application_data (RFC 8446 §5.2)
+
+    // STEP 2: Build AAD (Additional Authenticated Data)
+    // SOURCE: RFC 8446, Section 5.2 — AAD is the 5-byte record header
+    const aad_len: usize = 5;
+    var aad: [aad_len]u8 = undefined;
+    aad[0] = 0x17; // opaque_type = application_data
+    aad[1] = 0x03; // legacy_record_version major = TLS 1.2
+    aad[2] = 0x03; // legacy_record_version minor
+    // length = inner_plaintext_len + TAG_LEN (encrypted payload length)
+    const encrypted_len: u16 = @intCast(inner_plaintext_len + TAG_LEN);
+    aad[3] = @truncate((encrypted_len >> 8) & 0xFF);
+    aad[4] = @truncate(encrypted_len & 0xFF);
+
+    // STEP 3: Compute nonce
+    const nonce = computeNonce(session.client_write_iv, session.seq_send);
+
+    // STEP 4: AEAD Encrypt
+    // Aes128Gcm.encrypt requires c.len == m.len (ciphertext same size as plaintext)
+    // The tag is written to a separate output buffer.
+    const ciphertext_len = inner_plaintext_len; // same as plaintext
+    const ciphertext = try allocator.alloc(u8, ciphertext_len);
+    errdefer allocator.free(ciphertext);
+
+    var tag: [TAG_LEN]u8 = undefined;
+    Aes128Gcm.encrypt(ciphertext, &tag, inner_plaintext, &aad, nonce, session.client_write_key);
+
+    // STEP 5: Build TLSCiphertext record (header + encrypted_record + tag)
+    // encrypted_record = ciphertext || tag
+    const encrypted_record_total = ciphertext_len + TAG_LEN;
+    const record_len = aad_len + encrypted_record_total;
+    const record = try allocator.alloc(u8, record_len);
+    errdefer allocator.free(record);
+    @memcpy(record[0..aad_len], &aad);
+    @memcpy(record[aad_len .. aad_len + ciphertext_len], ciphertext);
+    @memcpy(record[aad_len + ciphertext_len .. aad_len + encrypted_record_total], &tag);
+
+    allocator.free(ciphertext);
+
+    // Increment sequence number (RFC 8446 §5.3)
+    session.seq_send += 1;
+
+    return record;
+}
+
+/// Decrypt a TLS 1.3 record using AES-128-GCM.
+///
+/// SOURCE: RFC 8446, Section 5.2 — Record Payload Protection
+/// SOURCE: RFC 8446, Section 5.3 — Per-Record Nonce
+/// SOURCE: RFC 8446, Section 5.4 — TLSInnerPlaintext (content + type + zeros)
+///
+/// Input: complete TLSCiphertext record (5-byte header + encrypted_record)
+/// STEP 1: Parse record header (content_type, version, length)
+/// STEP 2: Extract ciphertext + tag from encrypted_record
+/// STEP 3: Compute AAD from record header
+/// STEP 4: Compute nonce = write_iv XOR (0-padding || seq_recv)
+/// STEP 5: AEAD-Decrypt(key, nonce, AAD, ciphertext + tag) → TLSInnerPlaintext
+/// STEP 6: Strip trailing type byte and zeros padding → plaintext
+///
+/// Returns: allocated slice containing the decrypted plaintext (caller owns it).
+pub fn decryptRecord(
+    allocator: mem.Allocator,
+    session: *TlsSession,
+    ciphertext: []const u8,
+) ![]u8 {
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const TAG_LEN: usize = Aes128Gcm.tag_length; // 16 bytes
+
+    // STEP 1: Validate record has at least header + tag
+    if (ciphertext.len < TLS_REC_HEADER_LEN + TAG_LEN) {
+        return error.TlsRecordTooShort;
+    }
+
+    // Parse record header
+    const content_type = ciphertext[TLS_REC_CONTENT_TYPE];
+    const legacy_version: u16 = (@as(u16, ciphertext[TLS_REC_VERSION]) << 8) |
+        @as(u16, ciphertext[TLS_REC_VERSION + 1]);
+    const record_length: u16 = (@as(u16, ciphertext[TLS_REC_LENGTH]) << 8) |
+        @as(u16, ciphertext[TLS_REC_LENGTH + 1]);
+
+    // Validate record type (must be application_data = 0x17 for encrypted records)
+    if (content_type != 0x17) {
+        return error.UnexpectedContentType;
+    }
+    // Validate legacy_version (RFC 8446 §5.1 mandates 0x0303)
+    if (legacy_version != 0x0303) {
+        return error.UnexpectedLegacyVersion;
+    }
+    // Validate: ciphertext must contain header + encrypted_record of stated length
+    if (ciphertext.len < TLS_REC_HEADER_LEN + record_length) {
+        return error.TlsRecordTruncated;
+    }
+    // encrypted_record length must be > TAG_LEN (at least 1 byte of ciphertext + tag)
+    if (record_length < TAG_LEN + 1) {
+        return error.TlsRecordInvalidLength;
+    }
+
+    // STEP 2: Extract ciphertext (without tag) and tag
+    const encrypted_record = ciphertext[TLS_REC_HEADER_LEN .. TLS_REC_HEADER_LEN + record_length];
+    const ct_len = encrypted_record.len - TAG_LEN;
+    const ct_data = encrypted_record[0..ct_len];
+    const tag_bytes = encrypted_record[ct_len .. ct_len + TAG_LEN];
+    var tag: [TAG_LEN]u8 = undefined;
+    @memcpy(&tag, tag_bytes);
+
+    // STEP 3: Build AAD from record header (first 5 bytes)
+    var aad: [5]u8 = undefined;
+    @memcpy(&aad, ciphertext[0..5]);
+
+    // STEP 4: Compute nonce
+    const nonce = computeNonce(session.server_write_iv, session.seq_recv);
+
+    // STEP 5: AEAD Decrypt → TLSInnerPlaintext
+    // Aes128Gcm.decrypt requires output.len == ciphertext_input.len (without tag)
+    const inner_plaintext = try allocator.alloc(u8, ct_len);
+    errdefer allocator.free(inner_plaintext);
+
+    Aes128Gcm.decrypt(inner_plaintext, ct_data, tag, &aad, nonce, session.server_write_key) catch {
+        return error.TlsAeadDecryptFailed;
+    };
+
+    // STEP 6: Strip trailing ContentType byte (last byte of TLSInnerPlaintext)
+    // SOURCE: RFC 8446, Section 5.4 — last byte is ContentType, preceding zeros are padding
+    if (inner_plaintext.len < 1) {
+        allocator.free(inner_plaintext);
+        return error.TlsInnerPlaintextTooShort;
+    }
+    // Note: content_type byte is at inner_plaintext[inner_plaintext.len - 1]
+    // We strip it along with trailing zeros padding.
+
+    // Strip trailing zeros (padding) and the type byte
+    var end_idx: usize = inner_plaintext.len - 1; // skip type byte
+    while (end_idx > 0 and inner_plaintext[end_idx - 1] == 0x00) {
+        end_idx -= 1;
+    }
+
+    const plaintext = try allocator.alloc(u8, end_idx);
+    errdefer allocator.free(plaintext);
+    @memcpy(plaintext, inner_plaintext[0..end_idx]);
+
+    allocator.free(inner_plaintext);
+
+    // Increment sequence number (RFC 8446 §5.3)
+    session.seq_recv += 1;
+
+    return plaintext;
+}
+
+// ============================================================
+// MODULE 2.4 — Payload Construction and Token Extraction
+// ============================================================
+
+// --- 1. JSON PAYLOAD CONSTRUCTION ---
+
+/// Parameters for the GitHub OAuth Web Flow token request.
+///
+/// SOURCE: RFC 6749, Section 4.1.3 — Access Token Request
+/// SOURCE: GitHub OAuth API — POST /login/oauth/access_token
+/// NOTE: RFC 6749 mandates application/x-www-form-urlencoded, but GitHub's
+/// endpoint also accepts application/json. This module uses JSON per user spec.
+pub const GitHubTokenParams = struct {
+    client_id: []const u8,
+    client_secret: []const u8,
+    code: []const u8,
+    redirect_uri: []const u8,
+};
+
+/// Build the JSON request body for the GitHub OAuth token endpoint.
+///
+/// SOURCE: RFC 6749, Section 4.1.3 — Access Token Request parameters
+/// SOURCE: RFC 8259, Section 2 — JSON string encoding (UTF-8, escaped)
+/// SOURCE: RFC 8259, Section 7 — JSON string escaping rules
+///
+/// Produces: {"grant_type":"authorization_code","client_id":"...","client_secret":"...","code":"...","redirect_uri":"..."}
+///
+/// No Huffman encoding, no compression. Raw UTF-8 JSON with proper escaping.
+/// Caller owns the returned slice.
+pub fn buildGitHubPayload(
+    allocator: mem.Allocator,
+    params: GitHubTokenParams,
+) ![]u8 {
+    // We cannot pre-calculate exact size because escaping may expand values.
+    // Use ArrayList for correct sizing, then convert to owned slice.
+    var buf = std.array_list.Managed(u8).init(allocator);
+    errdefer buf.deinit();
+
+    // {"grant_type":"authorization_code"
+    try buf.appendSlice("{\"grant_type\":\"authorization_code\"");
+    // ,"client_id":"<escaped>"
+    try buf.appendSlice(",\"client_id\":\"");
+    try appendJsonEscaped(&buf, params.client_id);
+    // ,"client_secret":"<escaped>"
+    try buf.appendSlice("\",\"client_secret\":\"");
+    try appendJsonEscaped(&buf, params.client_secret);
+    // ,"code":"<escaped>"
+    try buf.appendSlice("\",\"code\":\"");
+    try appendJsonEscaped(&buf, params.code);
+    // ,"redirect_uri":"<escaped>"
+    try buf.appendSlice("\",\"redirect_uri\":\"");
+    try appendJsonEscaped(&buf, params.redirect_uri);
+    // "}
+    try buf.appendSlice("\"}");
+
+    return buf.toOwnedSlice();
+}
+
+/// Append a UTF-8 string as an escaped JSON string fragment (without surrounding quotes).
+/// Used between already-written quote characters in the JSON body.
+/// SOURCE: RFC 8259, Section 7 — JSON string escaping
+fn appendJsonEscaped(buf: *std.array_list.Managed(u8), value: []const u8) !void {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        const ch = value[i];
+        const esc: ?[]const u8 = switch (ch) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\x08' => "\\b",
+            '\x0C' => "\\f",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => if (ch < 0x20) blk: {
+                // Emit any pending unescaped run
+                try buf.appendSlice(value[start..i]);
+                // \u00XX
+                try buf.appendSlice("\\u00");
+                const hi = ch >> 4;
+                const lo = ch & 0x0F;
+                try buf.append(if (hi < 10) '0' + @as(u8, @intCast(hi)) else 'a' + @as(u8, @intCast(hi - 10)));
+                try buf.append(if (lo < 10) '0' + @as(u8, @intCast(lo)) else 'a' + @as(u8, @intCast(lo - 10)));
+                start = i + 1;
+                break :blk null;
+            } else null,
+        };
+        if (esc) |seq| {
+            try buf.appendSlice(value[start..i]);
+            try buf.appendSlice(seq);
+            start = i + 1;
+        }
+    }
+    try buf.appendSlice(value[start..]);
+}
+
+// --- 2. HTTP/2 DATA FRAME ---
+
+// HTTP/2 DATA Frame header (9 bytes) — wire format.
+//
+// SOURCE: RFC 7540, Section 4.1 — Frame Format
+//   +-----------------------------------------------+
+//   |                 Length (24)                   |
+//   +---------------+---------------+---------------+
+//   |   Type (8)    |   Flags (8)   |
+//   +-+-------------+---------------+-------------------------------+
+//   |R|                 Stream Identifier (31)                      |
+//   +=+=============================================================+
+//
+// NOTE: Zig 0.16 packed struct + bitfield ordering for mixed-size fields
+// requires careful layout. The Stream ID field has a reserved bit (R=0).
+// We use explicit byte construction instead of packed struct to avoid
+// Zig 0.16 packed struct limitations with non-power-of-2 bit widths.
+
+// Comptime assertion: frame header is exactly 9 bytes
+comptime {
+    std.debug.assert(HTTP2_FRAME_HEADER_LEN == 9);
+}
+
+const HTTP2_FRAME_HEADER_LEN: usize = 9;
+const HTTP2_FRAME_TYPE_DATA: u8 = 0x00; // SOURCE: RFC 7540, Section 6.1 — DATA frame type
+const HTTP2_FLAG_END_STREAM: u8 = 0x01; // SOURCE: RFC 7540, Section 6.1 — END_STREAM flag
+
+/// Pack a payload into an HTTP/2 DATA frame.
+///
+/// SOURCE: RFC 7540, Section 6.1 — DATA Frame Format
+/// SOURCE: RFC 7540, Section 4.1 — Frame Header Layout
+///
+/// Frame header (9 bytes):
+///   [0..2]   Length (24-bit BE) = payload.len
+///   [3]      Type = 0x00 (DATA)
+///   [4]      Flags = END_STREAM (0x01) if end_stream else 0x00
+///   [5..8]   Stream ID (31-bit BE, R bit = 0)
+///
+/// Caller owns the returned slice.
+pub fn packInDataFrame(
+    allocator: mem.Allocator,
+    payload: []const u8,
+    stream_id: u31,
+    end_stream: bool,
+) ![]u8 {
+    // Validate: stream_id must fit in 31 bits
+    std.debug.assert(stream_id <= 0x7FFFFFFF);
+    // Validate: stream_id 0 is reserved for connection-level frames (RFC 7540 §5.1.1)
+    std.debug.assert(stream_id > 0);
+
+    const total_len = HTTP2_FRAME_HEADER_LEN + payload.len;
+
+    const buf = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(buf);
+
+    var pw = PacketWriter.init(buf);
+
+    // Length (24-bit big-endian)
+    const plen: u24 = @intCast(payload.len);
+    pw.writeByte(@truncate((plen >> 16) & 0xFF));
+    pw.writeByte(@truncate((plen >> 8) & 0xFF));
+    pw.writeByte(@truncate(plen & 0xFF));
+
+    // Type = 0x00 (DATA)
+    pw.writeByte(HTTP2_FRAME_TYPE_DATA);
+
+    // Flags
+    const flags: u8 = if (end_stream) HTTP2_FLAG_END_STREAM else 0x00;
+    pw.writeByte(flags);
+
+    // Stream ID (31-bit big-endian, R bit = 0)
+    // The R bit is the MSB of byte[5], which must be 0.
+    // stream_id is already u31, so MSB is always 0.
+    const sid: u32 = stream_id;
+    pw.writeByte(@truncate((sid >> 24) & 0xFF)); // R bit = 0, top 7 bits of stream ID
+    pw.writeByte(@truncate((sid >> 16) & 0xFF));
+    pw.writeByte(@truncate((sid >> 8) & 0xFF));
+    pw.writeByte(@truncate(sid & 0xFF));
+
+    // Payload
+    pw.writeSlice(payload);
+
+    std.debug.assert(pw.index == total_len);
+
+    return buf;
+}
+
+// --- 3. TLS 1.3 RECORD WRAPPING ---
+
+/// Wrap an HTTP/2 frame in a TLS 1.3 encrypted record.
+///
+/// SOURCE: RFC 8446, Section 5.2 — TLSCiphertext structure
+/// SOURCE: RFC 8446, Section 5.1 — Record Layer (opaque_type=0x17, legacy_version=0x0303)
+///
+/// Calls encryptRecord() to produce AEAD-protected ciphertext,
+/// then prepends the TLS record header.
+///
+/// Caller owns the returned slice.
+pub fn wrapInTlsRecord(
+    allocator: mem.Allocator,
+    session: *TlsSession,
+    http2_frame: []const u8,
+) ![]u8 {
+    // encryptRecord already produces the full TLSCiphertext (header + encrypted_record)
+    // per our implementation. We just pass through to it.
+    return encryptRecord(allocator, session, http2_frame);
+}
+
+// --- 4. RESPONSE PROCESSING ---
+
+/// Read TLS records from a raw socket, decrypt, and strip HTTP/2 frame headers.
+///
+/// SOURCE: RFC 8446, Section 5.1 — TLSPlaintext record header (5 bytes)
+/// SOURCE: RFC 7540, Section 6.1 — DATA frame parsing
+/// SOURCE: man 2 read — POSIX read syscall behavior
+///
+/// NETWORK STACK ANALYSIS:
+/// [1] UFW/iptables: Raw socket reads bypass conntrack (NOTRACK rules active from init)
+/// [2] The socket fd was set with SO_RCVTIMEO in completeHandshake, so read() will
+///     eventually return error.WouldBlock instead of blocking forever.
+/// [3] Input chain ACCEPT rule ensures packets reach the socket (added during applyRstSuppression)
+///
+/// Loop:
+///   1. Read 5-byte TLS record header
+///   2. Read Length bytes of ciphertext
+///   3. decryptRecord() → plaintext
+///   4. Parse HTTP/2 DATA frame: strip 9-byte header, accumulate payload
+///   5. If END_STREAM flag set, break and return concatenated body
+///
+/// Caller owns the returned slice.
+pub fn readAndDecryptResponse(
+    allocator: mem.Allocator,
+    session: *TlsSession,
+    fd: std.posix.fd_t,
+) ![]u8 {
+    var body_parts = std.array_list.Managed([]const u8).init(allocator);
+    errdefer {
+        for (body_parts.items) |part| {
+            allocator.free(part);
+        }
+        body_parts.deinit();
+    }
+
+    var header_buf: [TLS_REC_HEADER_LEN]u8 = undefined;
+
+    while (true) {
+        // STEP 1: Read TLS record header (5 bytes)
+        var header_pos: usize = 0;
+        while (header_pos < TLS_REC_HEADER_LEN) {
+            const n = posix.read(fd, header_buf[header_pos..TLS_REC_HEADER_LEN]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    // Cleanup accumulated body parts before returning
+                    for (body_parts.items) |part| {
+                        allocator.free(part);
+                    }
+                    body_parts.deinit();
+                    return error.ReadTimeout;
+                },
+                else => return err,
+            };
+            if (n == 0) {
+                // Cleanup accumulated body parts before returning
+                for (body_parts.items) |part| {
+                    allocator.free(part);
+                }
+                body_parts.deinit();
+                return error.ConnectionClosed;
+            }
+            header_pos += n;
+        }
+
+        // Parse record length (big-endian u16)
+        const record_length: u16 = (@as(u16, header_buf[TLS_REC_LENGTH]) << 8) |
+            @as(u16, header_buf[TLS_REC_LENGTH + 1]);
+
+        // STEP 2: Read ciphertext (record_length bytes)
+        const encrypted_record = try allocator.alloc(u8, TLS_REC_HEADER_LEN + record_length);
+        errdefer allocator.free(encrypted_record);
+
+        @memcpy(encrypted_record[0..TLS_REC_HEADER_LEN], &header_buf);
+
+        var ct_pos: usize = TLS_REC_HEADER_LEN;
+        const ct_end = TLS_REC_HEADER_LEN + record_length;
+        while (ct_pos < ct_end) {
+            const n = posix.read(fd, encrypted_record[ct_pos..ct_end]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    allocator.free(encrypted_record);
+                    for (body_parts.items) |part| allocator.free(part);
+                    body_parts.deinit();
+                    return error.ReadTimeout;
+                },
+                else => return err,
+            };
+            if (n == 0) {
+                allocator.free(encrypted_record);
+                for (body_parts.items) |part| allocator.free(part);
+                body_parts.deinit();
+                return error.ConnectionClosed;
+            }
+            ct_pos += n;
+        }
+
+        // STEP 3: Decrypt
+        const plaintext = try decryptRecord(allocator, session, encrypted_record);
+        allocator.free(encrypted_record);
+
+        // STEP 4: Parse HTTP/2 DATA frames from plaintext
+        var offset: usize = 0;
+        while (offset + HTTP2_FRAME_HEADER_LEN <= plaintext.len) {
+            // Parse frame header
+            const frame_len: usize = (@as(usize, plaintext[offset]) << 16) |
+                (@as(usize, plaintext[offset + 1]) << 8) |
+                @as(usize, plaintext[offset + 2]);
+
+            const frame_type = plaintext[offset + 3];
+            const frame_flags = plaintext[offset + 4];
+
+            // Validate: must be DATA frame (type 0x00)
+            if (frame_type != HTTP2_FRAME_TYPE_DATA) {
+                // Skip non-DATA frames (e.g., HEADERS, SETTINGS)
+                offset += HTTP2_FRAME_HEADER_LEN + frame_len;
+                continue;
+            }
+
+            // Validate: frame payload fits in remaining buffer
+            if (offset + HTTP2_FRAME_HEADER_LEN + frame_len > plaintext.len) {
+                return error.Http2FrameTruncated;
+            }
+
+            // Extract frame payload (skip 9-byte header)
+            const frame_payload = plaintext[offset + HTTP2_FRAME_HEADER_LEN .. offset + HTTP2_FRAME_HEADER_LEN + frame_len];
+            if (frame_payload.len > 0) {
+                const copy = try allocator.dupe(u8, frame_payload);
+                errdefer allocator.free(copy);
+                try body_parts.append(copy);
+            }
+
+            // Check END_STREAM flag
+            const is_end_stream = (frame_flags & HTTP2_FLAG_END_STREAM) != 0;
+
+            offset += HTTP2_FRAME_HEADER_LEN + frame_len;
+
+            if (is_end_stream) {
+                // Concatenate all body parts and return
+                const total_len = blk: {
+                    var sum: usize = 0;
+                    for (body_parts.items) |part| sum += part.len;
+                    break :blk sum;
+                };
+
+                const result = try allocator.alloc(u8, total_len);
+                var pos: usize = 0;
+                for (body_parts.items) |part| {
+                    @memcpy(result[pos .. pos + part.len], part);
+                    pos += part.len;
+                    allocator.free(part);
+                }
+                body_parts.deinit();
+
+                // Also free remaining plaintext after END_STREAM frame
+                if (offset < plaintext.len) {
+                    // There might be trailing data, but we've already consumed what we need
+                }
+                allocator.free(plaintext);
+
+                return result;
+            }
+        }
+
+        // Free plaintext if we didn't hit END_STREAM yet
+        allocator.free(plaintext);
+    }
+}
+
+/// Extract a GitHub Personal Access Token from an HTTP response body.
+///
+/// Zero-allocation: returns a slice into the input `response` buffer.
+/// The caller must NOT free the returned slice independently.
+///
+/// Algorithm:
+///   1. Search for literal bytes "ghp_" (GitHub PAT prefix)
+///   2. Extract contiguous ASCII alphanumeric characters after prefix
+///   3. Stop at first non-alphanumeric byte (typically '"' or ',')
+///   4. If run length is 0, return null
+pub fn extractPatToken(response: []const u8) ?[]const u8 {
+    const PREFIX = "ghp_";
+    const prefix_len = PREFIX.len;
+
+    var search_start: usize = 0;
+    while (search_start + prefix_len <= response.len) {
+        // Search for "ghp_"
+        const pos = std.mem.indexOfPos(u8, response, search_start, PREFIX) orelse return null;
+
+        // Extract alphanumeric run after prefix
+        var token_end = pos + prefix_len;
+        while (token_end < response.len) {
+            const ch = response[token_end];
+            const is_alnum = (ch >= 'a' and ch <= 'z') or
+                (ch >= 'A' and ch <= 'Z') or
+                (ch >= '0' and ch <= '9');
+            if (!is_alnum) break;
+            token_end += 1;
+        }
+
+        const token_len = token_end - (pos + prefix_len);
+        if (token_len == 0) {
+            // "ghp_" found but no alphanumeric chars follow — keep searching
+            search_start = pos + prefix_len;
+            continue;
+        }
+
+        return response[pos .. pos + prefix_len + token_len];
+    }
+
+    return null;
+}
+
+// --- 5. ENGINE CLEANUP ---
+
+/// Shut down the engine: close the socket and clean up firewall rules.
+///
+/// SOURCE: man 2 close — POSIX close() syscall
+/// SOURCE: man 8 iptables — iptables -D to delete rules
+/// SOURCE: man 7 raw — SOCK_RAW cleanup requirements
+///
+/// FIREWALL REQUIREMENT (cleanup):
+/// The following iptables rules added during init must be removed:
+///   iptables -A OUTPUT -p tcp --tcp-flags RST RST --sport {port} -j DROP
+///   iptables -t raw -A OUTPUT -p tcp --sport {port} -j NOTRACK
+///   iptables -t raw -A PREROUTING -p tcp --dport {port} -j NOTRACK
+///   iptables -I INPUT -p tcp --sport 443 --dport {port} -j ACCEPT
+///
+/// NETWORK STACK ANALYSIS:
+/// [1] Closing fd does NOT automatically remove iptables rules — manual cleanup required
+/// [2] If iptables -D fails, we still close the fd (no abort)
+/// [3] std.process.Child is used for iptables to mirror the exact -A/-I commands with -D
+pub fn shutdown(fd: std.posix.fd_t) void {
+    // Close the raw socket
+    posix.close(fd);
+
+    // Remove firewall rules — mirror the rules added in applyRstSuppression
+    // We need the port; in a real engine this would be passed in or stored.
+    // For now, use cleanup_port global (set during engine init).
+    if (cleanup_port != 0) {
+        var buf: [256]u8 = undefined;
+
+        // Remove OUTPUT DROP rule (-D instead of -A)
+        const cmd_rst = std.fmt.bufPrintZ(&buf, "iptables -D OUTPUT -p tcp --tcp-flags RST RST --sport {d} -j DROP", .{cleanup_port}) catch {
+            std.debug.print("[WARN] Failed to format iptables OUTPUT DROP cleanup command\n", .{});
+            return;
+        };
+        if (system(cmd_rst.ptr) != 0) {
+            std.debug.print("[WARN] iptables OUTPUT DROP cleanup failed for port {d}\n", .{cleanup_port});
+        }
+
+        // Remove OUTPUT NOTRACK rule
+        const cmd_nt_out = std.fmt.bufPrintZ(&buf, "iptables -t raw -D OUTPUT -p tcp --sport {d} -j NOTRACK", .{cleanup_port}) catch return;
+        if (system(cmd_nt_out.ptr) != 0) {
+            std.debug.print("[WARN] iptables OUTPUT NOTRACK cleanup failed for port {d}\n", .{cleanup_port});
+        }
+
+        // Remove PREROUTING NOTRACK rule
+        const cmd_nt_in = std.fmt.bufPrintZ(&buf, "iptables -t raw -D PREROUTING -p tcp --dport {d} -j NOTRACK", .{cleanup_port}) catch return;
+        if (system(cmd_nt_in.ptr) != 0) {
+            std.debug.print("[WARN] iptables PREROUTING NOTRACK cleanup failed for port {d}\n", .{cleanup_port});
+        }
+
+        // Remove INPUT ACCEPT rule (-D instead of -I)
+        const cmd_in_del = std.fmt.bufPrintZ(&buf, "iptables -D INPUT -p tcp --sport 443 --dport {d} -j ACCEPT", .{cleanup_port}) catch return;
+        if (system(cmd_in_del.ptr) != 0) {
+            std.debug.print("[WARN] iptables INPUT ACCEPT cleanup failed for port {d}\n", .{cleanup_port});
+        }
+    }
+}
+
+// ============================================================
+// MODULE 2.4 TESTS
+// ============================================================
+
+test "extractPatToken: positive case — ghp_ token extraction" {
+    const input = "{\"token\":\"ghp_12345sampletoken\",\"scope\":\"\"}";
+    const result = extractPatToken(input);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("ghp_12345sampletoken", result.?);
+    // Verify zero-allocation: result is a slice into input
+    try std.testing.expect(@intFromPtr(result.?.ptr) >= @intFromPtr(input.ptr));
+    try std.testing.expect(@intFromPtr(result.?.ptr) + result.?.len <= @intFromPtr(input.ptr) + input.len);
+}
+
+test "extractPatToken: null case — no ghp_ prefix" {
+    const input = "{\"error\":\"bad_verification_code\"}";
+    const result = extractPatToken(input);
+    try std.testing.expect(result == null);
+}
+
+test "packInDataFrame: byte layout — 5-byte payload, stream_id=1, end_stream=true" {
+    const allocator = std.testing.allocator;
+    const payload = "hello";
+    const frame = try packInDataFrame(allocator, payload, 1, true);
+    defer allocator.free(frame);
+
+    // Expected: [0x00, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, ...payload]
+    // SOURCE: RFC 7540, Section 6.1 — DATA frame header layout
+    try std.testing.expectEqual(@as(u8, 0x00), frame[0]); // Length high
+    try std.testing.expectEqual(@as(u8, 0x00), frame[1]); // Length mid
+    try std.testing.expectEqual(@as(u8, 0x05), frame[2]); // Length low = 5
+    try std.testing.expectEqual(@as(u8, 0x00), frame[3]); // Type = DATA
+    try std.testing.expectEqual(@as(u8, 0x01), frame[4]); // Flags = END_STREAM
+    try std.testing.expectEqual(@as(u8, 0x00), frame[5]); // Stream ID byte 0 (R=0, top 7 bits)
+    try std.testing.expectEqual(@as(u8, 0x00), frame[6]); // Stream ID byte 1
+    try std.testing.expectEqual(@as(u8, 0x00), frame[7]); // Stream ID byte 2
+    try std.testing.expectEqual(@as(u8, 0x01), frame[8]); // Stream ID byte 3
+    try std.testing.expectEqualStrings("hello", frame[9..]);
+}
+
+test "buildGitHubPayload: field presence and JSON structure" {
+    const allocator = std.testing.allocator;
+    const params = GitHubTokenParams{
+        .client_id = "test_client_id",
+        .client_secret = "test_client_secret",
+        .code = "auth_code_123",
+        .redirect_uri = "https://example.com/callback",
+    };
+    const json = try buildGitHubPayload(allocator, params);
+    defer allocator.free(json);
+
+    // Verify all required fields are present
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"client_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"client_secret\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"redirect_uri\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"grant_type\":\"authorization_code\"") != null);
+
+    // Verify JSON structure: opening '{' and closing '}'
+    try std.testing.expect(json[0] == '{');
+    try std.testing.expect(json[json.len - 1] == '}');
+}
+
+test "packInDataFrame: end_stream=false flag" {
+    const allocator = std.testing.allocator;
+    const payload = "data";
+    const frame = try packInDataFrame(allocator, payload, 42, false);
+    defer allocator.free(frame);
+
+    try std.testing.expectEqual(@as(u8, 0x00), frame[4]); // Flags = 0 (no END_STREAM)
+    // Stream ID = 42 = 0x0000002A
+    try std.testing.expectEqual(@as(u8, 0x00), frame[5]);
+    try std.testing.expectEqual(@as(u8, 0x00), frame[6]);
+    try std.testing.expectEqual(@as(u8, 0x00), frame[7]);
+    try std.testing.expectEqual(@as(u8, 0x2A), frame[8]);
+}
+
+test "extractPatToken: empty response" {
+    const input = "";
+    try std.testing.expect(extractPatToken(input) == null);
+}
+
+test "extractPatToken: ghp_ at end with no alphanumeric" {
+    const input = "ghp_";
+    try std.testing.expect(extractPatToken(input) == null);
+}
+
+test "extractPatToken: multiple ghp_ prefixes, first has no token" {
+    const input = "ghp_\"ghp_abcdef123456\"";
+    const result = extractPatToken(input);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("ghp_abcdef123456", result.?);
+}
+
+test "encryptRecord then decryptRecord: round-trip" {
+    const allocator = std.testing.allocator;
+
+    var session = TlsSession{
+        .client_write_key = [_]u8{0x00} ** 16,
+        .client_write_iv = [_]u8{0x00} ** 12,
+        .server_write_key = [_]u8{0x00} ** 16,
+        .server_write_iv = [_]u8{0x00} ** 12,
+        .seq_send = 0,
+        .seq_recv = 0,
+    };
+
+    const plaintext = "Hello, TLS 1.3!";
+
+    const encrypted = try encryptRecord(allocator, &session, plaintext);
+    defer allocator.free(encrypted);
+
+    // Verify record header
+    try std.testing.expectEqual(@as(u8, 0x17), encrypted[0]); // application_data
+    try std.testing.expectEqual(@as(u8, 0x03), encrypted[1]); // TLS 1.2 version
+    try std.testing.expectEqual(@as(u8, 0x03), encrypted[2]);
+
+    // Decrypt (use same key/iv for symmetry in test)
+    var decrypt_session = TlsSession{
+        .client_write_key = session.client_write_key,
+        .client_write_iv = session.client_write_iv,
+        .server_write_key = session.client_write_key, // same key for test
+        .server_write_iv = session.client_write_iv, // same iv for test
+        .seq_send = 0,
+        .seq_recv = 0,
+    };
+    // Reset send seq since encryptRecord incremented it
+    session.seq_send = 0;
+
+    const decrypted = try decryptRecord(allocator, &decrypt_session, encrypted);
+    defer allocator.free(decrypted);
+
+    try std.testing.expectEqualStrings(plaintext, decrypted);
+}
+
+test "computeNonce: RFC 8446 Section 5.3 compliance" {
+    // write_iv = [0x01, 0x02, ..., 0x0C]
+    // seq_num = 0
+    // nonce should be write_iv XOR 0 = write_iv
+    const write_iv = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C };
+    const nonce0 = computeNonce(write_iv, 0);
+    try std.testing.expectEqual(write_iv, nonce0);
+
+    // seq_num = 1
+    // nonce = write_iv XOR [0,0,0,0, 0,0,0,0, 0,0,0,1]
+    const nonce1 = computeNonce(write_iv, 1);
+    try std.testing.expectEqual(@as(u8, 0x01), nonce1[0]);
+    try std.testing.expectEqual(@as(u8, 0x02), nonce1[1]);
+    try std.testing.expectEqual(@as(u8, 0x03), nonce1[2]);
+    try std.testing.expectEqual(@as(u8, 0x04), nonce1[3]);
+    try std.testing.expectEqual(@as(u8, 0x05), nonce1[4]);
+    try std.testing.expectEqual(@as(u8, 0x06), nonce1[5]);
+    try std.testing.expectEqual(@as(u8, 0x07), nonce1[6]);
+    try std.testing.expectEqual(@as(u8, 0x08), nonce1[7]);
+    try std.testing.expectEqual(@as(u8, 0x09), nonce1[8]);
+    try std.testing.expectEqual(@as(u8, 0x0A), nonce1[9]);
+    try std.testing.expectEqual(@as(u8, 0x0B), nonce1[10]);
+    try std.testing.expectEqual(@as(u8, 0x0C ^ 0x01), nonce1[11]); // 0x0C XOR 0x01 = 0x0D
+}
+
+test "TlsSession comptime assertions" {
+    // Verify key and IV sizes match AES-128-GCM requirements
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    try std.testing.expectEqual(@as(usize, 16), Aes128Gcm.key_length);
+    try std.testing.expectEqual(@as(usize, 12), Aes128Gcm.nonce_length);
+    try std.testing.expectEqual(@as(usize, 16), Aes128Gcm.tag_length);
+
+    // Verify TlsSession field sizes
+    const session: TlsSession = undefined;
+    _ = @sizeOf(@TypeOf(session)); // Must compile
+    _ = session.client_write_key;
+    _ = session.client_write_iv;
+    _ = session.server_write_key;
+    _ = session.server_write_iv;
+    _ = session.seq_send;
+    _ = session.seq_recv;
+}

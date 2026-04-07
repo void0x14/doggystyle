@@ -533,3 +533,32 @@ if (total_len > MTU_LIMIT) {
 *Son güncelleme: 2026-04-07*
 *Güncelleyen: Red Team Audit + void0x14*
 *Tetikleyen: Column A holistic statik analiz*
+
+---
+
+## [2026-04-07] — Module 2.4 Implementasyonu: AES-GCM API, JSON Buffer Hesaplama ve Nonce Test Hataları
+
+**Tetikleyici:** Module 2.4 — Payload Construction and Token Extraction implementasyonu
+**Dosyalar:** `src/network_core.zig`
+**Tip:** Proaktif — runtime hatası görülmeden, test aşamasında tespit edildi
+
+### Hata 1: `std.crypto.aead.Aes128Gcm` yolu yanlış
+**Doğru yol:** `std.crypto.aead.aes_gcm.Aes128Gcm` (nested struct organizasyonu)
+
+### Hata 2: Aes128Gcm.encrypt ciphertext buffer boyutu yanlış
+**Sorun:** `ciphertext = plaintext_len + TAG_LEN` allocate edildi, ama API `c.len == m.len` assert ediyor.
+**Çözüm:** ciphertext buffer = plaintext size, tag ayrı output parametresi.
+
+### Hata 3: buildGitHubPayload buffer boyutu yanlış hesaplanmış
+**Sorun:** Manuel `fixed_overhead` hesaplaması string literal uzunluklarını yanlış topluyordu.
+**Çözüm:** Statik string constants + `.len` ile otomatik hesaplama.
+
+### Hata 4: computeNonce testinde XOR değeri yanlış
+**Sorun:** `0x0B ^ 0x01` yazıyordu, `0x0C ^ 0x01` olmalı.
+**Çözüm:** `0x0C ^ 0x01 = 0x0D` olarak düzeltildi.
+
+---
+
+*Son güncelleme: 2026-04-07*
+*Güncelleyen: void0x14*
+*Tetikleyen: Module 2.4 implementasyonu ve zig build test*
