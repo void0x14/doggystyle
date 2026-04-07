@@ -54,6 +54,14 @@ pub fn build(b: *std.Build) void {
     test_run.has_side_effects = true;
     test_step.dependOn(&test_run.step);
 
+    // Module 2.2: HTTP/2 core tests
+    const http2_test_run = b.addSystemCommand(&.{
+        vendor_zig,      "test",           "src/http2_core.zig",
+        "--zig-lib-dir", "vendor/zig-std", "-lc",
+    });
+    http2_test_run.has_side_effects = true;
+    test_step.dependOn(&http2_test_run.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
