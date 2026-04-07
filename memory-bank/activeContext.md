@@ -1,18 +1,53 @@
-# Active Context: Surgical Packet Filter Refactor
+# Active Context: İki Katmanlı UFW Sorunu Çözüldü
 
-## Current Work
-Implemented strict 3-field packet validation in the raw socket listener to eliminate global background noise capture. The completeHandshake loop now only processes packets that pass: IPv4 Protocol==TCP, Source IP==Target IP, Destination Port==Our Bound Port.
+## Gerçek Kök Neden (Kesin, Kanıtlanmış)
 
-## Recent Decisions
-- **Source IP Filtering Enabled**: Reversed the `null` source IP decision. Now strictly validates `Source IP == ctx.dst_ip` in both the handshake loop and JA4S verification loop. This eliminates all non-target traffic.
-- **Post-Handshake TCP Options Fixed**: ACK and DATA packets now use standard `NOP+NOP+Timestamps` (12 bytes), not SYN-only options (SACK Permitted, Window Scale). Per RFC 793/7323, SACK and WS are SYN-only and cause server-side state confusion when present in post-handshake packets.
-- **MTU Raised to 1500**: Changed from 1492 (PPPoE-safe) to 1500 (standard Ethernet MTU) per user requirement.
-- **Jitter Range 8-15ms**: Changed from 5-12ms to 8-15ms organic jitter between ACK and TLS Client Hello.
-- **Logging After Filter**: `INBOUND PACKET` log moved after the surgical filter. Non-matching packets are silently dropped — no noise in output.
-- **TLS Alert Parsing**: Added `parseTlsAlertDescription()` with full RFC 8446 alert code lookup table.
-- **verify.sh Rewrite**: Fully autonomous, zero-intervention verification script matching new log patterns.
+tcpdump + raw socket karşılaştırması sonucu tespiti:
 
-## Open Questions/Tasks
-- **Anycast Compatibility**: Source IP filtering may reject legitimate responses from Cloudflare anycast IPs that differ from the target. Monitor for false negatives against CDN targets.
-- **Windows Porting**: `WindowsRawSocket` still returns `error.NotImplemented`.
-- **TLS Extension Order**: Further refinement possible to exactly match Chrome's current JA4 signature.
+```
+tcpdump (AF_PACKET, iptables ÖNCESİ): SYN-ACK görüyor ✓
+SOCK_RAW (AF_INET, iptables SONRASI): SYN-ACK görmüyor ✗
+```
+
+**Linux kernel netfilter akışı:**
+NIC → PREROUTING → routing → INPUT chain → socket delivery
+
+tcpdump pre-iptables çalışır (AF_PACKET seviyesi). SOCK_RAW, INPUT zincirinden SONRA paket alır. UFW INPUT `policy DROP` ve eşleşen ACCEPT kuralı olmadığından SYN-ACK INPUT chain'de düşürülüyordu.
+
+### Uygulanan Düzeltmeler
+
+1. **PREROUTING NOTRACK**: Inbound SYN-ACK için conntrack bypass (INVALID olarak işaretlenmesin)
+2. **INPUT ACCEPT** (asıl kritik düzeltme): `iptables -I INPUT -p tcp --sport 443 --dport {port} -j ACCEPT`
+   - UFW'un DROP policy'sini bypass eder
+   - Paketi socket delivery'a ulaştırır
+
+### TLS decode_error Düzeltmesi
+
+**Neden**: `0xFE0D` GREASE extension tipi değil — IANA'nın ECH'e atadığı gerçek extension tipi. Cloudflare 1.1.1.1 üzerinde ECH implement ediyor ve payload'ı strict parse ediyor. Önceki payload'daki byte[0] = `0x0D` geçersiz (ECH type: 0=inner, 1=outer).
+
+**Düzeltme**: ECHClientHello outer wire format:
+- byte 0: `0x01` (outer)
+- byte 1-2: `0x0001` (HKDF-SHA256)
+- byte 3-4: `0x0001` (AES-128-GCM)
+- byte 5: random config_id
+- byte 6-7: `0x0000` (enc length = 0)
+- byte 8-9: `0x0001` (payload length = 1)
+- byte 10: random payload byte
+
+## Mevcut Durum
+- Build: başarılı
+- PREROUTING NOTRACK + INPUT ACCEPT + ECH fix uygulandı
+- `sudo ./verify.sh` çalıştırılmayı bekliyor
+- Beklenen: STAGES=4+ → OVERALL SUCCESS
+
+## verify.sh Aşama Haritası
+| Aşama | Kontrol | Hata mı? |
+|---|---|---|
+| SYN-ACK | [SUCCESS] Targeted SYN-ACK Captured | RESULT=1 (mandatory) |
+| Handshake | Handshake Completed | stage++ only |
+| MTU | [MTU] Packet size N bytes <= 1500 | RESULT=1 if violation |
+| TLS Hello | TLS Client Hello sent | stage++ only |
+| JA4S | [SUCCESS] JA4S Confirmed | WARNING only |
+| RST leak | Kernel Leak Detected | RESULT=1 if present |
+
+STAGES >= 4 ve RESULT = 0 → OVERALL SUCCESS

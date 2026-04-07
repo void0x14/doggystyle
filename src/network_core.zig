@@ -103,8 +103,14 @@ fn signalHandler(sig: std.os.linux.SIG) callconv(.c) void {
         const cmd_str = std.fmt.bufPrintZ(&buf, "iptables -D OUTPUT -p tcp --tcp-flags RST RST --sport {d} -j DROP", .{cleanup_port}) catch return;
         _ = system(cmd_str.ptr);
 
-        const cmd_nt = std.fmt.bufPrintZ(&buf, "iptables -t raw -D OUTPUT -p tcp --sport {d} -j NOTRACK", .{cleanup_port}) catch return;
-        _ = system(cmd_nt.ptr);
+        const cmd_nt_out = std.fmt.bufPrintZ(&buf, "iptables -t raw -D OUTPUT -p tcp --sport {d} -j NOTRACK", .{cleanup_port}) catch return;
+        _ = system(cmd_nt_out.ptr);
+
+        const cmd_nt_in = std.fmt.bufPrintZ(&buf, "iptables -t raw -D PREROUTING -p tcp --dport {d} -j NOTRACK", .{cleanup_port}) catch return;
+        _ = system(cmd_nt_in.ptr);
+
+        const cmd_in_del = std.fmt.bufPrintZ(&buf, "iptables -D INPUT -p tcp --sport 443 --dport {d} -j ACCEPT", .{cleanup_port}) catch return;
+        _ = system(cmd_in_del.ptr);
     }
     std.process.exit(1);
 }
@@ -273,6 +279,22 @@ const sock_fprog = extern struct {
     filter: [*c]const sock_filter,
 };
 
+fn buildCanonicalTcpSocketFilter(src_ip: u32, target_port: u16, ephemeral_port: u16) [11]sock_filter {
+    return [11]sock_filter{
+        .{ .code = 0x30, .jt = 0, .jf = 0, .k = 9 },
+        .{ .code = 0x15, .jt = 0, .jf = 8, .k = posix.IPPROTO.TCP },
+        .{ .code = 0x20, .jt = 0, .jf = 0, .k = 16 },
+        .{ .code = 0x15, .jt = 0, .jf = 6, .k = src_ip },
+        .{ .code = 0xb1, .jt = 0, .jf = 0, .k = 0 },
+        .{ .code = 0x48, .jt = 0, .jf = 0, .k = 0 },
+        .{ .code = 0x15, .jt = 0, .jf = 3, .k = target_port },
+        .{ .code = 0x48, .jt = 0, .jf = 0, .k = 2 },
+        .{ .code = 0x15, .jt = 0, .jf = 1, .k = ephemeral_port },
+        .{ .code = 0x06, .jt = 0, .jf = 0, .k = 0x00040000 },
+        .{ .code = 0x06, .jt = 0, .jf = 0, .k = 0 },
+    };
+}
+
 const LinuxRawSocket = struct {
     fd: posix.socket_t,
     ifindex: u32,
@@ -298,49 +320,7 @@ const LinuxRawSocket = struct {
     }
 
     fn attachTcpFilter(fd: posix.socket_t, src_ip: u32, target_port: u16, ephemeral_port: u16) !void {
-        const local_ip_bytes = [4]u8{
-            @truncate((src_ip >> 24) & 0xFF),
-            @truncate((src_ip >> 16) & 0xFF),
-            @truncate((src_ip >> 8) & 0xFF),
-            @truncate(src_ip & 0xFF),
-        };
-        const target_port_bytes = [2]u8{
-            @truncate((target_port >> 8) & 0xFF),
-            @truncate(target_port & 0xFF),
-        };
-        const ephemeral_port_bytes = [2]u8{
-            @truncate((ephemeral_port >> 8) & 0xFF),
-            @truncate(ephemeral_port & 0xFF),
-        };
-
-        // Linux AF_INET/SOCK_RAW packets start at the IPv4 header.
-        // Filter only the target inbound flow before userspace sees host TCP noise.
-        const filter = [24]sock_filter{
-            .{ .code = 0x30, .jt = 0, .jf = 0, .k = 9 },
-            .{ .code = 0x15, .jt = 0, .jf = 21, .k = posix.IPPROTO.TCP },
-            .{ .code = 0x30, .jt = 0, .jf = 0, .k = 16 },
-            .{ .code = 0x15, .jt = 0, .jf = 19, .k = local_ip_bytes[0] },
-            .{ .code = 0x30, .jt = 0, .jf = 0, .k = 17 },
-            .{ .code = 0x15, .jt = 0, .jf = 17, .k = local_ip_bytes[1] },
-            .{ .code = 0x30, .jt = 0, .jf = 0, .k = 18 },
-            .{ .code = 0x15, .jt = 0, .jf = 15, .k = local_ip_bytes[2] },
-            .{ .code = 0x30, .jt = 0, .jf = 0, .k = 19 },
-            .{ .code = 0x15, .jt = 0, .jf = 13, .k = local_ip_bytes[3] },
-            .{ .code = 0x30, .jt = 0, .jf = 0, .k = 0 },
-            .{ .code = 0x54, .jt = 0, .jf = 0, .k = 0x0F },
-            .{ .code = 0x64, .jt = 0, .jf = 0, .k = 2 },
-            .{ .code = 0x07, .jt = 0, .jf = 0, .k = 0 },
-            .{ .code = 0x50, .jt = 0, .jf = 0, .k = 0 },
-            .{ .code = 0x15, .jt = 0, .jf = 7, .k = target_port_bytes[0] },
-            .{ .code = 0x50, .jt = 0, .jf = 0, .k = 1 },
-            .{ .code = 0x15, .jt = 0, .jf = 5, .k = target_port_bytes[1] },
-            .{ .code = 0x50, .jt = 0, .jf = 0, .k = 2 },
-            .{ .code = 0x15, .jt = 0, .jf = 3, .k = ephemeral_port_bytes[0] },
-            .{ .code = 0x50, .jt = 0, .jf = 0, .k = 3 },
-            .{ .code = 0x15, .jt = 0, .jf = 1, .k = ephemeral_port_bytes[1] },
-            .{ .code = 0x06, .jt = 0, .jf = 0, .k = 0x00040000 },
-            .{ .code = 0x06, .jt = 0, .jf = 0, .k = 0 },
-        };
+        const filter = buildCanonicalTcpSocketFilter(src_ip, target_port, ephemeral_port);
 
         var fprog = sock_fprog{
             .len = @intCast(filter.len),
@@ -1078,21 +1058,34 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
     var random: [32]u8 = undefined;
     try fillEntropy(&random);
     
-    // RFC 9446/9447: Structured ECH GREASE
-    // Layout: [type(1) + config_id(1) + cipher_suite(2) + encapped_len(2) + payload(5)]
+    // ECH GREASE: proper ECHClientHello outer wire format (draft-ietf-tls-esni).
+    // 0xFE0D is the ACTUAL ECH extension type assigned by IANA — NOT a GREASE type.
+    // Cloudflare on 1.1.1.1 implements ECH and strictly parses this extension.
+    // The previous payload had type=0x0D which is invalid (must be 0=inner or 1=outer)
+    // causing Cloudflare to return TLS Alert decode_error (50).
+    //
+    // Correct ECHClientHello outer layout (11 bytes total = ech_grease_payload_len):
+    //   byte 0:   type = 0x01 (outer)
+    //   byte 1-2: KDF id = 0x0001 (HKDF-SHA256)
+    //   byte 3-4: AEAD id = 0x0001 (AES-128-GCM)
+    //   byte 5:   config_id (random, GREASE)
+    //   byte 6-7: enc length = 0x0000 (empty enc → signals GREASE/HRR)
+    //   byte 8-9: payload length = 0x0001
+    //   byte 10:  payload byte (random)
     var ech_grease_payload = [_]u8{0} ** ech_grease_payload_len;
-    ech_grease_payload[0] = 0x0D; // type: encrypted_client_hello (GREASE placeholder)
-    ech_grease_payload[1] = 0x00; // config_id: 0 (GREASE)
-    ech_grease_payload[2] = 0xFE; // cipher_suite: GREASE (0xFE0D)
-    ech_grease_payload[3] = 0x0D;
-    // Payload length (remaining bytes after this field)
-    const ech_payload_remaining: u16 = @as(u16, @intCast(ech_grease_payload_len - 4));
-    ech_grease_payload[4] = @truncate((ech_payload_remaining >> 8) & 0xFF);
-    ech_grease_payload[5] = @truncate(ech_payload_remaining & 0xFF);
-    // Fill remaining with entropy (GREASE payload)
-    if (ech_grease_payload_len > 6) {
-        try fillEntropy(ech_grease_payload[6..]);
-    }
+    var ech_random: [2]u8 = undefined;
+    try fillEntropy(&ech_random);
+    ech_grease_payload[0] = 0x01;        // type = outer
+    ech_grease_payload[1] = 0x00;        // KDF id high
+    ech_grease_payload[2] = 0x01;        // KDF id low  (HKDF-SHA256)
+    ech_grease_payload[3] = 0x00;        // AEAD id high
+    ech_grease_payload[4] = 0x01;        // AEAD id low (AES-128-GCM)
+    ech_grease_payload[5] = ech_random[0]; // config_id (random)
+    ech_grease_payload[6] = 0x00;        // enc length high
+    ech_grease_payload[7] = 0x00;        // enc length low (empty enc)
+    ech_grease_payload[8] = 0x00;        // payload length high
+    ech_grease_payload[9] = 0x01;        // payload length low (1 byte)
+    ech_grease_payload[10] = ech_random[1]; // payload (random byte)
     var hybrid_keyshare = [_]u8{0} ** hybrid_keyshare_len;
     try fillHybridKeyShare(&hybrid_keyshare);
     const grease_value = try randomGreaseCodepoint();
@@ -1500,13 +1493,34 @@ pub fn applyRstSuppression(allocator: std.mem.Allocator, port: u16) !void {
     _ = allocator;
     if (is_linux) {
         var buf: [256]u8 = undefined;
-        // RST Suppression
+
+        // 1. RST Suppression: prevent kernel from sending RST for our raw SYN
         const cmd_rst = std.fmt.bufPrintZ(&buf, "iptables -A OUTPUT -p tcp --tcp-flags RST RST --sport {d} -j DROP", .{port}) catch return error.CmdFormatFailed;
         if (system(cmd_rst.ptr) != 0) return error.FirewallLockFailed;
-        
-        // NOTRACK to bypass conntrack (avoids state collisions in high-load/shadowban scenarios)
-        const cmd_nt = std.fmt.bufPrintZ(&buf, "iptables -t raw -A OUTPUT -p tcp --sport {d} -j NOTRACK", .{port}) catch return error.CmdFormatFailed;
-        _ = system(cmd_nt.ptr);
+
+        // 2. NOTRACK outbound: bypass conntrack for our outgoing SYN
+        const cmd_nt_out = std.fmt.bufPrintZ(&buf, "iptables -t raw -A OUTPUT -p tcp --sport {d} -j NOTRACK", .{port}) catch return error.CmdFormatFailed;
+        _ = system(cmd_nt_out.ptr);
+
+        // 3. NOTRACK inbound: bypass conntrack for SYN-ACK so it isn't marked INVALID
+        const cmd_nt_in = std.fmt.bufPrintZ(&buf, "iptables -t raw -A PREROUTING -p tcp --dport {d} -j NOTRACK", .{port}) catch return error.CmdFormatFailed;
+        _ = system(cmd_nt_in.ptr);
+
+        // 4. INPUT ACCEPT: CRITICAL — tcpdump proves SYN-ACK reaches the NIC but
+        //    UFW's default INPUT policy is DROP. The packet travels:
+        //      NIC -> PREROUTING -> routing -> INPUT chain -> socket delivery
+        //    tcpdump hooks at the NIC (AF_PACKET, pre-iptables) so it sees the
+        //    packet. SOCK_RAW hooks AFTER INPUT chain — if UFW drops it there,
+        //    the raw socket gets nothing. We must INSERT an ACCEPT rule at the
+        //    top of INPUT so UFW passes the SYN-ACK through before its DROP policy.
+        const cmd_in_accept = std.fmt.bufPrintZ(&buf, "iptables -I INPUT -p tcp --sport 443 --dport {d} -j ACCEPT", .{port}) catch return error.CmdFormatFailed;
+        if (system(cmd_in_accept.ptr) != 0) {
+            std.debug.print("[WARN] INPUT ACCEPT rule failed for port {d} - SYN-ACK may be dropped by UFW\n", .{port});
+        } else {
+            std.debug.print("[FIREWALL] INPUT ACCEPT inserted for port {d} (allows SYN-ACK past UFW DROP policy)\n", .{port});
+        }
+
+        std.debug.print("[FIREWALL] All rules applied for port {d}\n", .{port});
     } else if (is_windows) {
         std.debug.print("Windows WFP Native RST suppression engaged on port {d}\n", .{port});
     }
@@ -1516,11 +1530,19 @@ pub fn removeRstSuppression(allocator: std.mem.Allocator, port: u16) void {
     _ = allocator;
     if (is_linux) {
         var buf: [256]u8 = undefined;
+
         const cmd_rst = std.fmt.bufPrintZ(&buf, "iptables -D OUTPUT -p tcp --tcp-flags RST RST --sport {d} -j DROP", .{port}) catch return;
         _ = system(cmd_rst.ptr);
-        
-        const cmd_nt = std.fmt.bufPrintZ(&buf, "iptables -t raw -D OUTPUT -p tcp --sport {d} -j NOTRACK", .{port}) catch return;
-        _ = system(cmd_nt.ptr);
+
+        const cmd_nt_out = std.fmt.bufPrintZ(&buf, "iptables -t raw -D OUTPUT -p tcp --sport {d} -j NOTRACK", .{port}) catch return;
+        _ = system(cmd_nt_out.ptr);
+
+        const cmd_nt_in = std.fmt.bufPrintZ(&buf, "iptables -t raw -D PREROUTING -p tcp --dport {d} -j NOTRACK", .{port}) catch return;
+        _ = system(cmd_nt_in.ptr);
+
+        // Remove the INPUT ACCEPT rule added during setup
+        const cmd_in_del = std.fmt.bufPrintZ(&buf, "iptables -D INPUT -p tcp --sport 443 --dport {d} -j ACCEPT", .{port}) catch return;
+        _ = system(cmd_in_del.ptr);
     } else if (is_windows) {
         std.debug.print("Windows WFP Native RST suppression disengaged on port {d}\n", .{port});
     }
@@ -2296,4 +2318,24 @@ test "linux sock_fprog ABI matches kernel headers" {
     try std.testing.expectEqual(@alignOf(*const sock_filter), @alignOf(sock_fprog));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(sock_fprog, "len"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(sock_fprog, "filter"));
+}
+
+test "linux canonical tcp raw socket filter matches expected instructions" {
+    if (!is_linux) return;
+
+    const local_ip: u32 = (@as(u32, 192) << 24) | (@as(u32, 168) << 16) | (@as(u32, 1) << 8) | 2;
+    const filter = buildCanonicalTcpSocketFilter(local_ip, 443, 65101);
+
+    try std.testing.expectEqual(@as(usize, 11), filter.len);
+    try std.testing.expectEqual(sock_filter{ .code = 0x30, .jt = 0, .jf = 0, .k = 9 }, filter[0]);
+    try std.testing.expectEqual(sock_filter{ .code = 0x15, .jt = 0, .jf = 8, .k = posix.IPPROTO.TCP }, filter[1]);
+    try std.testing.expectEqual(sock_filter{ .code = 0x20, .jt = 0, .jf = 0, .k = 16 }, filter[2]);
+    try std.testing.expectEqual(sock_filter{ .code = 0x15, .jt = 0, .jf = 6, .k = local_ip }, filter[3]);
+    try std.testing.expectEqual(sock_filter{ .code = 0xb1, .jt = 0, .jf = 0, .k = 0 }, filter[4]);
+    try std.testing.expectEqual(sock_filter{ .code = 0x48, .jt = 0, .jf = 0, .k = 0 }, filter[5]);
+    try std.testing.expectEqual(sock_filter{ .code = 0x15, .jt = 0, .jf = 3, .k = 443 }, filter[6]);
+    try std.testing.expectEqual(sock_filter{ .code = 0x48, .jt = 0, .jf = 0, .k = 2 }, filter[7]);
+    try std.testing.expectEqual(sock_filter{ .code = 0x15, .jt = 0, .jf = 1, .k = 65101 }, filter[8]);
+    try std.testing.expectEqual(sock_filter{ .code = 0x06, .jt = 0, .jf = 0, .k = 0x00040000 }, filter[9]);
+    try std.testing.expectEqual(sock_filter{ .code = 0x06, .jt = 0, .jf = 0, .k = 0 }, filter[10]);
 }
