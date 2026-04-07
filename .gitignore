@@ -8,4 +8,3 @@ network_core
 tests/
 logs/
 .qwen/
-docs/
