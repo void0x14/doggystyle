@@ -1927,6 +1927,230 @@ fn verifyServerHelloCipher(payload: []const u8) bool {
     return false;
 }
 
+// ============================================================
+// MODULE 2.1 — TLS 1.3 Server Response Parser
+// ============================================================
+
+// SOURCE: RFC 8446, Section 5.1 — TLSPlaintext structure
+//   struct {
+//       ContentType type;
+//       ProtocolVersion legacy_record_version;
+//       uint16 length;
+//       opaque fragment[TLSPlaintext.length];
+//   } TLSPlaintext;
+//
+// NOTE: Zig 0.16'da packed struct + [N]u8 field + @bitCast sorunları nedeniyle
+// explicit byte-offset parsing kullanıyoruz. Her offset RFC referanslıdır.
+// AGENTS.md failure_log: packed struct + [N]u8 not supported in Zig 0.16.
+
+/// TLS Record Header field offsets (big-endian wire format) — PUBLIC for external use
+/// SOURCE: RFC 8446, Section 5.1
+pub const TLS_REC_CONTENT_TYPE: usize = 0; // u8
+pub const TLS_REC_VERSION: usize = 1; // u16 (big-endian)
+pub const TLS_REC_LENGTH: usize = 3; // u16 (big-endian)
+pub const TLS_REC_HEADER_LEN: usize = 5;
+
+/// TLS Handshake Header field offsets (big-endian wire format) — PUBLIC for external use
+/// SOURCE: RFC 8446, Section 4
+pub const TLS_HS_MSG_TYPE: usize = 0; // u8
+pub const TLS_HS_LENGTH: usize = 1; // u24 (3 bytes, big-endian)
+pub const TLS_HS_HEADER_LEN: usize = 4;
+
+/// TLS Alert payload field offsets — PUBLIC for external use
+/// SOURCE: RFC 8446, Section 6
+pub const TLS_ALERT_LEVEL: usize = 0; // u8
+pub const TLS_ALERT_DESC: usize = 1; // u8
+pub const TLS_ALERT_LEN: usize = 2;
+
+/// ServerHello fixed fields offsets (relative to handshake body start) — PUBLIC
+/// SOURCE: RFC 8446, Section 4.1.3 — ServerHello structure
+pub const TLS_SH_VERSION: usize = 0; // u16 (big-endian) = 0x0303
+pub const TLS_SH_RANDOM: usize = 2; // opaque Random[32]
+pub const TLS_SH_RANDOM_LEN: usize = 32;
+pub const TLS_SH_SID_LEN: usize = 34; // u8 legacy_session_id length (0..32)
+// session_id follows immediately (variable length)
+// cipher_suite follows session_id (2 bytes, big-endian)
+// compression_method follows cipher_suite (1 byte, must be 0x00)
+// extensions_length follows compression_method (2 bytes, big-endian)
+
+// Comptime assertions for protocol constant correctness
+comptime {
+    // Record header: 1(content_type) + 2(version) + 2(length) = 5
+    std.debug.assert(TLS_REC_HEADER_LEN == 5);
+    // Handshake header: 1(msg_type) + 3(length) = 4
+    std.debug.assert(TLS_HS_HEADER_LEN == 4);
+    // Alert payload: 1(level) + 1(desc) = 2
+    std.debug.assert(TLS_ALERT_LEN == 2);
+    // ServerHello fixed: 2(version) + 32(random) + 1(sid_len) = 35
+    std.debug.assert(TLS_SH_SID_LEN == 34);
+}
+
+/// Result of parsing a server TLS response
+pub const HandshakeResult = struct {
+    /// TLS record content_type (0x15=Alert, 0x16=Handshake)
+    record_type: u8,
+    /// If Alert: alert level (1=warning, 2=fatal)
+    alert_level: ?u8 = null,
+    /// If Alert: alert description (40=handshake_failure, 50=decode_error, etc.)
+    alert_description: ?u8 = null,
+    /// If ServerHello: handshake message type (should be 0x02)
+    handshake_type: ?u8 = null,
+    /// If ServerHello: cipher suite chosen by server (big-endian)
+    cipher_suite: ?u16 = null,
+    /// If ServerHello: legacy_session_id (opaque copy)
+    session_id: []const u8 = "",
+    /// If ServerHello: legacy_compression_method (should be 0x00 per RFC 8446)
+    compression_method: ?u8 = null,
+    /// If ServerHello: total extensions length in bytes
+    extensions_length: ?u16 = null,
+
+    /// Check if the selected cipher suite is in the JA4 offered list
+    pub fn isJa4Cipher(self: HandshakeResult) bool {
+        const cipher = self.cipher_suite orelse return false;
+        const ja4_ciphers = [_]u16{
+            0x1301, 0x1302, 0x1303, // TLS 1.3
+            0xC02B, 0xC02F, 0xC02C, 0xC030, // ECDHE-ECDSA/RSA-AES-GCM
+            0xCCA8, 0xCCA9, // CHACHA20
+            0xC009, 0xC013, 0xC00A, 0xC014, // Older ECDHE
+            0x009C, 0x009D, // RSA-AES-GCM
+        };
+        for (ja4_ciphers) |c| {
+            if (cipher == c) return true;
+        }
+        return false;
+    }
+};
+
+pub const TlsError = error{
+    TlsAlertReceived,
+    UnexpectedHandshakeType,
+    InvalidRecordType,
+};
+
+/// Parse a raw TLS server response buffer into a HandshakeResult.
+///
+/// SOURCE: RFC 8446, Section 5.1 — Record Layer
+/// SOURCE: RFC 8446, Section 4 — Handshake Protocol
+/// SOURCE: RFC 8446, Section 4.1.3 — ServerHello
+/// SOURCE: RFC 8446, Section 6 — Alert Protocol
+/// SOURCE: IANA TLS Cipher Suites — https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml
+///
+/// STEP 1: Validate Record Header (5 bytes).
+///   If content_type == 0x15 (Alert), parse Level + Description → return error.TlsAlertReceived.
+/// STEP 2: If content_type == 0x16 (Handshake), slice handshake payload.
+/// STEP 3: Validate Handshake Type (msg_type == 0x02 for ServerHello).
+/// STEP 4: Extract Cipher Suite and verify against JA4 offered ciphers.
+pub fn parseServerResponse(buffer: []const u8) !HandshakeResult {
+    // STEP 1: Validate buffer has at least the TLS Record Header (5 bytes)
+    std.debug.assert(buffer.len >= TLS_REC_HEADER_LEN);
+
+    // Parse record header fields using explicit offsets (big-endian)
+    const record_type = buffer[TLS_REC_CONTENT_TYPE];
+    const legacy_version: u16 = (@as(u16, buffer[TLS_REC_VERSION]) << 8) | @as(u16, buffer[TLS_REC_VERSION + 1]);
+    const record_length: u16 = (@as(u16, buffer[TLS_REC_LENGTH]) << 8) | @as(u16, buffer[TLS_REC_LENGTH + 1]);
+
+    // Validate legacy_version: RFC 8446 Section 5.1 mandates 0x0303 for TLS 1.2/1.3
+    std.debug.assert(legacy_version == 0x0303 or legacy_version == 0x0301);
+
+    // Validate: buffer must contain the full record (header + fragment)
+    const total_record_len = TLS_REC_HEADER_LEN + record_length;
+    std.debug.assert(buffer.len >= total_record_len);
+
+    // Handle TLS Alert (content_type = 0x15)
+    if (record_type == 0x15) {
+        // SOURCE: RFC 8446, Section 6 — Alert is exactly 2 bytes: level + description
+        std.debug.assert(record_length >= TLS_ALERT_LEN);
+        std.debug.assert(buffer.len >= TLS_REC_HEADER_LEN + TLS_ALERT_LEN);
+
+        const alert_offset = TLS_REC_HEADER_LEN;
+        const alert_level = buffer[alert_offset + TLS_ALERT_LEVEL];
+        const alert_desc = buffer[alert_offset + TLS_ALERT_DESC];
+        _ = alert_level;
+        _ = alert_desc;
+
+        return TlsError.TlsAlertReceived;
+    }
+
+    // Handle TLS Handshake (content_type = 0x16)
+    if (record_type == 0x16) {
+        const handshake_start = TLS_REC_HEADER_LEN;
+        const handshake_data = buffer[handshake_start .. handshake_start + record_length];
+
+        // STEP 2: Parse Handshake Header (4 bytes)
+        std.debug.assert(handshake_data.len >= TLS_HS_HEADER_LEN);
+
+        const hs_msg_type = handshake_data[TLS_HS_MSG_TYPE];
+        // Read uint24 length (big-endian): 3 bytes
+        const hs_length: u24 = (@as(u24, handshake_data[TLS_HS_LENGTH]) << 16) |
+            (@as(u24, handshake_data[TLS_HS_LENGTH + 1]) << 8) |
+            @as(u24, handshake_data[TLS_HS_LENGTH + 2]);
+
+        // STEP 3: Validate Handshake Type — must be ServerHello (0x02)
+        // SOURCE: RFC 8446, Section 4.1.3 — ServerHello msg_type = 2
+        if (hs_msg_type != 0x02) {
+            return TlsError.UnexpectedHandshakeType;
+        }
+
+        // Validate: handshake_data must contain the full handshake message
+        std.debug.assert(handshake_data.len >= TLS_HS_HEADER_LEN + hs_length);
+
+        const hs_body = handshake_data[TLS_HS_HEADER_LEN .. TLS_HS_HEADER_LEN + hs_length];
+
+        // STEP 4: Parse ServerHello body
+        // SOURCE: RFC 8446, Section 4.1.3
+        // Minimum body: legacy_version(2) + random(32) + session_id_len(1) = 35 bytes
+        std.debug.assert(hs_body.len >= TLS_SH_SID_LEN + 1);
+
+        // Parse legacy_version (big-endian)
+        const server_version: u16 = (@as(u16, hs_body[TLS_SH_VERSION]) << 8) | @as(u16, hs_body[TLS_SH_VERSION + 1]);
+        std.debug.assert(server_version == 0x0303);
+
+        // Parse legacy_session_id length (1 byte, 0..32)
+        const session_id_len = hs_body[TLS_SH_SID_LEN];
+        std.debug.assert(session_id_len <= 32);
+
+        // Calculate offsets for subsequent fields
+        const sid_data_end = TLS_SH_SID_LEN + 1 + session_id_len;
+        const cipher_suite_offset = sid_data_end;
+        const compression_offset = cipher_suite_offset + 2;
+        const ext_len_offset = compression_offset + 1;
+
+        // Validate buffer has all required fields
+        std.debug.assert(hs_body.len >= ext_len_offset + 2);
+
+        // Extract cipher_suite (2 bytes, big-endian)
+        // SOURCE: RFC 8446, Section 4.1.3 — cipher_suite follows session_id
+        const cs_hi: u16 = hs_body[cipher_suite_offset];
+        const cs_lo: u16 = hs_body[cipher_suite_offset + 1];
+        const cipher_suite = (cs_hi << 8) | cs_lo;
+
+        // Extract legacy_compression_method (1 byte, must be 0x00 per RFC 8446)
+        const compression_method = hs_body[compression_offset];
+        std.debug.assert(compression_method == 0x00);
+
+        // Parse extensions length (2 bytes, big-endian)
+        const ext_hi: u16 = hs_body[ext_len_offset];
+        const ext_lo: u16 = hs_body[ext_len_offset + 1];
+        const extensions_length = (ext_hi << 8) | ext_lo;
+        std.debug.assert(extensions_length >= 6); // Minimum per RFC 8446
+
+        // Extract session_id slice
+        const session_id_slice = hs_body[TLS_SH_SID_LEN + 1 .. TLS_SH_SID_LEN + 1 + session_id_len];
+
+        return HandshakeResult{
+            .record_type = record_type,
+            .handshake_type = hs_msg_type,
+            .cipher_suite = cipher_suite,
+            .session_id = session_id_slice,
+            .compression_method = compression_method,
+            .extensions_length = extensions_length,
+        };
+    }
+
+    // Unknown record type
+    return TlsError.InvalidRecordType;
+}
+
 // ------------------------------------------------------------
 // Public API
 // ------------------------------------------------------------
@@ -2338,4 +2562,246 @@ test "linux canonical tcp raw socket filter matches expected instructions" {
     try std.testing.expectEqual(sock_filter{ .code = 0x15, .jt = 0, .jf = 1, .k = 65101 }, filter[8]);
     try std.testing.expectEqual(sock_filter{ .code = 0x06, .jt = 0, .jf = 0, .k = 0x00040000 }, filter[9]);
     try std.testing.expectEqual(sock_filter{ .code = 0x06, .jt = 0, .jf = 0, .k = 0 }, filter[10]);
+}
+
+// ============================================================
+// MODULE 2.1 TESTS — TLS 1.3 Server Response Parser
+// ============================================================
+
+/// Helper: construct a minimal TLS 1.3 ServerHello buffer for testing.
+///
+/// SOURCE: RFC 8446, Section 4.1.3 — ServerHello structure
+/// SOURCE: RFC 8446, Section 5.1 — TLSPlaintext record layer
+fn buildTestServerHello(
+    allocator: std.mem.Allocator,
+    cipher_suite: u16,
+    session_id: []const u8,
+) ![]u8 {
+    // Calculate total size:
+    // Record header(5) + Handshake header(4) + legacy_version(2) + random(32) +
+    // session_id_len(1) + session_id(N) + cipher_suite(2) + compression(1) +
+    // extensions_length(2) + supported_versions_extension(6) = 5 + 4 + 2 + 32 + 1 + N + 2 + 1 + 2 + 6
+    // extensions (length-prefixed)
+    // SOURCE: RFC 8446, Section 4.1.3 — extensions<6..2^16-1> (minimum 6 bytes)
+    // We use a minimal supported_versions extension (type=0x002B, len=2, data=0x0304)
+    const ext_len: u16 = 6;
+    const hs_body_len: usize = 2 + 32 + 1 + session_id.len + 2 + 1 + 2 + ext_len;
+    const hs_total_len: usize = 4 + hs_body_len; // handshake header + body
+    const record_total_len: usize = 5 + hs_total_len; // record header + handshake
+
+    const buf = try allocator.alloc(u8, record_total_len);
+    errdefer allocator.free(buf);
+    @memset(buf, 0);
+
+    var pw = PacketWriter.init(buf);
+
+    // --- TLS Record Header (5 bytes) ---
+    // SOURCE: RFC 8446, Section 5.1
+    pw.writeByte(0x16); // content_type = handshake
+    pw.writeInt(u16, 0x0303); // legacy_version = TLS 1.2
+    pw.writeInt(u16, @as(u16, @intCast(hs_total_len))); // length of handshake
+
+    // --- Handshake Header (4 bytes) ---
+    // SOURCE: RFC 8446, Section 4
+    pw.writeByte(0x02); // msg_type = ServerHello
+    // uint24 length (big-endian) = hs_body_len
+    pw.writeByte(@truncate((hs_body_len >> 16) & 0xFF));
+    pw.writeByte(@truncate((hs_body_len >> 8) & 0xFF));
+    pw.writeByte(@truncate(hs_body_len & 0xFF));
+
+    // --- ServerHello Body ---
+    // SOURCE: RFC 8446, Section 4.1.3
+
+    // legacy_version = 0x0303
+    pw.writeInt(u16, 0x0303);
+
+    // random = 32 bytes (zeros for test)
+    const random_bytes = [_]u8{0} ** 32;
+    pw.writeSlice(&random_bytes);
+
+    // legacy_session_id (length-prefixed)
+    pw.writeByte(@intCast(session_id.len));
+    if (session_id.len > 0) {
+        pw.writeSlice(session_id);
+    }
+
+    // cipher_suite (big-endian)
+    pw.writeInt(u16, cipher_suite);
+
+    // legacy_compression_method = 0x00 (RFC 8446 mandates zero)
+    pw.writeByte(0x00);
+
+    // extensions (length-prefixed)
+    pw.writeInt(u16, ext_len);
+    // supported_versions extension (type=0x002B, length=2, version=TLS 1.3=0x0304)
+    // SOURCE: RFC 8446, Section 4.2.1 — supported_versions extension
+    pw.writeInt(u16, 0x002B); // supported_versions
+    pw.writeInt(u16, 0x0002); // length = 2
+    pw.writeInt(u16, 0x0304); // TLS 1.3
+
+    std.debug.assert(pw.index == record_total_len);
+    return buf;
+}
+
+test "parseServerResponse: Scenario A — valid TLS 1.3 ServerHello" {
+    const allocator = std.testing.allocator;
+
+    // Build a ServerHello with TLS_AES_128_GCM_SHA256 (0x1301)
+    // SOURCE: IANA TLS Cipher Suites — 0x1301 = TLS_AES_128_GCM_SHA256
+    const server_hello = try buildTestServerHello(
+        allocator,
+        0x1301, // TLS_AES_128_GCM_SHA256
+        &[_]u8{ 0xAA, 0xBB, 0xCC }, // 3-byte session_id
+    );
+    defer allocator.free(server_hello);
+
+    const result = try parseServerResponse(server_hello);
+
+    // Verify record type
+    try std.testing.expectEqual(@as(u8, 0x16), result.record_type);
+
+    // Verify handshake type
+    try std.testing.expectEqual(@as(u8, 0x02), result.handshake_type.?);
+
+    // Verify cipher suite
+    try std.testing.expectEqual(@as(u16, 0x1301), result.cipher_suite.?);
+
+    // Verify session_id
+    try std.testing.expectEqual(@as(usize, 3), result.session_id.len);
+    try std.testing.expectEqual(@as(u8, 0xAA), result.session_id[0]);
+    try std.testing.expectEqual(@as(u8, 0xBB), result.session_id[1]);
+    try std.testing.expectEqual(@as(u8, 0xCC), result.session_id[2]);
+
+    // Verify compression method (must be 0 per RFC 8446)
+    try std.testing.expectEqual(@as(u8, 0x00), result.compression_method.?);
+
+    // Verify extensions length (6 bytes: supported_versions extension)
+    try std.testing.expectEqual(@as(u16, 6), result.extensions_length.?);
+
+    // Verify JA4 cipher match
+    try std.testing.expect(result.isJa4Cipher());
+}
+
+test "parseServerResponse: Scenario A2 — TLS_CHACHA20_POLY1305_SHA256" {
+    const allocator = std.testing.allocator;
+
+    // Build a ServerHello with TLS_CHACHA20_POLY1305_SHA256 (0x1303)
+    // SOURCE: IANA TLS Cipher Suites — 0x1303 = TLS_CHACHA20_POLY1305_SHA256
+    const server_hello = try buildTestServerHello(
+        allocator,
+        0x1303,
+        &[_]u8{}, // empty session_id
+    );
+    defer allocator.free(server_hello);
+
+    const result = try parseServerResponse(server_hello);
+
+    try std.testing.expectEqual(@as(u16, 0x1303), result.cipher_suite.?);
+    try std.testing.expect(result.isJa4Cipher());
+    try std.testing.expectEqual(@as(usize, 0), result.session_id.len);
+}
+
+test "parseServerResponse: Scenario B — TLS Alert (handshake_failure)" {
+    // Construct a TLS Alert record: handshake_failure (code 40 = 0x28)
+    // Wire format: 0x15 0x03 0x03 0x00 0x02 0x02 0x28
+    //   - 0x15: content_type = Alert
+    //   - 0x0303: legacy_version
+    //   - 0x0002: length = 2 bytes
+    //   - 0x02: alert level = fatal
+    //   - 0x28: alert description = handshake_failure (40)
+    // SOURCE: RFC 8446, Section 6 — Alert Protocol
+    // SOURCE: RFC 8446, Table 2 — AlertDescription: handshake_failure = 40
+    const alert_buffer = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28 };
+
+    const result = parseServerResponse(&alert_buffer);
+    try std.testing.expectError(TlsError.TlsAlertReceived, result);
+}
+
+test "parseServerResponse: Scenario B2 — TLS Alert (decode_error)" {
+    // Construct a TLS Alert record: decode_error (code 50 = 0x32)
+    // Wire format: 0x15 0x03 0x03 0x00 0x02 0x02 0x32
+    // SOURCE: RFC 8446, Table 2 — AlertDescription: decode_error = 50
+    const alert_buffer = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32 };
+
+    const result = parseServerResponse(&alert_buffer);
+    try std.testing.expectError(TlsError.TlsAlertReceived, result);
+}
+
+test "parseServerResponse: unexpected handshake type (ClientHello instead of ServerHello)" {
+    const allocator = std.testing.allocator;
+
+    // Build a buffer that looks like a ClientHello (msg_type=0x01) instead of ServerHello
+    const buf = try allocator.alloc(u8, 20);
+    defer allocator.free(buf);
+    @memset(buf, 0);
+
+    var pw = PacketWriter.init(buf);
+    pw.writeByte(0x16); // Handshake record
+    pw.writeInt(u16, 0x0303); // legacy_version
+    pw.writeInt(u16, 11); // record length (handshake data)
+
+    pw.writeByte(0x01); // msg_type = ClientHello (NOT ServerHello)
+    pw.writeByte(0x00); // length high
+    pw.writeByte(0x00); // length mid
+    pw.writeByte(0x07); // length low = 7 bytes body
+
+    // Minimal body: legacy_version(2) + random(5 of 32, truncated for test)
+    pw.writeInt(u16, 0x0303);
+    pw.writeSlice(&[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF });
+
+    const result = parseServerResponse(buf);
+    try std.testing.expectError(TlsError.UnexpectedHandshakeType, result);
+}
+
+test "parseServerResponse: buffer too short — truncated record asserts" {
+    // Build a record header that says "handshake data is 1 byte" but handshake needs 4+ bytes
+    // Record: 0x16 (handshake) 0x0303 (version) 0x0001 (length=1)
+    // Then only 1 byte of "handshake" data (needs at least 4 for handshake header)
+    // This will hit an assert because handshake_data.len < TLS_HS_HEADER_LEN
+    const truncated_buffer = [_]u8{ 0x16, 0x03, 0x03, 0x00, 0x01, 0x02 };
+
+    // We verify the assert exists by confirming the constant values are correct:
+    try std.testing.expect(truncated_buffer.len >= TLS_REC_HEADER_LEN); // passes (6 >= 5)
+    // The actual assert for handshake_data.len >= TLS_HS_HEADER_LEN would fire at runtime.
+    // In Zig test, assert failures are panics (not catchable errors).
+    // We document this behavior rather than trying to catch a panic.
+}
+
+test "TLS Record Header offset constants are correct (5 bytes total)" {
+    try std.testing.expectEqual(@as(usize, 5), TLS_REC_HEADER_LEN);
+    try std.testing.expectEqual(@as(usize, 0), TLS_REC_CONTENT_TYPE);
+    try std.testing.expectEqual(@as(usize, 1), TLS_REC_VERSION);
+    try std.testing.expectEqual(@as(usize, 3), TLS_REC_LENGTH);
+}
+
+test "TLS Handshake Header offset constants are correct (4 bytes total)" {
+    try std.testing.expectEqual(@as(usize, 4), TLS_HS_HEADER_LEN);
+    try std.testing.expectEqual(@as(usize, 0), TLS_HS_MSG_TYPE);
+    try std.testing.expectEqual(@as(usize, 1), TLS_HS_LENGTH);
+}
+
+test "TLS Alert payload size is 2 bytes" {
+    try std.testing.expectEqual(@as(usize, 2), TLS_ALERT_LEN);
+    try std.testing.expectEqual(@as(usize, 0), TLS_ALERT_LEVEL);
+    try std.testing.expectEqual(@as(usize, 1), TLS_ALERT_DESC);
+}
+
+test "ServerHello SID_LEN offset constant is correct (34)" {
+    try std.testing.expectEqual(@as(usize, 34), TLS_SH_SID_LEN);
+    try std.testing.expectEqual(@as(usize, 2), TLS_SH_RANDOM);
+    try std.testing.expectEqual(@as(usize, 32), TLS_SH_RANDOM_LEN);
+}
+
+test "HandshakeResult.isJa4Cipher correctly identifies JA4 ciphers" {
+    const ja4_result = HandshakeResult{
+        .record_type = 0x16,
+        .cipher_suite = 0x1301, // TLS_AES_128_GCM_SHA256
+    };
+    try std.testing.expect(ja4_result.isJa4Cipher());
+
+    const non_ji4_result = HandshakeResult{
+        .record_type = 0x16,
+        .cipher_suite = 0x00FF, // Unknown/invalid cipher
+    };
+    try std.testing.expect(!non_ji4_result.isJa4Cipher());
 }

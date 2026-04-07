@@ -6,6 +6,60 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-07] — Zig 0.16 packed struct + [N]u8 + @bitCast uyumsuzluğu
+
+**Tetikleyici:** Module 2.1 — TLS 1.3 Server Response Parser implementasyonu
+**Dosyalar:** `src/network_core.zig`
+**Tip:** Proaktif — runtime hatası görülmeden, derleyici hataları sırasında tespit edildi
+
+---
+
+### Hata: Zig 0.16'da `packed struct` içinde `[N]u8` array field desteklenmiyor
+
+**Hata:** `TlsServerHelloFixed` packed struct'ı içinde `random: [32]u8` field'ı tanımlandı.
+Zig 0.16 derleyicisi: `error: packed structs cannot contain fields of type '[32]u8'`
+
+**Ayrıca:** `@bitCast` ile `[5]u8` → `TlsRecordHeader` dönüşümü size mismatch hatası verdi.
+`@sizeOf(TlsRecordHeader)` comptime assert'te beklenen 5 yerine farklı değer döndü.
+
+**Ayrıca:** `std.mem.readInt(u16, slice[start..end], .big)` Zig 0.16'da `*const [2]u8` bekliyor,
+slice değil. Slice üzerinde `.*` ile `[2]u8` value elde ediliyor ama bu da `[N]u8`'den
+`*const [N]u8`'e implicit cast ile uyumsuz.
+
+**Kök Sebep:** Zig 0.16'nın packed struct ve @bitCast semantics'i, array field'ları ve
+slice-to-array dönüşümlerini desteklemiyor.
+
+**Kaynak:** Zig 0.16 language semantics — packed struct only supports integer types,
+bool, enum, and other packed structs. Arrays are not bit-packable.
+
+**Düzeltme:**
+```zig
+// ÖNCEKİ: packed struct + @bitCast yaklaşımı
+pub const TlsRecordHeader = packed struct {
+    content_type: u8,
+    legacy_version: u16,
+    length: u16,
+};
+const header: TlsRecordHeader = @bitCast(buffer[0..5].*);
+
+// SONRAKİ: Explicit const offset + manual big-endian read
+pub const TLS_REC_CONTENT_TYPE: usize = 0;
+pub const TLS_REC_VERSION: usize = 1;
+pub const TLS_REC_LENGTH: usize = 3;
+pub const TLS_REC_HEADER_LEN: usize = 5;
+
+const record_type = buffer[TLS_REC_CONTENT_TYPE];
+const legacy_version: u16 = (@as(u16, buffer[1]) << 8) | @as(u16, buffer[2]);
+```
+
+**Ders:** Zig 0.16'da protokol parsing için packed struct + @bitCast yerine
+explicit offset constants + manual byte assembly kullan. Her offset için
+comptime assert ile boyut doğrulaması yap.
+
+---
+
+---
+
 ## [2026-04-07] — UFW INPUT DROP + ECH decode_error: 20 Saatlik Kör Nokta
 
 **Commit:** `2fed10e51e8c4959767e3730decdb341f4da3229`
