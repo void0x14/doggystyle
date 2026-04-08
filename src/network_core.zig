@@ -668,9 +668,137 @@ fn randomGreaseCodepoint() !u16 {
     return greaseCodepointFromNibble(random_byte[0] & 0x0F);
 }
 
-fn fillHybridKeyShare(buffer: *[hybrid_keyshare_len]u8) !void {
-    try fillEntropy(buffer[0..mlkem768_share_len]);
-    try fillEntropy(buffer[mlkem768_share_len..]);
+pub const TlsClientHelloState = struct {
+    client_random: [32]u8,
+    grease_value: u16,
+    ech_grease_payload: [ech_grease_payload_len]u8,
+    mlkem768_key_pair: std.crypto.kem.ml_kem.MLKem768.KeyPair,
+    hybrid_x25519_key_pair: std.crypto.dh.X25519.KeyPair,
+    retry_x25519_key_pair: ?std.crypto.dh.X25519.KeyPair = null,
+};
+
+pub const TlsClientHelloBuildResult = struct {
+    hello: []u8,
+    state: TlsClientHelloState,
+};
+
+const DerivedSharedSecret = struct {
+    bytes: [std.crypto.kem.ml_kem.MLKem768.shared_length + std.crypto.dh.X25519.shared_length]u8,
+    len: usize,
+};
+
+// SOURCE: RFC 7748, Section 5 — X25519 key generation uses 32-byte private scalars
+fn generateX25519KeyPair() !std.crypto.dh.X25519.KeyPair {
+    while (true) {
+        var seed: [std.crypto.dh.X25519.seed_length]u8 = undefined;
+        try fillEntropy(&seed);
+        return std.crypto.dh.X25519.KeyPair.generateDeterministic(seed) catch continue;
+    }
+}
+
+// SOURCE: FIPS 203, Section 7.2 — ML-KEM-768 key generation consumes a 64-byte seed
+fn generateMlKem768KeyPair() !std.crypto.kem.ml_kem.MLKem768.KeyPair {
+    while (true) {
+        var seed: [std.crypto.kem.ml_kem.MLKem768.seed_length]u8 = undefined;
+        try fillEntropy(&seed);
+        return std.crypto.kem.ml_kem.MLKem768.KeyPair.generateDeterministic(seed) catch continue;
+    }
+}
+
+// SOURCE: IANA TLS Supported Groups Registry — X25519MLKEM768 public key payload
+// SOURCE: RFC 8446, Section 4.2.8 — KeyShareEntry.key_exchange bytes are group-specific
+fn writeHybridKeyShare(buffer: *[hybrid_keyshare_len]u8, state: *const TlsClientHelloState) void {
+    const mlkem_public_key = state.mlkem768_key_pair.public_key.toBytes();
+    @memcpy(buffer[0..mlkem768_share_len], &mlkem_public_key);
+    @memcpy(buffer[mlkem768_share_len..], &state.hybrid_x25519_key_pair.public_key);
+}
+
+// SOURCE: RFC 8701, Section 2 — GREASE values use the 0x?a?a pattern
+// SOURCE: RFC 8446, Section 4.1.2 — ClientHello.random is 32 bytes
+// SOURCE: RFC 9446, Section 7.1 — ECH outer extension carries structured payload bytes
+fn initTlsClientHelloState() !TlsClientHelloState {
+    var client_random: [32]u8 = undefined;
+    try fillEntropy(&client_random);
+
+    var ech_grease_payload = [_]u8{0} ** ech_grease_payload_len;
+    var ech_random: [2]u8 = undefined;
+    try fillEntropy(&ech_random);
+    ech_grease_payload[0] = 0x01;
+    ech_grease_payload[1] = 0x00;
+    ech_grease_payload[2] = 0x01;
+    ech_grease_payload[3] = 0x00;
+    ech_grease_payload[4] = 0x01;
+    ech_grease_payload[5] = ech_random[0];
+    ech_grease_payload[6] = 0x00;
+    ech_grease_payload[7] = 0x00;
+    ech_grease_payload[8] = 0x00;
+    ech_grease_payload[9] = 0x01;
+    ech_grease_payload[10] = ech_random[1];
+
+    return .{
+        .client_random = client_random,
+        .grease_value = try randomGreaseCodepoint(),
+        .ech_grease_payload = ech_grease_payload,
+        .mlkem768_key_pair = try generateMlKem768KeyPair(),
+        .hybrid_x25519_key_pair = try generateX25519KeyPair(),
+    };
+}
+
+// SOURCE: RFC 8446, Section 4.2.8 — HelloRetryRequest requests a fresh KeyShareEntry
+fn ensureRetryX25519KeyPair(state: *TlsClientHelloState) !void {
+    if (state.retry_x25519_key_pair == null) {
+        state.retry_x25519_key_pair = try generateX25519KeyPair();
+    }
+}
+
+// SOURCE: RFC 8446, Section 4.2.8 — KeyShareEntry.key_exchange bytes are group-specific
+// SOURCE: IANA TLS Supported Groups Registry — X25519MLKEM768 uses ML-KEM-768 public key || X25519 public key
+fn deriveSharedSecret(
+    state: *const TlsClientHelloState,
+    negotiated_group: u16,
+    server_key_share: []const u8,
+) !DerivedSharedSecret {
+    var result = DerivedSharedSecret{
+        .bytes = undefined,
+        .len = 0,
+    };
+
+    switch (negotiated_group) {
+        x25519_mlkem768_group => {
+            const hybrid_ciphertext_len = std.crypto.kem.ml_kem.MLKem768.ciphertext_length;
+            if (server_key_share.len != hybrid_ciphertext_len + std.crypto.dh.X25519.public_length) {
+                return error.ServerHelloParseFailed;
+            }
+
+            const kem_ciphertext = server_key_share[0..hybrid_ciphertext_len];
+            const x25519_public_key = server_key_share[hybrid_ciphertext_len..];
+            const kem_shared_secret = try state.mlkem768_key_pair.secret_key.decaps(kem_ciphertext[0..hybrid_ciphertext_len]);
+            const x25519_shared_secret = try std.crypto.dh.X25519.scalarmult(
+                state.hybrid_x25519_key_pair.secret_key,
+                x25519_public_key[0..std.crypto.dh.X25519.public_length].*,
+            );
+
+            @memcpy(result.bytes[0..kem_shared_secret.len], &kem_shared_secret);
+            @memcpy(result.bytes[kem_shared_secret.len .. kem_shared_secret.len + x25519_shared_secret.len], &x25519_shared_secret);
+            result.len = kem_shared_secret.len + x25519_shared_secret.len;
+        },
+        0x001D => {
+            const retry_key_pair = state.retry_x25519_key_pair orelse return error.HelloRetryRequestUnsupported;
+            if (server_key_share.len != std.crypto.dh.X25519.public_length) {
+                return error.ServerHelloParseFailed;
+            }
+
+            const shared_secret = try std.crypto.dh.X25519.scalarmult(
+                retry_key_pair.secret_key,
+                server_key_share[0..std.crypto.dh.X25519.public_length].*,
+            );
+            @memcpy(result.bytes[0..shared_secret.len], &shared_secret);
+            result.len = shared_secret.len;
+        },
+        else => return error.HelloRetryRequestUnsupported,
+    }
+
+    return result;
 }
 
 fn appendInt(list: *std.array_list.Managed(u8), comptime T: type, value: T) !void {
@@ -1036,6 +1164,7 @@ const CipherSuite = enum(u16) {
 const ExtensionType = enum(u16) {
     server_name = 0,
     extended_master_secret = 0x0017,
+    cookie = 44,
     renegotiation_info = 0xFF01,
     supported_groups = 10,
     ec_point_formats = 11,
@@ -1051,7 +1180,10 @@ const ExtensionType = enum(u16) {
     ech_grease = ech_grease_extension,
 };
 
-pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []const u8) ![]u8 {
+// SOURCE: RFC 8446, Section 4.1.2 — ClientHello wire format
+// SOURCE: RFC 8446, Section 4.2.8 — KeyShareClientHello
+// SOURCE: IANA TLS Supported Groups Registry — X25519MLKEM768 codepoint 0x11EC
+pub fn buildTLSClientHelloAllocWithState(allocator: std.mem.Allocator, server_name: []const u8) !TlsClientHelloBuildResult {
     if (server_name.len > max_supported_server_name_len) return error.ServerNameTooLong;
 
     var enforcer = MTUEnforcer.init(server_name);
@@ -1072,40 +1204,9 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
         // Removed 10 suites to hit 1492 MTU with TCP Timestamps
     };
 
-    var random: [32]u8 = undefined;
-    try fillEntropy(&random);
-
-    // ECH GREASE: proper ECHClientHello outer wire format (draft-ietf-tls-esni).
-    // 0xFE0D is the ACTUAL ECH extension type assigned by IANA — NOT a GREASE type.
-    // Cloudflare on 1.1.1.1 implements ECH and strictly parses this extension.
-    // The previous payload had type=0x0D which is invalid (must be 0=inner or 1=outer)
-    // causing Cloudflare to return TLS Alert decode_error (50).
-    //
-    // Correct ECHClientHello outer layout (11 bytes total = ech_grease_payload_len):
-    //   byte 0:   type = 0x01 (outer)
-    //   byte 1-2: KDF id = 0x0001 (HKDF-SHA256)
-    //   byte 3-4: AEAD id = 0x0001 (AES-128-GCM)
-    //   byte 5:   config_id (random, GREASE)
-    //   byte 6-7: enc length = 0x0000 (empty enc → signals GREASE/HRR)
-    //   byte 8-9: payload length = 0x0001
-    //   byte 10:  payload byte (random)
-    var ech_grease_payload = [_]u8{0} ** ech_grease_payload_len;
-    var ech_random: [2]u8 = undefined;
-    try fillEntropy(&ech_random);
-    ech_grease_payload[0] = 0x01; // type = outer
-    ech_grease_payload[1] = 0x00; // KDF id high
-    ech_grease_payload[2] = 0x01; // KDF id low  (HKDF-SHA256)
-    ech_grease_payload[3] = 0x00; // AEAD id high
-    ech_grease_payload[4] = 0x01; // AEAD id low (AES-128-GCM)
-    ech_grease_payload[5] = ech_random[0]; // config_id (random)
-    ech_grease_payload[6] = 0x00; // enc length high
-    ech_grease_payload[7] = 0x00; // enc length low (empty enc)
-    ech_grease_payload[8] = 0x00; // payload length high
-    ech_grease_payload[9] = 0x01; // payload length low (1 byte)
-    ech_grease_payload[10] = ech_random[1]; // payload (random byte)
+    var state = try initTlsClientHelloState();
     var hybrid_keyshare = [_]u8{0} ** hybrid_keyshare_len;
-    try fillHybridKeyShare(&hybrid_keyshare);
-    const grease_value = try randomGreaseCodepoint();
+    writeHybridKeyShare(&hybrid_keyshare, &state);
 
     const session_id = &[_]u8{};
 
@@ -1129,7 +1230,7 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
 
     // Client Hello Data
     ch.writeInt(u16, 0x0303); // Legacy Version TLS 1.2
-    ch.writeSlice(&random);
+    ch.writeSlice(&state.client_random);
     ch.writeByte(0); // Legacy Session ID Length
     ch.writeSlice(session_id);
 
@@ -1146,7 +1247,7 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
     ch.writeInt(u16, 0);
 
     // 1. GREASE placeholder
-    ch.writeInt(u16, grease_value);
+    ch.writeInt(u16, state.grease_value);
     ch.writeInt(u16, 0);
 
     // 2. server_name
@@ -1173,7 +1274,7 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
     ch.writeInt(u16, @intFromEnum(ExtensionType.supported_groups));
     const sg_len_pos = ch.index;
     ch.writeInt(u16, 0);
-    const groups = [_]u16{ grease_value, x25519_mlkem768_group, 0x001D, 0x0017 };
+    const groups = [_]u16{ state.grease_value, x25519_mlkem768_group, 0x001D, 0x0017 };
     ch.writeInt(u16, @as(u16, @intCast(groups.len * 2)));
     for (groups) |g| {
         ch.writeInt(u16, g);
@@ -1265,7 +1366,7 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
     // 16. ECH GREASE placeholder (REDUCED size for MTU compliance)
     ch.writeInt(u16, @intFromEnum(ExtensionType.ech_grease));
     ch.writeInt(u16, ech_grease_payload_len);
-    ch.writeSlice(&ech_grease_payload);
+    ch.writeSlice(&state.ech_grease_payload);
 
     const ext_total_len = @as(u16, @intCast(ch.index - ext_len_pos - 2));
     ch.patchInt(u16, ext_len_pos, ext_total_len);
@@ -1291,6 +1392,212 @@ pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []con
     if (total_len > tls_client_hello_mss_limit) {
         return error.ClientHelloTooLarge;
     }
+    return .{
+        .hello = buffer,
+        .state = state,
+    };
+}
+
+pub fn buildTLSClientHelloAlloc(allocator: std.mem.Allocator, server_name: []const u8) ![]u8 {
+    const result = try buildTLSClientHelloAllocWithState(allocator, server_name);
+    return result.hello;
+}
+
+fn tlsClientHelloRetryExtensionsLen(server_name_len: usize, cookie_len: usize, retry_key_share_len: usize) usize {
+    const cookie_extension_len: usize = if (cookie_len > 0) 4 + cookie_len else 0;
+    return 4 +
+        (9 + server_name_len) +
+        4 +
+        5 +
+        14 +
+        6 +
+        4 +
+        18 +
+        9 +
+        14 +
+        4 +
+        cookie_extension_len +
+        (4 + 2 + 2 + 2 + retry_key_share_len) +
+        6 +
+        9 +
+        7 +
+        (4 + ech_grease_payload_len);
+}
+
+fn tlsClientHelloRetryLen(server_name: []const u8, cookie_len: usize, retry_key_share_len: usize) usize {
+    return 5 + 4 + 2 + 32 + 1 + 0 + 2 + (5 * 2) + 1 + 1 + 2 +
+        tlsClientHelloRetryExtensionsLen(server_name.len, cookie_len, retry_key_share_len);
+}
+
+// SOURCE: RFC 8446, Section 4.1.2 — Second ClientHello keeps the original fields unchanged
+// SOURCE: RFC 8446, Section 4.1.4 — HelloRetryRequest processing rules
+// SOURCE: RFC 8446, Section 4.2.2 — cookie
+// SOURCE: RFC 8446, Section 4.2.8 — replace key_share with a single new entry
+pub fn buildTLSHelloRetryClientHelloAlloc(
+    allocator: std.mem.Allocator,
+    server_name: []const u8,
+    state: *TlsClientHelloState,
+    selected_group: u16,
+    cookie: []const u8,
+) ![]u8 {
+    if (server_name.len > max_supported_server_name_len) return error.ServerNameTooLong;
+    if (selected_group != 0x001D) return error.HelloRetryRequestUnsupported;
+
+    try ensureRetryX25519KeyPair(state);
+    const retry_key_share = (state.retry_x25519_key_pair orelse unreachable).public_key;
+    const total_len = tlsClientHelloRetryLen(server_name, cookie.len, retry_key_share.len);
+
+    if (total_len > tls_client_hello_mss_limit) return error.ClientHelloTooLarge;
+    if (total_len > MTU_LIMIT) return error.MTUExceeded;
+
+    const cipher_suites = [_]CipherSuite{
+        .TLS_AES_128_GCM_SHA256,
+        .TLS_AES_256_GCM_SHA384,
+        .TLS_CHACHA20_POLY1305_SHA256,
+        .TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        .TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    };
+
+    const session_id = &[_]u8{};
+    const buffer = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(buffer);
+    var ch = PacketWriter.init(buffer);
+
+    ch.writeByte(0x16);
+    ch.writeInt(u16, 0x0301);
+    const record_len_pos = ch.index;
+    ch.writeInt(u16, 0);
+
+    const hs_start = ch.index;
+    ch.writeByte(0x01);
+    const hs_len_pos = ch.index;
+    ch.writeInt(u24, 0);
+
+    ch.writeInt(u16, 0x0303);
+    ch.writeSlice(&state.client_random);
+    ch.writeByte(0);
+    ch.writeSlice(session_id);
+
+    const cs_len: u16 = @intCast(cipher_suites.len * 2);
+    ch.writeInt(u16, cs_len);
+    for (cipher_suites) |cs| {
+        ch.writeInt(u16, @intFromEnum(cs));
+    }
+
+    ch.writeByte(0x01);
+    ch.writeByte(0x00);
+
+    const ext_len_pos = ch.index;
+    ch.writeInt(u16, 0);
+
+    ch.writeInt(u16, state.grease_value);
+    ch.writeInt(u16, 0);
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.server_name));
+    const sn_len_pos = ch.index;
+    ch.writeInt(u16, 0);
+    ch.writeInt(u16, @as(u16, @intCast(server_name.len + 3)));
+    ch.writeByte(0);
+    ch.writeInt(u16, @as(u16, @intCast(server_name.len)));
+    ch.writeSlice(server_name);
+    ch.patchInt(u16, sn_len_pos, @as(u16, @intCast(ch.index - sn_len_pos - 2)));
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.extended_master_secret));
+    ch.writeInt(u16, 0);
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.renegotiation_info));
+    ch.writeInt(u16, 1);
+    ch.writeByte(0x00);
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.supported_groups));
+    const sg_len_pos = ch.index;
+    ch.writeInt(u16, 0);
+    const groups = [_]u16{ state.grease_value, x25519_mlkem768_group, 0x001D, 0x0017 };
+    ch.writeInt(u16, @as(u16, @intCast(groups.len * 2)));
+    for (groups) |group| {
+        ch.writeInt(u16, group);
+    }
+    ch.patchInt(u16, sg_len_pos, @as(u16, @intCast(ch.index - sg_len_pos - 2)));
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.ec_point_formats));
+    ch.writeInt(u16, 2);
+    ch.writeByte(1);
+    ch.writeByte(0x00);
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.session_ticket));
+    ch.writeInt(u16, 0);
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.application_layer_protocol_negotiation));
+    const alpn_len_pos = ch.index;
+    ch.writeInt(u16, 0);
+    ch.writeInt(u16, 12);
+    ch.writeByte(2);
+    ch.writeSlice("h2");
+    ch.writeByte(8);
+    ch.writeSlice("http/1.1");
+    ch.patchInt(u16, alpn_len_pos, @as(u16, @intCast(ch.index - alpn_len_pos - 2)));
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.status_request));
+    ch.writeInt(u16, 5);
+    ch.writeByte(0x01);
+    ch.writeInt(u16, 0);
+    ch.writeInt(u16, 0);
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.signature_algorithms));
+    const sig_len_pos = ch.index;
+    ch.writeInt(u16, 0);
+    const sig_algs = [_]u16{ 0x0403, 0x0804, 0x0805, 0x0201 };
+    ch.writeInt(u16, @as(u16, @intCast(sig_algs.len * 2)));
+    for (sig_algs) |sig_alg| {
+        ch.writeInt(u16, sig_alg);
+    }
+    ch.patchInt(u16, sig_len_pos, @as(u16, @intCast(ch.index - sig_len_pos - 2)));
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.signed_certificate_timestamp));
+    ch.writeInt(u16, 0);
+
+    if (cookie.len > 0) {
+        ch.writeInt(u16, @intFromEnum(ExtensionType.cookie));
+        ch.writeInt(u16, @as(u16, @intCast(cookie.len)));
+        ch.writeSlice(cookie);
+    }
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.key_share));
+    const ks_len_pos = ch.index;
+    ch.writeInt(u16, 0);
+    ch.writeInt(u16, @as(u16, @intCast(2 + 2 + retry_key_share.len)));
+    ch.writeInt(u16, selected_group);
+    ch.writeInt(u16, @as(u16, @intCast(retry_key_share.len)));
+    ch.writeSlice(&retry_key_share);
+    ch.patchInt(u16, ks_len_pos, @as(u16, @intCast(ch.index - ks_len_pos - 2)));
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.psk_key_exchange_modes));
+    ch.writeInt(u16, 2);
+    ch.writeByte(1);
+    ch.writeByte(0x01);
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.supported_versions));
+    ch.writeInt(u16, 5);
+    ch.writeByte(4);
+    ch.writeInt(u16, 0x0304);
+    ch.writeInt(u16, 0x0303);
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.compress_certificate));
+    ch.writeInt(u16, 3);
+    ch.writeByte(2);
+    ch.writeInt(u16, 0x0002);
+
+    ch.writeInt(u16, @intFromEnum(ExtensionType.ech_grease));
+    ch.writeInt(u16, ech_grease_payload_len);
+    ch.writeSlice(&state.ech_grease_payload);
+
+    ch.patchInt(u16, ext_len_pos, @as(u16, @intCast(ch.index - ext_len_pos - 2)));
+
+    const record_payload_len = ch.index - hs_start;
+    ch.patchInt(u16, record_len_pos, @as(u16, @intCast(record_payload_len)));
+    ch.patchInt(u24, hs_len_pos, @as(u24, @intCast(record_payload_len - 4)));
+
+    std.debug.assert(ch.index == total_len);
     return buffer;
 }
 
@@ -1397,6 +1704,37 @@ pub fn buildTCPAckAlloc(
     pw.patchInt(u16, 36, tcp_csum);
 
     return packet;
+}
+
+// SOURCE: RFC 9293, Section 3.4 — pure ACK packets acknowledge bytes but do not consume sequence space
+// SOURCE: man 2 sendto — raw socket packet transmission
+fn sendTcpAckForState(
+    allocator: std.mem.Allocator,
+    sock: anytype,
+    dst_ip: u32,
+    src_ip: u32,
+    src_port: u16,
+    dst_port: u16,
+    seq_num: u32,
+    ack_num: u32,
+    client_tsval: *u32,
+    server_tsval: u32,
+) !void {
+    client_tsval.* +%= 1;
+    const ack_packet = try buildTCPAckAlloc(
+        allocator,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq_num,
+        ack_num,
+        client_tsval.*,
+        server_tsval,
+    );
+    defer allocator.free(ack_packet);
+
+    _ = try sock.sendPacket(ack_packet, dst_ip);
 }
 
 pub fn buildTCPDataAlloc(
@@ -2087,8 +2425,104 @@ pub const TlsError = error{
     HandshakeTimeout,
     ServerHelloParseFailed,
     HelloRetryRequestUnsupported,
+    UnsupportedCipherSuite,
+    ServerFinishedVerifyFailed,
     TlsKeyScheduleUnimplemented,
 };
+
+const Tls13Aes128GcmSha256HandshakeSecrets = struct {
+    master_secret: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    client_finished_key: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8,
+    server_finished_key: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8,
+    handshake_session: TlsSession,
+};
+
+// SOURCE: RFC 8446, Section 4.4.1 — HelloRetryRequest injects a synthetic message_hash
+fn buildMessageHashHandshake(client_hello_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8) [4 + std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var synthetic = [_]u8{0} ** (4 + std.crypto.hash.sha2.Sha256.digest_length);
+    synthetic[0] = 0xFE;
+    synthetic[1] = 0x00;
+    synthetic[2] = 0x00;
+    synthetic[3] = std.crypto.hash.sha2.Sha256.digest_length;
+    @memcpy(synthetic[4..], &client_hello_hash);
+    return synthetic;
+}
+
+// SOURCE: RFC 8446, Section 7.1 — TLS 1.3 key schedule
+// SOURCE: RFC 8446, Section 7.3 — traffic secrets derive key/iv pairs
+fn deriveTls13Aes128GcmSha256HandshakeSecrets(
+    shared_secret: []const u8,
+    hello_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) Tls13Aes128GcmSha256HandshakeSecrets {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+
+    const zeroes = [1]u8{0} ** Sha256.digest_length;
+    const early_secret = HkdfSha256.extract(&[1]u8{0}, &zeroes);
+    const empty_hash = std.crypto.tls.emptyHash(Sha256);
+    const hs_derived_secret = std.crypto.tls.hkdfExpandLabel(HkdfSha256, early_secret, "derived", &empty_hash, Sha256.digest_length);
+    const handshake_secret = HkdfSha256.extract(&hs_derived_secret, shared_secret);
+    const ap_derived_secret = std.crypto.tls.hkdfExpandLabel(HkdfSha256, handshake_secret, "derived", &empty_hash, Sha256.digest_length);
+    const master_secret = HkdfSha256.extract(&ap_derived_secret, &zeroes);
+    const client_secret = std.crypto.tls.hkdfExpandLabel(HkdfSha256, handshake_secret, "c hs traffic", &hello_hash, Sha256.digest_length);
+    const server_secret = std.crypto.tls.hkdfExpandLabel(HkdfSha256, handshake_secret, "s hs traffic", &hello_hash, Sha256.digest_length);
+
+    return .{
+        .master_secret = master_secret,
+        .client_finished_key = std.crypto.tls.hkdfExpandLabel(HkdfSha256, client_secret, "finished", "", HmacSha256.key_length),
+        .server_finished_key = std.crypto.tls.hkdfExpandLabel(HkdfSha256, server_secret, "finished", "", HmacSha256.key_length),
+        .handshake_session = .{
+            .client_write_key = std.crypto.tls.hkdfExpandLabel(HkdfSha256, client_secret, "key", "", 16),
+            .client_write_iv = std.crypto.tls.hkdfExpandLabel(HkdfSha256, client_secret, "iv", "", 12),
+            .server_write_key = std.crypto.tls.hkdfExpandLabel(HkdfSha256, server_secret, "key", "", 16),
+            .server_write_iv = std.crypto.tls.hkdfExpandLabel(HkdfSha256, server_secret, "iv", "", 12),
+            .seq_send = 0,
+            .seq_recv = 0,
+        },
+    };
+}
+
+// SOURCE: RFC 8446, Section 7.1 — application traffic secret derivation after Finished
+fn deriveTls13Aes128GcmSha256ApplicationSession(
+    master_secret: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    handshake_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) TlsSession {
+    const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+    const client_secret = std.crypto.tls.hkdfExpandLabel(HkdfSha256, master_secret, "c ap traffic", &handshake_hash, std.crypto.hash.sha2.Sha256.digest_length);
+    const server_secret = std.crypto.tls.hkdfExpandLabel(HkdfSha256, master_secret, "s ap traffic", &handshake_hash, std.crypto.hash.sha2.Sha256.digest_length);
+
+    return .{
+        .client_write_key = std.crypto.tls.hkdfExpandLabel(HkdfSha256, client_secret, "key", "", 16),
+        .client_write_iv = std.crypto.tls.hkdfExpandLabel(HkdfSha256, client_secret, "iv", "", 12),
+        .server_write_key = std.crypto.tls.hkdfExpandLabel(HkdfSha256, server_secret, "key", "", 16),
+        .server_write_iv = std.crypto.tls.hkdfExpandLabel(HkdfSha256, server_secret, "iv", "", 12),
+        .seq_send = 0,
+        .seq_recv = 0,
+    };
+}
+
+// SOURCE: RFC 8446, Section 4.4.1 — transcript hash for HelloRetryRequest inserts message_hash(ClientHello1)
+fn initServerHelloTranscriptSha256(
+    first_client_hello: []const u8,
+    hello_retry_request: ?[]const u8,
+    second_client_hello: ?[]const u8,
+    final_server_hello: []const u8,
+) std.crypto.hash.sha2.Sha256 {
+    var transcript = std.crypto.hash.sha2.Sha256.init(.{});
+    if (hello_retry_request) |hrr| {
+        var first_hash = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+        std.crypto.hash.sha2.Sha256.hash(first_client_hello, &first_hash, .{});
+        const synthetic = buildMessageHashHandshake(first_hash);
+        transcript.update(&synthetic);
+        transcript.update(hrr);
+        transcript.update(second_client_hello orelse unreachable);
+    } else {
+        transcript.update(first_client_hello);
+    }
+    transcript.update(final_server_hello);
+    return transcript;
+}
 
 /// Complete TCP + TLS 1.3 handshake returning full connection state.
 ///
@@ -2225,10 +2659,17 @@ pub fn completeHandshakeFull(
                 jitter_core.exactSleepMs(pre_tls_jitter);
 
                 // Build and send TLS ClientHello
-                const tls_ch = try buildTLSClientHelloAlloc(allocator, server_name);
-                defer allocator.free(tls_ch);
+                const tls_ch = try buildTLSClientHelloAllocWithState(allocator, server_name);
+                defer allocator.free(tls_ch.hello);
+                var client_hello_state = tls_ch.state;
+                var retry_client_hello: ?[]u8 = null;
+                defer if (retry_client_hello) |hello| allocator.free(hello);
+                var hello_retry_request_message: ?[]u8 = null;
+                defer if (hello_retry_request_message) |message| allocator.free(message);
 
                 client_seq += 1; // SYN consumed one seq
+                client_tsval +%= 1;
+                server_seq += 1; // SYN-ACK consumed one seq on the server side
                 const data_packet = try buildTCPDataAlloc(
                     allocator,
                     src_ip,
@@ -2236,21 +2677,32 @@ pub fn completeHandshakeFull(
                     src_port,
                     dst_port,
                     client_seq,
-                    server_seq + 1,
-                    client_tsval + 2,
+                    server_seq,
+                    client_tsval,
                     server_tsval,
-                    tls_ch,
+                    tls_ch.hello,
                 );
                 defer allocator.free(data_packet);
 
-                client_seq += @as(u32, @intCast(tls_ch.len));
+                client_seq += @as(u32, @intCast(tls_ch.hello.len));
                 _ = try sock.sendPacket(data_packet, dst_ip);
-                std.debug.print("[HANDSHAKE] TLS ClientHello sent ({d} bytes)\n", .{tls_ch.len});
+                std.debug.print("[HANDSHAKE] TLS ClientHello sent ({d} bytes)\n", .{tls_ch.hello.len});
 
                 // Wait for ServerHello
                 const sh_start = currentTimestampMs();
                 var pkt_count: usize = 0;
                 var filtered_count: usize = 0;
+                var handshake_plaintext = std.array_list.Managed(u8).init(allocator);
+                defer handshake_plaintext.deinit();
+                var tls_record_buffer = std.array_list.Managed(u8).init(allocator);
+                defer tls_record_buffer.deinit();
+                var handshake_transcript: std.crypto.hash.sha2.Sha256 = undefined;
+                var handshake_transcript_ready = false;
+                var handshake_secrets: ?Tls13Aes128GcmSha256HandshakeSecrets = null;
+                var handshake_session: TlsSession = undefined;
+                var handshake_session_ready = false;
+                var saw_certificate_verify = false;
+
                 while (currentTimestampMs() - sh_start < 10000) {
                     const vlen = sock.recvPacket(&buffer) catch continue;
                     const vdata = buffer[0..vlen];
@@ -2288,66 +2740,262 @@ pub fn completeHandshakeFull(
 
                     if (vlen > v_ip_offset + v_tcp_off) {
                         const payload = vdata[v_ip_offset + v_tcp_off .. vlen];
+                        const incoming_sequence = readBe32(v_tcp[4..8]);
+                        const control_len: u32 = @intFromBool((v_tcp_flags & 0x02) != 0 or (v_tcp_flags & 0x01) != 0);
+                        server_seq = incoming_sequence + @as(u32, @intCast(payload.len)) + control_len;
+                        if (parseTcpTimestampValue(v_tcp, v_tcp_off)) |tsval| {
+                            server_tsval = tsval;
+                        }
+
+                        try sendTcpAckForState(
+                            allocator,
+                            sock,
+                            dst_ip,
+                            src_ip,
+                            src_port,
+                            dst_port,
+                            client_seq,
+                            server_seq,
+                            &client_tsval,
+                            server_tsval,
+                        );
+
                         std.debug.print("[SH-RECV] TCP payload: {d} bytes, TCP flags=0x{x:02}\n", .{
                             payload.len, v_tcp_flags,
                         });
 
-                        // TLS Alert
-                        if (payload.len >= 7 and payload[0] == 0x15) {
-                            const alert_level = payload[5];
-                            const alert_desc = payload[6];
-                            const alert_name = parseTlsAlertDescription(alert_desc);
-                            std.debug.print("[TLS ALERT] Level={d} Code=0x{x:02} ({s})\n", .{
-                                alert_level, alert_desc, alert_name,
-                            });
-                            if (alert_level == 2) {
-                                std.debug.print("[FATAL] TLS Fatal Alert — aborting handshake\n", .{});
-                                return error.TlsAlertReceived;
+                        try tls_record_buffer.appendSlice(payload);
+
+                        var record_offset: usize = 0;
+                        while (tls_record_buffer.items.len - record_offset >= TLS_REC_HEADER_LEN) {
+                            const record_length = readBe16(
+                                tls_record_buffer.items[record_offset + TLS_REC_LENGTH .. record_offset + TLS_REC_LENGTH + 2],
+                            );
+                            const total_record_len = TLS_REC_HEADER_LEN + @as(usize, record_length);
+                            if (tls_record_buffer.items.len - record_offset < total_record_len) break;
+
+                            const record = tls_record_buffer.items[record_offset .. record_offset + total_record_len];
+                            switch (record[0]) {
+                                0x15 => {
+                                    if (record.len < TLS_REC_HEADER_LEN + TLS_ALERT_LEN) return error.TlsAlertReceived;
+                                    const alert_level = record[5];
+                                    const alert_desc = record[6];
+                                    const alert_name = parseTlsAlertDescription(alert_desc);
+                                    std.debug.print("[TLS ALERT] Level={d} Code=0x{x:02} ({s})\n", .{
+                                        alert_level, alert_desc, alert_name,
+                                    });
+                                    if (alert_level == 2) return error.TlsAlertReceived;
+                                },
+                                0x14 => {
+                                    if (record_length != 1 or record[5] != 0x01) return error.ServerHelloParseFailed;
+                                },
+                                0x16 => {
+                                    const wrapped_handshake = record[TLS_REC_HEADER_LEN .. TLS_REC_HEADER_LEN + record_length];
+                                    const parsed_server_hello = try parseServerHelloMessage(wrapped_handshake);
+
+                                    if (parsed_server_hello.supported_version != 0x0304) return error.ServerHelloParseFailed;
+                                    if (parsed_server_hello.cipher_suite != 0x1301) return error.UnsupportedCipherSuite;
+
+                                    if (parsed_server_hello.is_hello_retry_request) {
+                                        if (hello_retry_request_message != null) return error.HelloRetryRequestUnsupported;
+
+                                        const selected_group = parsed_server_hello.key_share_group orelse return error.HelloRetryRequestUnsupported;
+                                        hello_retry_request_message = try allocator.dupe(u8, wrapped_handshake);
+                                        retry_client_hello = try buildTLSHelloRetryClientHelloAlloc(
+                                            allocator,
+                                            server_name,
+                                            &client_hello_state,
+                                            selected_group,
+                                            parsed_server_hello.cookie,
+                                        );
+
+                                        client_tsval +%= 1;
+                                        const retry_packet = try buildTCPDataAlloc(
+                                            allocator,
+                                            src_ip,
+                                            dst_ip,
+                                            src_port,
+                                            dst_port,
+                                            client_seq,
+                                            server_seq,
+                                            client_tsval,
+                                            server_tsval,
+                                            retry_client_hello.?,
+                                        );
+                                        defer allocator.free(retry_packet);
+                                        client_seq += @as(u32, @intCast(retry_client_hello.?.len));
+                                        _ = try sock.sendPacket(retry_packet, dst_ip);
+                                        std.debug.print("[HANDSHAKE] HelloRetryRequest received; second ClientHello sent for group 0x{x:04}\n", .{selected_group});
+                                    } else {
+                                        std.debug.print("[HANDSHAKE] ServerHello received\n", .{});
+                                        cipher_suite = parsed_server_hello.cipher_suite;
+                                        server_random = parsed_server_hello.server_random;
+
+                                        const selected_group = parsed_server_hello.key_share_group orelse return error.ServerHelloParseFailed;
+                                        const shared_secret = try deriveSharedSecret(
+                                            &client_hello_state,
+                                            selected_group,
+                                            parsed_server_hello.key_share_data,
+                                        );
+
+                                        handshake_transcript = initServerHelloTranscriptSha256(
+                                            tls_ch.hello[5..],
+                                            hello_retry_request_message,
+                                            if (retry_client_hello) |hello| hello[5..] else null,
+                                            wrapped_handshake,
+                                        );
+                                        handshake_transcript_ready = true;
+                                        handshake_secrets = deriveTls13Aes128GcmSha256HandshakeSecrets(
+                                            shared_secret.bytes[0..shared_secret.len],
+                                            handshake_transcript.peek(),
+                                        );
+                                        handshake_session = handshake_secrets.?.handshake_session;
+                                        handshake_session_ready = true;
+                                        std.debug.print("[HANDSHAKE] Cipher suite: 0x{x:04}\n", .{cipher_suite});
+                                    }
+                                },
+                                0x17 => {
+                                    if (!handshake_session_ready or !handshake_transcript_ready) return error.TlsKeyScheduleUnimplemented;
+
+                                    const decrypted = try decryptRecordWithInnerType(allocator, &handshake_session, record);
+                                    defer allocator.free(decrypted.plaintext);
+
+                                    switch (decrypted.inner_content_type) {
+                                        0x15 => {
+                                            if (decrypted.plaintext.len < 2) return error.TlsAlertReceived;
+                                            const alert_level = decrypted.plaintext[0];
+                                            const alert_desc = decrypted.plaintext[1];
+                                            const alert_name = parseTlsAlertDescription(alert_desc);
+                                            std.debug.print("[TLS ALERT] Level={d} Code=0x{x:02} ({s})\n", .{
+                                                alert_level, alert_desc, alert_name,
+                                            });
+                                            if (alert_level == 2) return error.TlsAlertReceived;
+                                        },
+                                        0x16 => {
+                                            try handshake_plaintext.appendSlice(decrypted.plaintext);
+
+                                            var consumed: usize = 0;
+                                            while (handshake_plaintext.items.len - consumed >= TLS_HS_HEADER_LEN) {
+                                                const remaining = handshake_plaintext.items[consumed..];
+                                                const handshake_len = readBe24(remaining[1..4]);
+                                                if (remaining.len < TLS_HS_HEADER_LEN + handshake_len) break;
+
+                                                const wrapped_handshake = remaining[0 .. TLS_HS_HEADER_LEN + handshake_len];
+                                                switch (wrapped_handshake[0]) {
+                                                    0x08, 0x0B => handshake_transcript.update(wrapped_handshake),
+                                                    0x0F => {
+                                                        saw_certificate_verify = true;
+                                                        handshake_transcript.update(wrapped_handshake);
+                                                    },
+                                                    0x14 => {
+                                                        const current_handshake_secrets = handshake_secrets orelse return error.TlsKeyScheduleUnimplemented;
+                                                        const finished_digest = handshake_transcript.peek();
+                                                        var expected_verify_data: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+                                                        std.crypto.auth.hmac.sha2.HmacSha256.create(
+                                                            &expected_verify_data,
+                                                            &finished_digest,
+                                                            current_handshake_secrets.server_finished_key[0..],
+                                                        );
+                                                        if (handshake_len != expected_verify_data.len or
+                                                            !mem.eql(u8, wrapped_handshake[4 .. 4 + handshake_len], &expected_verify_data))
+                                                        {
+                                                            return error.ServerFinishedVerifyFailed;
+                                                        }
+
+                                                        handshake_transcript.update(wrapped_handshake);
+                                                        const handshake_hash = handshake_transcript.finalResult();
+
+                                                        var client_verify_data: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+                                                        std.crypto.auth.hmac.sha2.HmacSha256.create(
+                                                            &client_verify_data,
+                                                            &handshake_hash,
+                                                            current_handshake_secrets.client_finished_key[0..],
+                                                        );
+
+                                                        var client_finished = [_]u8{0} ** (TLS_HS_HEADER_LEN + std.crypto.auth.hmac.sha2.HmacSha256.mac_length);
+                                                        client_finished[0] = 0x14;
+                                                        client_finished[1] = 0x00;
+                                                        client_finished[2] = 0x00;
+                                                        client_finished[3] = std.crypto.auth.hmac.sha2.HmacSha256.mac_length;
+                                                        @memcpy(client_finished[4..], &client_verify_data);
+
+                                                        const finished_record = try encryptRecordWithInnerType(
+                                                            allocator,
+                                                            &handshake_session,
+                                                            &client_finished,
+                                                            0x16,
+                                                        );
+                                                        defer allocator.free(finished_record);
+
+                                                        client_tsval +%= 1;
+                                                        const finished_packet = try buildTCPDataAlloc(
+                                                            allocator,
+                                                            src_ip,
+                                                            dst_ip,
+                                                            src_port,
+                                                            dst_port,
+                                                            client_seq,
+                                                            server_seq,
+                                                            client_tsval,
+                                                            server_tsval,
+                                                            finished_record,
+                                                        );
+                                                        defer allocator.free(finished_packet);
+                                                        _ = try sock.sendPacket(finished_packet, dst_ip);
+                                                        client_seq += @as(u32, @intCast(finished_record.len));
+
+                                                        if (saw_certificate_verify) {
+                                                            std.debug.print("[HANDSHAKE] CertificateVerify message was present, but certificate chain/signature validation is not implemented yet\n", .{});
+                                                        }
+
+                                                        std.debug.print("[HANDSHAKE] TLS 1.3 Finished verified; application traffic keys established\n", .{});
+                                                        return HandshakeResultFull{
+                                                            .sock_fd = sock.fd,
+                                                            .tls_session = deriveTls13Aes128GcmSha256ApplicationSession(
+                                                                current_handshake_secrets.master_secret,
+                                                                handshake_hash,
+                                                            ),
+                                                            .src_ip = src_ip,
+                                                            .dst_ip = dst_ip,
+                                                            .src_port = src_port,
+                                                            .dst_port = dst_port,
+                                                            .client_seq = client_seq,
+                                                            .server_seq = server_seq,
+                                                            .client_tsval = client_tsval,
+                                                            .server_tsval = server_tsval,
+                                                            .cipher_suite = cipher_suite,
+                                                            .server_random = server_random,
+                                                        };
+                                                    },
+                                                    else => return error.UnexpectedHandshakeType,
+                                                }
+
+                                                consumed += wrapped_handshake.len;
+                                            }
+
+                                            if (consumed > 0) {
+                                                const remaining_len = handshake_plaintext.items.len - consumed;
+                                                mem.copyForwards(u8, handshake_plaintext.items[0..remaining_len], handshake_plaintext.items[consumed..]);
+                                                handshake_plaintext.items.len = remaining_len;
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                },
+                                else => return error.InvalidRecordType,
                             }
-                            continue;
+
+                            record_offset += total_record_len;
                         }
 
-                        // TLS Handshake (ServerHello)
-                        // SOURCE: RFC 8446, Section 5.1 — TLSPlaintext structure (5 byte record header)
-                        // SOURCE: RFC 8446, Section 4 — Handshake protocol (4 byte handshake header)
-                        // SOURCE: RFC 8446, Section 4.1.3 — ServerHello structure
-                        if (payload.len > 10 and payload[0] == 0x16 and payload[5] == 0x02) {
-                            std.debug.print("[HANDSHAKE] ServerHello received\n", .{});
-
-                            // Parse ServerHello body
-                            // Layout: record_header(5) + handshake_header(4) + ServerHello_body
-                            // ServerHello_body: legacy_version(2) + random(32) + session_id_len(1) + session_id(var) + cipher_suite(2) + compression(1) + extensions(var)
-                            const sh_body = payload[9..]; // Skip TLS record header (5) + handshake header (4)
-                            if (sh_body.len >= 35) {
-                                // legacy_version: sh_body[0..2]
-                                // server_random: sh_body[2..34]
-                                // session_id_len: sh_body[34]
-                                const sid_len = sh_body[34];
-                                const cs_offset = 35 + sid_len;
-                                if (cs_offset + 2 <= sh_body.len) {
-                                    cipher_suite = (@as(u16, sh_body[cs_offset]) << 8) | sh_body[cs_offset + 1];
-                                    std.debug.print("[HANDSHAKE] Cipher suite: 0x{x:04}\n", .{cipher_suite});
-                                } else {
-                                    std.debug.print("[HANDSHAKE] ERROR: ServerHello too short for cipher suite (cs_offset={d}, body_len={d})\n", .{ cs_offset, sh_body.len });
-                                }
-
-                                // Extract server random
-                                @memcpy(&server_random, sh_body[2..34]);
-
-                                if (isHelloRetryRequestRandom(&server_random)) {
-                                    std.debug.print("[HANDSHAKE] HelloRetryRequest detected — current ClientHello/key_share path is not sufficient\n", .{});
-                                    return error.HelloRetryRequestUnsupported;
-                                }
-                            } else {
-                                std.debug.print("[HANDSHAKE] ERROR: ServerHello body too short ({d} bytes, need >=35)\n", .{sh_body.len});
-                            }
-
-                            // Update client_tsval for subsequent sends
-                            client_tsval += 3;
-                            server_tsval += 1;
-
-                            std.debug.print("[HANDSHAKE] RFC 8446 key schedule and Finished processing are not implemented; refusing to fabricate TLS application keys\n", .{});
-                            return error.TlsKeyScheduleUnimplemented;
+                        if (record_offset > 0) {
+                            const remaining_len = tls_record_buffer.items.len - record_offset;
+                            mem.copyForwards(
+                                u8,
+                                tls_record_buffer.items[0..remaining_len],
+                                tls_record_buffer.items[record_offset..],
+                            );
+                            tls_record_buffer.items.len = remaining_len;
                         }
                     }
                 }
@@ -2702,6 +3350,96 @@ fn isHelloRetryRequestRandom(server_random: []const u8) bool {
         mem.eql(u8, server_random, &hello_retry_request_random);
 }
 
+const ParsedServerHello = struct {
+    server_random: [32]u8,
+    cipher_suite: u16,
+    supported_version: ?u16 = null,
+    key_share_group: ?u16 = null,
+    key_share_data: []const u8 = &.{},
+    cookie: []const u8 = &.{},
+    is_hello_retry_request: bool,
+};
+
+// SOURCE: RFC 8446, Section 4.1.3 — ServerHello wire format
+// SOURCE: RFC 8446, Section 4.1.4 — HelloRetryRequest uses ServerHello structure
+// SOURCE: RFC 8446, Section 4.2.1 — supported_versions
+// SOURCE: RFC 8446, Section 4.2.2 — cookie
+// SOURCE: RFC 8446, Section 4.2.8 — key_share
+fn parseServerHelloMessage(message: []const u8) !ParsedServerHello {
+    if (message.len < 4 + 2 + 32 + 1 + 2 + 1 + 2) return error.ServerHelloParseFailed;
+    if (message[0] != 0x02) return error.UnexpectedHandshakeType;
+    if (readBe24(message[1..4]) + 4 != message.len) return error.ServerHelloParseFailed;
+
+    const body = message[4..];
+    var offset: usize = 0;
+    offset += 2; // legacy_version
+
+    var server_random: [32]u8 = undefined;
+    @memcpy(&server_random, body[offset .. offset + 32]);
+    offset += 32;
+
+    const session_id_echo_len = body[offset];
+    offset += 1;
+    if (offset + session_id_echo_len + 2 + 1 + 2 > body.len) return error.ServerHelloParseFailed;
+    offset += session_id_echo_len;
+
+    const cipher_suite = readBe16(body[offset .. offset + 2]);
+    offset += 2;
+
+    const compression_method = body[offset];
+    if (compression_method != 0) return error.ServerHelloParseFailed;
+    offset += 1;
+
+    const extensions_len = readBe16(body[offset .. offset + 2]);
+    offset += 2;
+    if (offset + extensions_len != body.len) return error.ServerHelloParseFailed;
+
+    const is_hrr = isHelloRetryRequestRandom(&server_random);
+    var parsed = ParsedServerHello{
+        .server_random = server_random,
+        .cipher_suite = cipher_suite,
+        .is_hello_retry_request = is_hrr,
+    };
+
+    const extensions_end = offset + extensions_len;
+    while (offset < extensions_end) {
+        if (offset + 4 > extensions_end) return error.ServerHelloParseFailed;
+        const ext_type = readBe16(body[offset .. offset + 2]);
+        const ext_len = readBe16(body[offset + 2 .. offset + 4]);
+        offset += 4;
+        if (offset + ext_len > extensions_end) return error.ServerHelloParseFailed;
+        const ext_data = body[offset .. offset + ext_len];
+
+        switch (ext_type) {
+            @intFromEnum(ExtensionType.supported_versions) => {
+                if (ext_len != 2) return error.ServerHelloParseFailed;
+                parsed.supported_version = readBe16(ext_data);
+            },
+            @intFromEnum(ExtensionType.cookie) => {
+                parsed.cookie = ext_data;
+            },
+            @intFromEnum(ExtensionType.key_share) => {
+                if (is_hrr) {
+                    if (ext_len != 2) return error.ServerHelloParseFailed;
+                    parsed.key_share_group = readBe16(ext_data);
+                } else {
+                    if (ext_len < 4) return error.ServerHelloParseFailed;
+                    const group = readBe16(ext_data[0..2]);
+                    const key_exchange_len = readBe16(ext_data[2..4]);
+                    if (4 + key_exchange_len != ext_len) return error.ServerHelloParseFailed;
+                    parsed.key_share_group = group;
+                    parsed.key_share_data = ext_data[4 .. 4 + key_exchange_len];
+                }
+            },
+            else => {},
+        }
+
+        offset += ext_len;
+    }
+
+    return parsed;
+}
+
 fn summarizeTlsHello(hello: []const u8) !TlsHelloSummary {
     if (hello.len < 47) return error.MalformedClientHello;
     if (hello[0] != 0x16 or hello[1] != 0x03 or hello[2] != 0x01) return error.MalformedClientHello;
@@ -2759,6 +3497,37 @@ fn summarizeTlsHello(hello: []const u8) !TlsHelloSummary {
     };
 }
 
+fn extractClientHelloExtension(hello: []const u8, extension_type: u16) !?[]const u8 {
+    if (hello.len < 47) return error.MalformedClientHello;
+
+    var offset: usize = 9;
+    offset += 2;
+    offset += 32;
+
+    const session_id_len = hello[offset];
+    offset += 1 + session_id_len;
+
+    const cipher_len = readBe16(hello[offset .. offset + 2]);
+    offset += 2 + cipher_len;
+
+    const compression_len = hello[offset];
+    offset += 1 + compression_len;
+
+    const extensions_len = readBe16(hello[offset .. offset + 2]);
+    offset += 2;
+    const extensions_end = offset + extensions_len;
+
+    while (offset < extensions_end) {
+        const current_type = readBe16(hello[offset .. offset + 2]);
+        const current_len = readBe16(hello[offset + 2 .. offset + 4]);
+        const body = hello[offset + 4 .. offset + 4 + current_len];
+        if (current_type == extension_type) return body;
+        offset += 4 + current_len;
+    }
+
+    return null;
+}
+
 test "GREASE helper follows RFC 8701 pattern" {
     try std.testing.expectEqual(@as(u16, 0x0A0A), greaseCodepointFromNibble(0x0));
     try std.testing.expectEqual(@as(u16, 0x1A1A), greaseCodepointFromNibble(0x1));
@@ -2783,6 +3552,60 @@ test "client hello matches JA4 structural counts" {
     try std.testing.expect(summary.has_alpn);
     try std.testing.expect(summary.has_ech_placeholder);
     try std.testing.expect(hello.len <= tls_client_hello_mss_limit);
+}
+
+test "client hello state serializes real hybrid key material" {
+    const result = try buildTLSClientHelloAllocWithState(std.testing.allocator, "github.com");
+    defer std.testing.allocator.free(result.hello);
+
+    const key_share = (try extractClientHelloExtension(result.hello, @intFromEnum(ExtensionType.key_share))) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, @as(u16, @intCast(2 + 2 + hybrid_keyshare_len))), readBe16(key_share[0..2]));
+    try std.testing.expectEqual(@as(u16, x25519_mlkem768_group), readBe16(key_share[2..4]));
+    try std.testing.expectEqual(@as(u16, hybrid_keyshare_len), readBe16(key_share[4..6]));
+
+    const encoded_mlkem = result.state.mlkem768_key_pair.public_key.toBytes();
+    try std.testing.expectEqualSlices(u8, &encoded_mlkem, key_share[6 .. 6 + mlkem768_share_len]);
+    try std.testing.expectEqualSlices(u8, &result.state.hybrid_x25519_key_pair.public_key, key_share[6 + mlkem768_share_len .. 6 + hybrid_keyshare_len]);
+}
+
+test "hello retry client hello switches key_share to requested x25519 group" {
+    var result = try buildTLSClientHelloAllocWithState(std.testing.allocator, "github.com");
+    defer std.testing.allocator.free(result.hello);
+
+    const retry_hello = try buildTLSHelloRetryClientHelloAlloc(
+        std.testing.allocator,
+        "github.com",
+        &result.state,
+        0x001D,
+        "cookie",
+    );
+    defer std.testing.allocator.free(retry_hello);
+
+    const retry_key_share = (try extractClientHelloExtension(retry_hello, @intFromEnum(ExtensionType.key_share))) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, @as(u16, @intCast(2 + 2 + x25519_share_len))), readBe16(retry_key_share[0..2]));
+    try std.testing.expectEqual(@as(u16, 0x001D), readBe16(retry_key_share[2..4]));
+    try std.testing.expectEqual(@as(u16, x25519_share_len), readBe16(retry_key_share[4..6]));
+
+    const retry_cookie = (try extractClientHelloExtension(retry_hello, @intFromEnum(ExtensionType.cookie))) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("cookie", retry_cookie);
+}
+
+test "hello retry client hello without cookie still serializes correctly" {
+    var result = try buildTLSClientHelloAllocWithState(std.testing.allocator, "github.com");
+    defer std.testing.allocator.free(result.hello);
+
+    const retry_hello = try buildTLSHelloRetryClientHelloAlloc(
+        std.testing.allocator,
+        "github.com",
+        &result.state,
+        0x001D,
+        "",
+    );
+    defer std.testing.allocator.free(retry_hello);
+
+    try std.testing.expect((try extractClientHelloExtension(retry_hello, @intFromEnum(ExtensionType.cookie))) == null);
+    const retry_key_share = (try extractClientHelloExtension(retry_hello, @intFromEnum(ExtensionType.key_share))) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, x25519_share_len), readBe16(retry_key_share[4..6]));
 }
 
 test "client hello exact size matches serializer output" {
@@ -3266,6 +4089,11 @@ pub const TlsSession = struct {
     seq_recv: u64 = 0,
 };
 
+const DecryptedTlsInnerPlaintext = struct {
+    plaintext: []u8,
+    inner_content_type: u8,
+};
+
 /// Compute the per-record nonce for TLS 1.3 AEAD operations.
 ///
 /// SOURCE: RFC 8446, Section 5.3 — Per-Record Nonce
@@ -3306,64 +4134,53 @@ fn computeNonce(write_iv: [12]u8, seq_num: u64) [12]u8 {
 ///
 /// Returns: allocated slice containing the complete TLSCiphertext (header + encrypted_record).
 /// Caller owns the returned slice.
-pub fn encryptRecord(
+fn encryptRecordWithInnerType(
     allocator: mem.Allocator,
     session: *TlsSession,
     plaintext: []const u8,
+    inner_content_type: u8,
 ) ![]u8 {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
-    const TAG_LEN: usize = Aes128Gcm.tag_length; // 16 bytes
+    const TAG_LEN: usize = Aes128Gcm.tag_length;
 
-    // STEP 1: Build TLSInnerPlaintext
-    // For simplicity, no padding (zeros length = 0).
-    // TLSInnerPlaintext = content || type(0x17 = application_data)
-    const inner_plaintext_len = plaintext.len + 1; // +1 for ContentType byte
+    const inner_plaintext_len = plaintext.len + 1;
     const inner_plaintext = try allocator.alloc(u8, inner_plaintext_len);
     defer allocator.free(inner_plaintext);
     @memcpy(inner_plaintext[0..plaintext.len], plaintext);
-    inner_plaintext[plaintext.len] = 0x17; // ContentType = application_data (RFC 8446 §5.2)
+    inner_plaintext[plaintext.len] = inner_content_type;
 
-    // STEP 2: Build AAD (Additional Authenticated Data)
-    // SOURCE: RFC 8446, Section 5.2 — AAD is the 5-byte record header
-    const aad_len: usize = 5;
-    var aad: [aad_len]u8 = undefined;
-    aad[0] = 0x17; // opaque_type = application_data
-    aad[1] = 0x03; // legacy_record_version major = TLS 1.2
-    aad[2] = 0x03; // legacy_record_version minor
-    // length = inner_plaintext_len + TAG_LEN (encrypted payload length)
+    var aad: [5]u8 = undefined;
+    aad[0] = 0x17;
+    aad[1] = 0x03;
+    aad[2] = 0x03;
     const encrypted_len: u16 = @intCast(inner_plaintext_len + TAG_LEN);
     aad[3] = @truncate((encrypted_len >> 8) & 0xFF);
     aad[4] = @truncate(encrypted_len & 0xFF);
 
-    // STEP 3: Compute nonce
     const nonce = computeNonce(session.client_write_iv, session.seq_send);
-
-    // STEP 4: AEAD Encrypt
-    // Aes128Gcm.encrypt requires c.len == m.len (ciphertext same size as plaintext)
-    // The tag is written to a separate output buffer.
-    const ciphertext_len = inner_plaintext_len; // same as plaintext
-    const ciphertext = try allocator.alloc(u8, ciphertext_len);
+    const ciphertext = try allocator.alloc(u8, inner_plaintext_len);
     errdefer allocator.free(ciphertext);
 
     var tag: [TAG_LEN]u8 = undefined;
     Aes128Gcm.encrypt(ciphertext, &tag, inner_plaintext, &aad, nonce, session.client_write_key);
 
-    // STEP 5: Build TLSCiphertext record (header + encrypted_record + tag)
-    // encrypted_record = ciphertext || tag
-    const encrypted_record_total = ciphertext_len + TAG_LEN;
-    const record_len = aad_len + encrypted_record_total;
-    const record = try allocator.alloc(u8, record_len);
+    const record = try allocator.alloc(u8, aad.len + ciphertext.len + tag.len);
     errdefer allocator.free(record);
-    @memcpy(record[0..aad_len], &aad);
-    @memcpy(record[aad_len .. aad_len + ciphertext_len], ciphertext);
-    @memcpy(record[aad_len + ciphertext_len .. aad_len + encrypted_record_total], &tag);
+    @memcpy(record[0..aad.len], &aad);
+    @memcpy(record[aad.len .. aad.len + ciphertext.len], ciphertext);
+    @memcpy(record[aad.len + ciphertext.len ..], &tag);
 
     allocator.free(ciphertext);
-
-    // Increment sequence number (RFC 8446 §5.3)
     session.seq_send += 1;
-
     return record;
+}
+
+pub fn encryptRecord(
+    allocator: mem.Allocator,
+    session: *TlsSession,
+    plaintext: []const u8,
+) ![]u8 {
+    return encryptRecordWithInnerType(allocator, session, plaintext, 0x17);
 }
 
 /// Decrypt a TLS 1.3 record using AES-128-GCM.
@@ -3381,11 +4198,11 @@ pub fn encryptRecord(
 /// STEP 6: Strip trailing type byte and zeros padding → plaintext
 ///
 /// Returns: allocated slice containing the decrypted plaintext (caller owns it).
-pub fn decryptRecord(
+fn decryptRecordWithInnerType(
     allocator: mem.Allocator,
     session: *TlsSession,
     ciphertext: []const u8,
-) ![]u8 {
+) !DecryptedTlsInnerPlaintext {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const TAG_LEN: usize = Aes128Gcm.tag_length; // 16 bytes
 
@@ -3448,25 +4265,35 @@ pub fn decryptRecord(
         allocator.free(inner_plaintext);
         return error.TlsInnerPlaintextTooShort;
     }
-    // Note: content_type byte is at inner_plaintext[inner_plaintext.len - 1]
-    // We strip it along with trailing zeros padding.
 
-    // Strip trailing zeros (padding) and the type byte
-    var end_idx: usize = inner_plaintext.len - 1; // skip type byte
-    while (end_idx > 0 and inner_plaintext[end_idx - 1] == 0x00) {
-        end_idx -= 1;
+    var type_index: usize = inner_plaintext.len - 1;
+    while (type_index > 0 and inner_plaintext[type_index] == 0x00) {
+        type_index -= 1;
     }
+    const inner_content_type = inner_plaintext[type_index];
 
-    const plaintext = try allocator.alloc(u8, end_idx);
+    const plaintext = try allocator.alloc(u8, type_index);
     errdefer allocator.free(plaintext);
-    @memcpy(plaintext, inner_plaintext[0..end_idx]);
+    @memcpy(plaintext, inner_plaintext[0..type_index]);
 
     allocator.free(inner_plaintext);
 
     // Increment sequence number (RFC 8446 §5.3)
     session.seq_recv += 1;
 
-    return plaintext;
+    return .{
+        .plaintext = plaintext,
+        .inner_content_type = inner_content_type,
+    };
+}
+
+pub fn decryptRecord(
+    allocator: mem.Allocator,
+    session: *TlsSession,
+    ciphertext: []const u8,
+) ![]u8 {
+    const decrypted = try decryptRecordWithInnerType(allocator, session, ciphertext);
+    return decrypted.plaintext;
 }
 
 // ============================================================
