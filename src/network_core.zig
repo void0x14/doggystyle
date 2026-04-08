@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const mem = std.mem;
 const ascii = std.ascii;
+const tls = std.crypto.tls;
+const Certificate = std.crypto.Certificate;
 const jitter_core = @import("jitter_core.zig");
 const http2_core = @import("http2_core.zig");
 
@@ -2432,6 +2434,260 @@ pub const TlsError = error{
     TlsKeyScheduleUnimplemented,
 };
 
+const Tls13CertificateEntry = struct {
+    cert_data: []const u8,
+    extensions: []const u8,
+};
+
+const ParsedTls13CertificateMessage = struct {
+    certificate_request_context: []const u8,
+    entries: std.array_list.Managed(Tls13CertificateEntry),
+
+    fn deinit(self: *ParsedTls13CertificateMessage, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.entries.deinit();
+        self.* = undefined;
+    }
+};
+
+const TlsCertificatePublicKey = struct {
+    algo: Certificate.AlgorithmCategory,
+    buf: [600]u8,
+    len: u16,
+
+    fn init(
+        self: *TlsCertificatePublicKey,
+        pub_key_algo: Certificate.Parsed.PubKeyAlgo,
+        pub_key: []const u8,
+    ) error{CertificatePublicKeyInvalid}!void {
+        if (pub_key.len > self.buf.len) return error.CertificatePublicKeyInvalid;
+        self.algo = switch (pub_key_algo) {
+            .rsaEncryption => .rsaEncryption,
+            .rsassa_pss => .rsassa_pss,
+            .X9_62_id_ecPublicKey => .X9_62_id_ecPublicKey,
+            .curveEd25519 => .curveEd25519,
+        };
+        @memcpy(self.buf[0..pub_key.len], pub_key);
+        self.len = @intCast(pub_key.len);
+    }
+
+    // SOURCE: RFC 8446, Section 4.2.3 — SignatureScheme negotiation
+    // SOURCE: RFC 8446, Section 4.4.3 — CertificateVerify
+    // SOURCE: vendor/zig-std/std/crypto/tls/Client.zig — SignatureScheme verification logic
+    fn verifyTls13Signature(
+        self: *const TlsCertificatePublicKey,
+        scheme: tls.SignatureScheme,
+        encoded_sig: []const u8,
+        msg: []const []const u8,
+    ) error{
+        TlsBadSignatureScheme,
+        TlsBadRsaSignatureBitCount,
+        CertificatePublicKeyInvalid,
+        CertificateSignatureInvalid,
+    }!void {
+        const pub_key = self.buf[0..self.len];
+        switch (scheme) {
+            .ecdsa_secp256r1_sha256 => {
+                if (self.algo != .X9_62_id_ecPublicKey) return error.TlsBadSignatureScheme;
+
+                const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+                const sig = Ecdsa.Signature.fromDer(encoded_sig) catch return error.CertificateSignatureInvalid;
+                const key = Ecdsa.PublicKey.fromSec1(pub_key) catch return error.CertificateSignatureInvalid;
+                var verifier = sig.verifier(key) catch return error.CertificateSignatureInvalid;
+                for (msg) |part| verifier.update(part);
+                verifier.verify() catch return error.CertificateSignatureInvalid;
+            },
+            inline .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384 => |comptime_scheme| {
+                if (self.algo != .rsaEncryption) return error.TlsBadSignatureScheme;
+
+                const Hash = switch (comptime_scheme) {
+                    .rsa_pss_rsae_sha256 => std.crypto.hash.sha2.Sha256,
+                    .rsa_pss_rsae_sha384 => std.crypto.hash.sha2.Sha384,
+                    else => unreachable,
+                };
+                const PublicKey = Certificate.rsa.PublicKey;
+                const components = PublicKey.parseDer(pub_key) catch return error.CertificatePublicKeyInvalid;
+                const exponent = components.exponent;
+                const modulus = components.modulus;
+                switch (modulus.len) {
+                    inline 128, 256, 384, 512 => |modulus_len| {
+                        const key = PublicKey.fromBytes(exponent, modulus) catch return error.CertificatePublicKeyInvalid;
+                        const sig = Certificate.rsa.PSSSignature.fromBytes(modulus_len, encoded_sig);
+                        Certificate.rsa.PSSSignature.concatVerify(modulus_len, sig, msg, key, Hash) catch
+                            return error.CertificateSignatureInvalid;
+                    },
+                    else => return error.TlsBadRsaSignatureBitCount,
+                }
+            },
+            else => return error.TlsBadSignatureScheme,
+        }
+    }
+};
+
+const TlsVerifiedServerCertificateChain = struct {
+    leaf_der: []u8,
+    public_key: TlsCertificatePublicKey,
+
+    fn deinit(self: *TlsVerifiedServerCertificateChain, allocator: std.mem.Allocator) void {
+        allocator.free(self.leaf_der);
+        self.* = undefined;
+    }
+};
+
+// SOURCE: RFC 8446, Section 4.4.2 — Certificate
+fn parseTls13CertificateMessage(
+    allocator: std.mem.Allocator,
+    wrapped_handshake: []const u8,
+) (std.mem.Allocator.Error || error{
+    TlsDecodeError,
+    UnexpectedHandshakeType,
+})!ParsedTls13CertificateMessage {
+    var decoder = tls.Decoder.fromTheirSlice(@constCast(wrapped_handshake));
+    try decoder.ensure(TLS_HS_HEADER_LEN);
+    const handshake_type = decoder.decode(u8);
+    if (handshake_type != 0x0B) return error.UnexpectedHandshakeType;
+
+    const handshake_len = decoder.decode(u24);
+    var body = try decoder.sub(handshake_len);
+    try body.ensure(1 + 3);
+    const cert_request_context_len = body.decode(u8);
+    try body.ensure(cert_request_context_len + 3);
+    const cert_request_context = body.slice(cert_request_context_len);
+    const certificate_list_len = body.decode(u24);
+    var certificate_list = try body.sub(certificate_list_len);
+
+    var entries = std.array_list.Managed(Tls13CertificateEntry).init(allocator);
+    errdefer entries.deinit();
+
+    while (!certificate_list.eof()) {
+        try certificate_list.ensure(3);
+        const cert_data_len = certificate_list.decode(u24);
+        try certificate_list.ensure(cert_data_len + 2);
+        const cert_data = certificate_list.slice(cert_data_len);
+        const extensions_len = certificate_list.decode(u16);
+        try certificate_list.ensure(extensions_len);
+        const extensions = certificate_list.slice(extensions_len);
+        try entries.append(.{
+            .cert_data = cert_data,
+            .extensions = extensions,
+        });
+    }
+
+    return .{
+        .certificate_request_context = cert_request_context,
+        .entries = entries,
+    };
+}
+
+// SOURCE: RFC 8446, Section 4.4.2 — Certificate
+// SOURCE: RFC 5280, Section 6.1.3 — X.509 path validation
+// SOURCE: RFC 6125, Section 6.4.1 and Section 6.4.3 — DNS-ID and wildcard matching
+// SOURCE: vendor/zig-std/std/crypto/Certificate.zig — DER parse / hostname verification
+// SOURCE: vendor/zig-std/std/crypto/Certificate/Bundle.zig — OS CA bundle verification
+fn verifyTls13ServerCertificateChain(
+    allocator: std.mem.Allocator,
+    wrapped_handshake: []const u8,
+    host_name: []const u8,
+    now_sec: i64,
+    ca_bundle: *const Certificate.Bundle,
+) (std.mem.Allocator.Error ||
+    error{
+        TlsDecodeError,
+        UnexpectedHandshakeType,
+        TlsCertificateNotVerified,
+        CertificatePublicKeyInvalid,
+    } ||
+    Certificate.ParseError ||
+    Certificate.Bundle.VerifyError ||
+    Certificate.Parsed.VerifyError ||
+    Certificate.Parsed.VerifyHostNameError)!TlsVerifiedServerCertificateChain {
+    var parsed_message = try parseTls13CertificateMessage(allocator, wrapped_handshake);
+    defer parsed_message.deinit(allocator);
+
+    if (parsed_message.certificate_request_context.len != 0) return error.TlsDecodeError;
+    if (parsed_message.entries.items.len == 0) return error.TlsCertificateNotVerified;
+
+    var previous_cert: ?Certificate.Parsed = null;
+    var leaf_public_key: TlsCertificatePublicKey = undefined;
+    var trust_anchor_found = false;
+
+    for (parsed_message.entries.items, 0..) |entry, cert_index| {
+        const subject_cert: Certificate = .{
+            .buffer = entry.cert_data,
+            .index = 0,
+        };
+        const subject = try subject_cert.parse();
+
+        if (cert_index == 0) {
+            try subject.verifyHostName(host_name);
+            try leaf_public_key.init(subject.pub_key_algo, subject.pubKey());
+        } else {
+            try previous_cert.?.verify(subject, now_sec);
+        }
+
+        if (ca_bundle.verify(subject, now_sec)) {
+            trust_anchor_found = true;
+            break;
+        } else |err| switch (err) {
+            error.CertificateIssuerNotFound => {},
+            else => |e| return e,
+        }
+
+        previous_cert = subject;
+    }
+
+    if (!trust_anchor_found) return error.TlsCertificateNotVerified;
+
+    return .{
+        .leaf_der = try allocator.dupe(u8, parsed_message.entries.items[0].cert_data),
+        .public_key = leaf_public_key,
+    };
+}
+
+// SOURCE: RFC 8446, Section 4.4.3 — CertificateVerify input format
+fn buildTls13ServerCertificateVerifyInput(
+    transcript_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) [64 + "TLS 1.3, server CertificateVerify".len + 1 + std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    const prefix = " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00";
+    var input = [_]u8{0} ** (prefix.len + std.crypto.hash.sha2.Sha256.digest_length);
+    @memcpy(input[0..prefix.len], prefix);
+    @memcpy(input[prefix.len..], &transcript_hash);
+    return input;
+}
+
+// SOURCE: RFC 8446, Section 4.2.3 — Signature Algorithms
+// SOURCE: RFC 8446, Section 4.4.3 — CertificateVerify
+// SOURCE: vendor/zig-std/std/crypto/tls/Client.zig — SignatureScheme verification logic
+fn verifyTls13CertificateVerifyMessage(
+    public_key: *const TlsCertificatePublicKey,
+    wrapped_handshake: []const u8,
+    transcript_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) error{
+    TlsDecodeError,
+    UnexpectedHandshakeType,
+    TlsBadSignatureScheme,
+    TlsBadRsaSignatureBitCount,
+    CertificatePublicKeyInvalid,
+    CertificateSignatureInvalid,
+}!void {
+    var decoder = tls.Decoder.fromTheirSlice(@constCast(wrapped_handshake));
+    try decoder.ensure(TLS_HS_HEADER_LEN);
+    const handshake_type = decoder.decode(u8);
+    if (handshake_type != 0x0F) return error.UnexpectedHandshakeType;
+
+    const handshake_len = decoder.decode(u24);
+    var body = try decoder.sub(handshake_len);
+    try body.ensure(4);
+    const scheme = body.decode(tls.SignatureScheme);
+    const signature_len = body.decode(u16);
+    try body.ensure(signature_len);
+    const signature = body.slice(signature_len);
+    if (!body.eof()) return error.TlsDecodeError;
+
+    const verify_input = buildTls13ServerCertificateVerifyInput(transcript_hash);
+    try public_key.verifyTls13Signature(scheme, signature, &.{&verify_input});
+}
+
 const Tls13Aes128GcmSha256HandshakeSecrets = struct {
     master_secret: [std.crypto.hash.sha2.Sha256.digest_length]u8,
     client_finished_key: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8,
@@ -2556,10 +2812,11 @@ pub fn completeHandshakeFull(
     client_isn: u32, // SYN'nin initial sequence number'ı
     client_tsval_init: u32, // SYN'nin TSval'i — monotonik artış buradan devam eder
 ) !HandshakeResultFull {
-    _ = io;
     var buffer: [65535]u8 = undefined;
     const timeout_ms: i64 = 5000;
     const start_time = currentTimestampMs();
+    const realtime_now = std.Io.Clock.real.now(io);
+    const certificate_validation_now_sec = realtime_now.toSeconds();
 
     const tv = posix.timeval{ .sec = 1, .usec = 0 };
     _ = posix.system.setsockopt(sock.fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &tv, @sizeOf(posix.timeval));
@@ -2703,6 +2960,11 @@ pub fn completeHandshakeFull(
                 var handshake_secrets: ?Tls13Aes128GcmSha256HandshakeSecrets = null;
                 var handshake_session: TlsSession = undefined;
                 var handshake_session_ready = false;
+                var certificate_bundle: Certificate.Bundle = .empty;
+                var certificate_bundle_loaded = false;
+                defer if (certificate_bundle_loaded) certificate_bundle.deinit(allocator);
+                var verified_server_certificate: ?TlsVerifiedServerCertificateChain = null;
+                defer if (verified_server_certificate) |*verified| verified.deinit(allocator);
                 var saw_certificate_verify = false;
 
                 while (currentTimestampMs() - sh_start < 10000) {
@@ -2884,13 +3146,37 @@ pub fn completeHandshakeFull(
 
                                                 const wrapped_handshake = remaining[0 .. TLS_HS_HEADER_LEN + handshake_len];
                                                 switch (wrapped_handshake[0]) {
-                                                    0x08, 0x0B => handshake_transcript.update(wrapped_handshake),
+                                                    0x08 => handshake_transcript.update(wrapped_handshake),
+                                                    0x0B => {
+                                                        if (!certificate_bundle_loaded) {
+                                                            try certificate_bundle.rescan(allocator, io, realtime_now);
+                                                            certificate_bundle_loaded = true;
+                                                        }
+                                                        if (verified_server_certificate != null) return error.TlsCertificateNotVerified;
+                                                        verified_server_certificate = try verifyTls13ServerCertificateChain(
+                                                            allocator,
+                                                            wrapped_handshake,
+                                                            server_name,
+                                                            certificate_validation_now_sec,
+                                                            &certificate_bundle,
+                                                        );
+                                                        handshake_transcript.update(wrapped_handshake);
+                                                    },
                                                     0x0F => {
+                                                        const verified_certificate = verified_server_certificate orelse return error.TlsCertificateNotVerified;
+                                                        try verifyTls13CertificateVerifyMessage(
+                                                            &verified_certificate.public_key,
+                                                            wrapped_handshake,
+                                                            handshake_transcript.peek(),
+                                                        );
                                                         saw_certificate_verify = true;
                                                         handshake_transcript.update(wrapped_handshake);
                                                     },
                                                     0x14 => {
                                                         const current_handshake_secrets = handshake_secrets orelse return error.TlsKeyScheduleUnimplemented;
+                                                        if (verified_server_certificate == null or !saw_certificate_verify) {
+                                                            return error.TlsCertificateNotVerified;
+                                                        }
                                                         const finished_digest = handshake_transcript.peek();
                                                         var expected_verify_data: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
                                                         std.crypto.auth.hmac.sha2.HmacSha256.create(
@@ -2945,10 +3231,6 @@ pub fn completeHandshakeFull(
                                                         defer allocator.free(finished_packet);
                                                         _ = try sock.sendPacket(finished_packet, dst_ip);
                                                         client_seq += @as(u32, @intCast(finished_record.len));
-
-                                                        if (saw_certificate_verify) {
-                                                            std.debug.print("[HANDSHAKE] CertificateVerify message was present, but certificate chain/signature validation is not implemented yet\n", .{});
-                                                        }
 
                                                         const pending_ciphertext_start = record_offset + total_record_len;
                                                         const pending_ciphertext = if (pending_ciphertext_start < tls_record_buffer.items.len)
@@ -3541,6 +3823,225 @@ fn extractClientHelloExtension(hello: []const u8, extension_type: u16) !?[]const
     }
 
     return null;
+}
+
+const test_tls_root_der = @embedFile("testdata/tls_cert_validation/root.der");
+const test_tls_intermediate_der = @embedFile("testdata/tls_cert_validation/inter.der");
+const test_tls_leaf_der = @embedFile("testdata/tls_cert_validation/leaf.der");
+const test_tls_cert_verify_sig = @embedFile("testdata/tls_cert_validation/cert_verify_sig.der");
+const test_tls_transcript_hash = @embedFile("testdata/tls_cert_validation/transcript_hash.bin");
+
+// SOURCE: RFC 8446, Section 4.4.2 — Certificate
+fn buildTestTls13CertificateMessage(
+    allocator: std.mem.Allocator,
+    certs: []const []const u8,
+) ![]u8 {
+    var certificate_list_len: usize = 0;
+    for (certs) |cert| {
+        certificate_list_len += 3 + cert.len + 2;
+    }
+
+    const handshake_body_len = 1 + 3 + certificate_list_len;
+    const total_len = TLS_HS_HEADER_LEN + handshake_body_len;
+    const buf = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(buf);
+
+    var writer = PacketWriter.init(buf);
+    writer.writeByte(0x0B);
+    writer.writeByte(@truncate((handshake_body_len >> 16) & 0xFF));
+    writer.writeByte(@truncate((handshake_body_len >> 8) & 0xFF));
+    writer.writeByte(@truncate(handshake_body_len & 0xFF));
+    writer.writeByte(0x00); // certificate_request_context length
+    writer.writeByte(@truncate((certificate_list_len >> 16) & 0xFF));
+    writer.writeByte(@truncate((certificate_list_len >> 8) & 0xFF));
+    writer.writeByte(@truncate(certificate_list_len & 0xFF));
+
+    for (certs) |cert| {
+        writer.writeByte(@truncate((cert.len >> 16) & 0xFF));
+        writer.writeByte(@truncate((cert.len >> 8) & 0xFF));
+        writer.writeByte(@truncate(cert.len & 0xFF));
+        writer.writeSlice(cert);
+        writer.writeInt(u16, 0); // extensions length
+    }
+
+    std.debug.assert(writer.index == total_len);
+    return buf;
+}
+
+// SOURCE: RFC 8446, Section 4.4.3 — CertificateVerify
+fn buildTestTls13CertificateVerifyMessage(
+    allocator: std.mem.Allocator,
+    signature_scheme: u16,
+    signature: []const u8,
+) ![]u8 {
+    const handshake_body_len = 2 + 2 + signature.len;
+    const total_len = TLS_HS_HEADER_LEN + handshake_body_len;
+    const buf = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(buf);
+
+    var writer = PacketWriter.init(buf);
+    writer.writeByte(0x0F);
+    writer.writeByte(@truncate((handshake_body_len >> 16) & 0xFF));
+    writer.writeByte(@truncate((handshake_body_len >> 8) & 0xFF));
+    writer.writeByte(@truncate(handshake_body_len & 0xFF));
+    writer.writeInt(u16, signature_scheme);
+    writer.writeInt(u16, @intCast(signature.len));
+    writer.writeSlice(signature);
+
+    std.debug.assert(writer.index == total_len);
+    return buf;
+}
+
+fn addDerCertificateToBundle(
+    bundle: *std.crypto.Certificate.Bundle,
+    allocator: std.mem.Allocator,
+    der_bytes: []const u8,
+    now_sec: i64,
+) !void {
+    const decoded_start: u32 = @intCast(bundle.bytes.items.len);
+    try bundle.bytes.appendSlice(allocator, der_bytes);
+    try bundle.parseCert(allocator, decoded_start, now_sec);
+}
+
+test "parseTls13CertificateMessage parses RFC 8446 certificate_list" {
+    const allocator = std.testing.allocator;
+    const certificate_message = try buildTestTls13CertificateMessage(allocator, &.{
+        test_tls_leaf_der,
+        test_tls_intermediate_der,
+    });
+    defer allocator.free(certificate_message);
+
+    var parsed = try parseTls13CertificateMessage(allocator, certificate_message);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.certificate_request_context.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed.entries.items.len);
+    try std.testing.expectEqualSlices(u8, test_tls_leaf_der, parsed.entries.items[0].cert_data);
+    try std.testing.expectEqualSlices(u8, test_tls_intermediate_der, parsed.entries.items[1].cert_data);
+    try std.testing.expectEqual(@as(usize, 0), parsed.entries.items[0].extensions.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.entries.items[1].extensions.len);
+}
+
+test "verifyTls13ServerCertificateChain validates hostname and chain" {
+    const allocator = std.testing.allocator;
+    const certificate_message = try buildTestTls13CertificateMessage(allocator, &.{
+        test_tls_leaf_der,
+        test_tls_intermediate_der,
+    });
+    defer allocator.free(certificate_message);
+
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(allocator);
+    try addDerCertificateToBundle(&bundle, allocator, test_tls_root_der, 1_800_000_000);
+
+    var verified = try verifyTls13ServerCertificateChain(
+        allocator,
+        certificate_message,
+        "github.com",
+        1_800_000_000,
+        &bundle,
+    );
+    defer verified.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, test_tls_leaf_der.len), verified.leaf_der.len);
+}
+
+test "verifyTls13ServerCertificateChain rejects hostname mismatch" {
+    const allocator = std.testing.allocator;
+    const certificate_message = try buildTestTls13CertificateMessage(allocator, &.{
+        test_tls_leaf_der,
+        test_tls_intermediate_der,
+    });
+    defer allocator.free(certificate_message);
+
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(allocator);
+    try addDerCertificateToBundle(&bundle, allocator, test_tls_root_der, 1_800_000_000);
+
+    try std.testing.expectError(
+        error.CertificateHostMismatch,
+        verifyTls13ServerCertificateChain(
+            allocator,
+            certificate_message,
+            "not-github.example",
+            1_800_000_000,
+            &bundle,
+        ),
+    );
+}
+
+test "verifyTls13CertificateVerifyMessage validates transcript-bound ECDSA signature" {
+    const allocator = std.testing.allocator;
+    const certificate_message = try buildTestTls13CertificateMessage(allocator, &.{
+        test_tls_leaf_der,
+        test_tls_intermediate_der,
+    });
+    defer allocator.free(certificate_message);
+
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(allocator);
+    try addDerCertificateToBundle(&bundle, allocator, test_tls_root_der, 1_800_000_000);
+
+    var verified = try verifyTls13ServerCertificateChain(
+        allocator,
+        certificate_message,
+        "github.com",
+        1_800_000_000,
+        &bundle,
+    );
+    defer verified.deinit(allocator);
+
+    const certificate_verify = try buildTestTls13CertificateVerifyMessage(
+        allocator,
+        0x0403,
+        test_tls_cert_verify_sig,
+    );
+    defer allocator.free(certificate_verify);
+
+    try std.testing.expectEqual(@as(usize, std.crypto.hash.sha2.Sha256.digest_length), test_tls_transcript_hash.len);
+    try verifyTls13CertificateVerifyMessage(
+        &verified.public_key,
+        certificate_verify,
+        test_tls_transcript_hash[0..std.crypto.hash.sha2.Sha256.digest_length].*,
+    );
+}
+
+test "verifyTls13CertificateVerifyMessage rejects TLS 1.3 unsupported RSA PKCS1 scheme" {
+    const allocator = std.testing.allocator;
+    const certificate_message = try buildTestTls13CertificateMessage(allocator, &.{
+        test_tls_leaf_der,
+        test_tls_intermediate_der,
+    });
+    defer allocator.free(certificate_message);
+
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(allocator);
+    try addDerCertificateToBundle(&bundle, allocator, test_tls_root_der, 1_800_000_000);
+
+    var verified = try verifyTls13ServerCertificateChain(
+        allocator,
+        certificate_message,
+        "github.com",
+        1_800_000_000,
+        &bundle,
+    );
+    defer verified.deinit(allocator);
+
+    const certificate_verify = try buildTestTls13CertificateVerifyMessage(
+        allocator,
+        0x0201,
+        test_tls_cert_verify_sig,
+    );
+    defer allocator.free(certificate_verify);
+
+    try std.testing.expectError(
+        error.TlsBadSignatureScheme,
+        verifyTls13CertificateVerifyMessage(
+            &verified.public_key,
+            certificate_verify,
+            test_tls_transcript_hash[0..std.crypto.hash.sha2.Sha256.digest_length].*,
+        ),
+    );
 }
 
 test "GREASE helper follows RFC 8701 pattern" {

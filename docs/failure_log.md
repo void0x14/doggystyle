@@ -6,6 +6,48 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-08] — Module 3.1: TLS 1.3 Certificate ve CertificateVerify Placeholder Bırakılmıştı
+
+**Tetikleyici:** Native TLS 1.3 + HTTP/2 yolu canlı GitHub response alıyordu ama server authentication bloğu eksikti
+**Dosyalar:** `src/network_core.zig`, `src/main.zig`
+**Tip:** Runtime protocol/authentication error — Certificate chain doğrulaması ve CertificateVerify imza kontrolü yoktu
+
+---
+
+### Hata: Server auth bloğu sadece varlık kontrolü yapıyor, gerçek doğrulama yapmıyordu
+
+**Hata:** Handshake akışı şu iki kritik boşluğu taşıyordu:
+1. `Certificate` mesajı parse edilmeden transcript hash'e ekleniyor, certificate chain ve `github.com` hostname doğrulaması yapılmıyordu
+2. `CertificateVerify` mesajı için yalnızca `saw_certificate_verify = true` set edilip log basılıyor, imza RFC 8446 transcript kurallarıyla hiç verify edilmiyordu
+3. Canlı `main.zig` yolu `completeHandshakeFull` çağrısına `undefined` bir `std.Io` geçiriyordu; certificate bundle yükleme eklenince bu placeholder runtime crash'e dönüştü
+
+**Kök Sebep:** TLS 1.3 state-machine, `EncryptedExtensions -> Certificate -> CertificateVerify -> Finished` authentication bloğunu gerçek güven zinciri olarak değil, sadece handshake ilerleme işareti olarak ele alıyordu. Ayrıca `CertificateVerify` için transcript update sırası RFC 8446 Section 4.4.3 ile uyumlu değildi: imza verify edilmeden mesaj hash'e katılabiliyordu.
+
+**Kaynak:** RFC 8446, Section 4.4.2 — Certificate  
+**Kaynak:** RFC 8446, Section 4.4.3 — CertificateVerify  
+**Kaynak:** RFC 8446, Section 4.4.1 — Transcript Hash  
+**Kaynak:** RFC 8446, Section 4.2.3 — Signature Algorithms  
+**Kaynak:** RFC 5280, Section 6.1.3 — Certification Path Validation  
+**Kaynak:** RFC 6125, Section 6.4.1 ve Section 6.4.3 — DNS-ID / wildcard hostname matching  
+**Kaynak:** `vendor/zig-std/std/crypto/Certificate.zig` — DER parse, chain verify, hostname verify  
+**Kaynak:** `vendor/zig-std/std/crypto/Certificate/Bundle.zig` — Linux trust store path discovery  
+**Kaynak:** `vendor/zig-std/std/process.zig` — `std.process.Init.io` geçerli process I/O context'i
+
+**Düzeltme:**
+1. RFC 8446 `Certificate` message parser eklendi ve certificate_list içindeki DER sertifikalar parse edilmeye başlandı
+2. Leaf certificate için `github.com` hostname doğrulaması ve ara sertifikalar üzerinden chain verification eklendi
+3. Trust anchor doğrulaması Zig stdlib `Certificate.Bundle.rescan()` ile doğrulanmış Linux CA bundle path'leri üzerinden yapıldı
+4. `CertificateVerify` imzası artık transcript hash üstünden, mesaj transcript'e eklenmeden önce verify ediliyor
+5. TLS 1.3 için desteklenmeyen / teklif edilmemiş signature scheme'ler açık error ile reddediliyor
+6. `main.zig` canlı yolunda `init.io` kullanılarak gerçek `std.Io` context'i geçiriliyor
+
+**Tekrar olmaması için:**
+- `Certificate` görüldü diye server authenticate olmuş sayılmayacak; chain + hostname doğrulaması olmadan Finished kabul edilmeyecek
+- `CertificateVerify` mesajı transcript'e ancak imza başarıyla doğrulandıktan sonra eklenecek
+- Live path'te `undefined` I/O/context placeholder bırakılmayacak
+
+---
+
 ## [2026-04-08] — Module 3.1: HTTP/2 Bootstrap Öncesi TCP/TLS Katmanları Temiz Sanılıyordu
 
 **Tetikleyici:** `Http2PrefaceFailed`, `TlsAeadDecryptFailed`, ardından canlı koşuda HTTP/2 SETTINGS/HEADERS aşamasına kadar ilerleme

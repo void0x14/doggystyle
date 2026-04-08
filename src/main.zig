@@ -155,8 +155,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("\n", .{});
     std.debug.print("[HANDSHAKE] Starting TCP + TLS 1.3 handshake...\n", .{});
 
-    // io placeholder (future async I/O)
-    const io: std.Io = undefined;
+    // SOURCE: vendor/zig-std/std/process.zig — std.process.Init carries a valid process I/O context
+    const io = init.io;
 
     const handshake = try network.completeHandshakeFull(
         allocator,
