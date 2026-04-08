@@ -277,6 +277,64 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // =========================================================================
+    // ADIM 11.5: Final Signup Submission
+    // =========================================================================
+    std.debug.print("\n[SIGNUP] Preparing random credentials via digistallone...\n", .{});
+    var mail_client = try digistallone.DigistalloneClient.init(allocator);
+    defer mail_client.deinit();
+
+    const email = try mail_client.getNewEmailAddress(null);
+    defer allocator.free(email);
+
+    // Generate secure password and human-like username
+    var username_buf: [16]u8 = undefined;
+    var pwd_buf: [20]u8 = undefined;
+    const charset = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const pwd_charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
+    var rand_bytes: [36]u8 = undefined;
+
+    _ = std.os.linux.getrandom(&rand_bytes, rand_bytes.len, 0);
+    for (0..12) |i| {
+        username_buf[i] = charset[rand_bytes[i] % charset.len];
+    }
+    const username = username_buf[0..12];
+    for (0..16) |i| {
+        pwd_buf[i] = pwd_charset[rand_bytes[i + 12] % pwd_charset.len];
+    }
+    // ensure at least one number, one lower, one upper, one special
+    pwd_buf[16] = '1';
+    pwd_buf[17] = 'a';
+    pwd_buf[18] = 'A';
+    pwd_buf[19] = '!';
+    const password = pwd_buf[0..20];
+
+    std.debug.print("[SIGNUP] Generated Username: {s}\n", .{username});
+    std.debug.print("[SIGNUP] Using Email: {s} (TEST MODE - Digistallone bypassed)\n", .{email});
+    std.debug.print("[SIGNUP] Submitting POST to /signup...\n", .{});
+
+    const signup_success = github_client.performSignup(
+        allocator,
+        response.body,
+        username,
+        email,
+        password,
+        &sock,
+        dst_ip,
+    ) catch |err| {
+        if (err == error.UnexpectedChallenge) {
+            std.debug.print("[FATAL] Unexpected Arkose Challenge triggered during signup submission!\n", .{});
+            return err;
+        }
+        return err;
+    };
+
+    if (signup_success) {
+        std.debug.print("[SUCCESS] Signup Form Submitted. Waiting for Redirect...\n", .{});
+    } else {
+        std.debug.print("[WARN] Signup did not redirect as expected.\n", .{});
+    }
+
+    // =========================================================================
     // ADIM 12: Safe Shutdown
     // =========================================================================
     std.debug.print("\n[SHUTDOWN] Initiating safe shutdown...\n", .{});

@@ -75,7 +75,7 @@ pub const DigistalloneError = error{
 // ---------------------------------------------------------------------------
 
 /// digistallone.com resolved IP (captured 2026-04-08)
-/// NOTE: This may change. For production, implement DNS resolution.
+/// NOTE: Runtime client path now prefers hostname resolution via std.Io.net.HostName.connect.
 pub const DIGISTALLONE_IP = "66.29.148.143";
 pub const DIGISTALLONE_PORT: u16 = 443;
 pub const DIGISTALLONE_SNI = "digistallone.com";
@@ -210,74 +210,135 @@ pub const ComponentState = struct {
     }
 };
 
+// SOURCE: GET /mailbox HTML source — Livewire component snapshots are serialized into
+// the wire:snapshot attribute using HTML entities such as &quot; for JSON quotes.
+fn decodeHtmlAttributeInto(dst: []u8, src: []const u8) DigistalloneError!usize {
+    var src_idx: usize = 0;
+    var dst_idx: usize = 0;
+
+    while (src_idx < src.len) {
+        if (dst_idx >= dst.len) return DigistalloneError.BufferTooSmall;
+
+        if (src[src_idx] == '&') {
+            if (mem.startsWith(u8, src[src_idx..], "&quot;")) {
+                dst[dst_idx] = '"';
+                src_idx += "&quot;".len;
+            } else if (mem.startsWith(u8, src[src_idx..], "&#039;")) {
+                dst[dst_idx] = '\'';
+                src_idx += "&#039;".len;
+            } else if (mem.startsWith(u8, src[src_idx..], "&amp;")) {
+                dst[dst_idx] = '&';
+                src_idx += "&amp;".len;
+            } else if (mem.startsWith(u8, src[src_idx..], "&lt;")) {
+                dst[dst_idx] = '<';
+                src_idx += "&lt;".len;
+            } else if (mem.startsWith(u8, src[src_idx..], "&gt;")) {
+                dst[dst_idx] = '>';
+                src_idx += "&gt;".len;
+            } else {
+                dst[dst_idx] = src[src_idx];
+                src_idx += 1;
+            }
+        } else {
+            dst[dst_idx] = src[src_idx];
+            src_idx += 1;
+        }
+        dst_idx += 1;
+    }
+
+    return dst_idx;
+}
+
+// SOURCE: GET /mailbox inline bootstrap script — DOMContentLoaded sets
+// `const email = '<current mailbox>'` before dispatching syncEmail/fetchMessages.
+fn extractBootstrapEmail(html: []const u8) ?[]const u8 {
+    const prefix = "const email = '";
+    const start = mem.indexOf(u8, html, prefix) orelse return null;
+    const after = html[start + prefix.len ..];
+    const end = mem.indexOfScalar(u8, after, '\'') orelse return null;
+    return after[0..end];
+}
+
 // ---------------------------------------------------------------------------
-// HTTP/1.1 Client over TLS — Minimal implementation
+// HTTP/1.1 Client over TLS
 // ---------------------------------------------------------------------------
 
-/// HTTP/1.1 client using std.Io TCP stream + std.crypto.tls.Client
+/// HTTP/1.1 client using std.Io network streams + std.crypto.tls.Client
 /// SOURCE: RFC 7230 — HTTP/1.1 Message Syntax and Routing
 /// SOURCE: RFC 7231 — HTTP/1.1 Semantics and Content
-///
-/// NOTE: TLS client and I/O buffers are heap-allocated to avoid
-/// lifetime issues (std.crypto.tls.Client holds pointers to
-/// Reader/Writer interfaces that must outlive the TLS client).
+/// SOURCE: RFC 8446, Section 5.1 — TLS record layer
+
 pub const HttpClient = struct {
     allocator: mem.Allocator,
-    io: std.Io.Threaded,
+    io_impl: *std.Io.Threaded,
+    io: std.Io,
     stream: std.Io.net.Stream,
-    // Heap-allocated TLS client (owns Reader/Writer interface pointers)
     tls: *crypto.tls.Client,
-    // Heap-allocated Reader/Writer (interface pointers referenced by TLS)
     reader_ptr: *std.Io.net.Stream.Reader,
     writer_ptr: *std.Io.net.Stream.Writer,
-    // Buffers for TLS encryption/decryption
-    reader_buf: []u8,
-    writer_buf: []u8,
-    // Cookie storage
+    read_buf: []u8,
+    write_buf: []u8,
     cookie_jar: CookieJar = .{},
 
+    // SOURCE: vendor/zig-std/std/Io/net.zig — std.Io.net.IpAddress.parse/connect
+    // SOURCE: vendor/zig-std/std/Io/net/HostName.zig — std.Io.net.HostName.init/connect
+    fn connectTcpTarget(io: std.Io, target: []const u8, port: u16) DigistalloneError!std.Io.net.Stream {
+        if (std.Io.net.IpAddress.parse(target, port)) |addr| {
+            return std.Io.net.IpAddress.connect(&addr, io, .{
+                .mode = .stream,
+                .protocol = .tcp,
+                .timeout = .none,
+            }) catch return DigistalloneError.TcpConnectFailed;
+        } else |_| {}
+
+        const host = std.Io.net.HostName.init(target) catch return DigistalloneError.TcpConnectFailed;
+        return std.Io.net.HostName.connect(host, io, port, .{
+            .mode = .stream,
+            .protocol = .tcp,
+            .timeout = .none,
+        }) catch return DigistalloneError.TcpConnectFailed;
+    }
+
+    // SOURCE: vendor/zig-std/std/Io/Threaded.zig — Threaded.init/io provide the default POSIX networking backend
+    // SOURCE: vendor/zig-std/std/Io/net/HostName.zig — HostName.connect resolves DNS before opening TCP stream
+    // SOURCE: vendor/zig-std/std/Io/net.zig — Stream.Reader.init / Stream.Writer.init satisfy std.crypto.tls.Client I/O contracts
+    // SOURCE: vendor/zig-std/std/crypto/tls/Client.zig — Client.init expects stable Reader/Writer interfaces for TLS records
     pub fn init(
         allocator: mem.Allocator,
-        io: std.Io.Threaded,
-        ip: []const u8,
+        target: []const u8,
         port: u16,
         sni: []const u8,
     ) DigistalloneError!HttpClient {
-        // Parse IP address and connect
-        const addr = std.Io.net.IpAddress.parse(ip, port) catch return DigistalloneError.TcpConnectFailed;
-        const stream = std.Io.net.IpAddress.connect(&addr, io, .{
-            .mode = .stream,
-            .timeout = .none,
-        }) catch return DigistalloneError.TcpConnectFailed;
+        const io_impl = try allocator.create(std.Io.Threaded);
+        errdefer allocator.destroy(io_impl);
+        io_impl.* = std.Io.Threaded.init(std.heap.smp_allocator, .{});
+        errdefer io_impl.deinit();
+        const io = io_impl.io();
 
-        // Heap-allocate TLS buffers (lifetime managed by HttpClient)
-        const reader_buf = try allocator.alloc(u8, crypto.tls.Client.min_buffer_len);
-        errdefer allocator.free(reader_buf);
-        const writer_buf = try allocator.alloc(u8, 4096);
-        errdefer allocator.free(writer_buf);
+        const stream = try connectTcpTarget(io, target, port);
+        errdefer stream.close(io);
 
-        // Heap-allocate the TLS client struct itself
+        // Heap-allocate TLS buffers
+        const read_buf = try allocator.alloc(u8, crypto.tls.Client.min_buffer_len);
+        errdefer allocator.free(read_buf);
+        const write_buf = try allocator.alloc(u8, crypto.tls.Client.min_buffer_len);
+        errdefer allocator.free(write_buf);
+
+        // Heap-allocate the TLS client struct
         const tls_ptr = try allocator.create(crypto.tls.Client);
         errdefer allocator.destroy(tls_ptr);
 
-        // Heap-allocate the Reader and Writer so their interface pointers
-        // remain valid for the lifetime of the TLS client
         const reader_ptr = try allocator.create(std.Io.net.Stream.Reader);
         errdefer allocator.destroy(reader_ptr);
         const writer_ptr = try allocator.create(std.Io.net.Stream.Writer);
         errdefer allocator.destroy(writer_ptr);
+        reader_ptr.* = std.Io.net.Stream.Reader.init(stream, io, read_buf);
+        writer_ptr.* = std.Io.net.Stream.Writer.init(stream, io, write_buf);
 
-        // Initialize I/O wrappers around the stream
-        reader_ptr.* = std.Io.net.Stream.Reader.init(stream, io, reader_buf);
-        writer_ptr.* = std.Io.net.Stream.Writer.init(stream, io, writer_buf);
-
-        // Generate entropy for TLS handshake (240 bytes required)
-        // SOURCE: RFC 8446, Section 4.1 — ClientHello.random (32 bytes minimum)
+        // Generate entropy for TLS handshake
         var entropy: [crypto.tls.Client.Options.entropy_len]u8 = undefined;
-        // Use Linux getrandom syscall for cryptographically secure entropy
-        const bytes_read = std.os.linux.getrandom(&entropy, entropy.len, 0);
-        if (bytes_read < entropy.len) {
-            // Fallback: time-based LCG seed
+        const gr_rc = std.os.linux.getrandom(&entropy, entropy.len, 0);
+        if (gr_rc < entropy.len) {
             var seed: u64 = 0;
             for (0..entropy.len) |i| {
                 seed = seed *% 6364136223846793005 +% 1;
@@ -287,40 +348,40 @@ pub const HttpClient = struct {
 
         const now: std.Io.Timestamp = .{ .nanoseconds = 0 };
 
-        // Perform TLS handshake
-        // The TLS client stores pointers to reader_ptr.*.interface
-        // and writer_ptr.*.interface — these remain valid because
-        // reader_ptr and writer_ptr are heap-allocated.
         tls_ptr.* = crypto.tls.Client.init(
-            &reader_ptr.*.interface,
-            &writer_ptr.*.interface,
+            &reader_ptr.interface,
+            &writer_ptr.interface,
             .{
                 .host = .{ .explicit = sni },
                 .ca = .no_verification,
                 .entropy = &entropy,
                 .realtime_now = now,
-                .write_buffer = writer_buf,
-                .read_buffer = reader_buf,
+                .write_buffer = write_buf,
+                .read_buffer = read_buf,
                 .allow_truncation_attacks = true,
             },
         ) catch {
             allocator.destroy(writer_ptr);
             allocator.destroy(reader_ptr);
             allocator.destroy(tls_ptr);
-            allocator.free(writer_buf);
-            allocator.free(reader_buf);
+            allocator.free(write_buf);
+            allocator.free(read_buf);
+            stream.close(io);
+            io_impl.deinit();
+            allocator.destroy(io_impl);
             return DigistalloneError.TlsHandshakeFailed;
         };
 
         return .{
             .allocator = allocator,
+            .io_impl = io_impl,
             .io = io,
             .stream = stream,
             .tls = tls_ptr,
             .reader_ptr = reader_ptr,
             .writer_ptr = writer_ptr,
-            .reader_buf = reader_buf,
-            .writer_buf = writer_buf,
+            .read_buf = read_buf,
+            .write_buf = write_buf,
         };
     }
 
@@ -329,8 +390,10 @@ pub const HttpClient = struct {
         self.allocator.destroy(self.writer_ptr);
         self.allocator.destroy(self.reader_ptr);
         self.allocator.destroy(self.tls);
-        self.allocator.free(self.writer_buf);
-        self.allocator.free(self.reader_buf);
+        self.allocator.free(self.write_buf);
+        self.allocator.free(self.read_buf);
+        self.io_impl.deinit();
+        self.allocator.destroy(self.io_impl);
     }
 
     // --- HTTP Request Building ---
@@ -498,15 +561,16 @@ pub const HttpClient = struct {
 
     /// Send raw bytes through the TLS connection
     fn sendRaw(self: *HttpClient, data: []const u8) DigistalloneError!void {
-        var writer = self.tls.writer;
+        const writer = &self.tls.writer;
         writer.writeAll(data) catch return DigistalloneError.TcpSendFailed;
+        writer.flush() catch return DigistalloneError.TcpSendFailed;
+        self.writer_ptr.interface.flush() catch return DigistalloneError.TcpSendFailed;
     }
 
     /// Receive full HTTP response: parse status, headers, body
     /// SOURCE: RFC 7230, Section 3 — Message Format
     fn recvFullResponse(self: *HttpClient, allocator: mem.Allocator) DigistalloneError![]u8 {
-        // Read response headers and body through TLS
-        var reader = self.tls.reader;
+        const reader = &self.tls.reader;
 
         // Read status line: "HTTP/1.1 200 OK\r\n"
         var status_line_buf: [256]u8 = undefined;
@@ -569,15 +633,14 @@ pub const HttpClient = struct {
             }
 
             // Parse Set-Cookie
-            if (mem.startsWith(u8, header_line, "Set-Cookie:") or mem.startsWith(u8, header_line, "set-cookie:")) {
-                const cookie_value = header_line["Set-Cookie:".len..];
+            if (ascii.startsWithIgnoreCase(header_line, "set-cookie:")) {
+                const cookie_value = header_line["set-cookie:".len..];
                 self.cookie_jar.setCookie(std.mem.trim(u8, cookie_value, &ascii.whitespace));
             }
 
             // Parse Content-Length
-            if (mem.startsWith(u8, header_line, "Content-Length:") or mem.startsWith(u8, header_line, "content-length:")) {
-                const cl_key = if (mem.startsWith(u8, header_line, "Content-Length:")) "Content-Length:" else "content-length:";
-                const cl_value = std.mem.trim(u8, header_line[cl_key.len..], &ascii.whitespace);
+            if (ascii.startsWithIgnoreCase(header_line, "content-length:")) {
+                const cl_value = std.mem.trim(u8, header_line["content-length:".len..], &ascii.whitespace);
                 content_length = std.fmt.parseInt(usize, cl_value, 10) catch null;
             }
         }
@@ -588,14 +651,11 @@ pub const HttpClient = struct {
             errdefer allocator.free(body);
             var pos: usize = 0;
             while (pos < cl) {
-                const remaining = cl - pos;
-                const data = try reader.take(remaining);
-                if (data.len == 0) {
-                    allocator.free(body);
-                    return DigistalloneError.TcpRecvFailed;
-                }
-                @memcpy(body[pos .. pos + data.len], data);
-                pos += data.len;
+                const available = reader.peekGreedy(1) catch return DigistalloneError.TcpRecvFailed;
+                const chunk_len = @min(available.len, cl - pos);
+                @memcpy(body[pos .. pos + chunk_len], available[0..chunk_len]);
+                reader.toss(chunk_len);
+                pos += chunk_len;
             }
             return body;
         } else {
@@ -612,7 +672,6 @@ pub const HttpClient = struct {
 /// Manages Livewire component state and protocol serialization
 /// SOURCE: wire:attribute structure from GET /mailbox HTML (Chrome DevTools)
 pub const LivewireClient = struct {
-    http: *HttpClient,
     csrf_token: [256]u8 = [_]u8{0} ** 256,
     csrf_token_len: usize = 0,
     components: [3]ComponentState = .{ .{}, .{}, .{} },
@@ -622,9 +681,8 @@ pub const LivewireClient = struct {
     current_email: [256]u8 = [_]u8{0} ** 256,
     current_email_len: usize = 0,
 
-    pub fn init(http: *HttpClient) LivewireClient {
+    pub fn init() LivewireClient {
         var self: LivewireClient = .{
-            .http = http,
             .domains = undefined,
         };
         // Initialize domains list
@@ -643,7 +701,6 @@ pub const LivewireClient = struct {
         allocator: mem.Allocator,
         html: []const u8,
     ) DigistalloneError!void {
-        _ = allocator;
         // Extract CSRF token
         if (mem.indexOf(u8, html, "<meta name=\"csrf-token\" content=\"")) |cs_start| {
             const after = html[cs_start + "<meta name=\"csrf-token\" content=\"".len ..];
@@ -654,82 +711,66 @@ pub const LivewireClient = struct {
             self.csrf_token_len = copy_len;
         } else return DigistalloneError.CsrfTokenNotFound;
 
-        // Extract wire:snapshot data — there are 3 components in the HTML
-        // Each has: wire:snapshot="{...data...}" wire:effects="{...}" wire:id="..."
-        var snapshot_search = html;
-        var idx: usize = 0;
-        while (mem.indexOf(u8, snapshot_search, "wire:snapshot=\"")) |snap_start| : ({
-            snapshot_search = snapshot_search[snap_start + "wire:snapshot=\"".len ..];
-            idx += 1;
-        }) {
-            if (idx >= 3) break; // max 3 components
+        if (extractBootstrapEmail(html)) |bootstrap_email| {
+            const copy_len = @min(bootstrap_email.len, self.current_email.len - 1);
+            @memcpy(self.current_email[0..copy_len], bootstrap_email[0..copy_len]);
+            self.current_email_len = copy_len;
+        }
 
-            const after_tag = snapshot_search["wire:snapshot=\"".len..];
-            // Find the matching closing quote (handle escaped quotes)
-            var depth: usize = 0;
-            var snap_end: usize = 0;
-            var i: usize = 0;
-            while (i < after_tag.len) : (i += 1) {
-                if (after_tag[i] == '"' and (i == 0 or after_tag[i - 1] != '\\')) {
-                    depth += 1;
-                    if (depth == 1) {
-                        snap_end = i;
-                        break;
+        // Extract wire:snapshot data — there are currently three components in GET /mailbox
+        // and the attribute contents are HTML-entity encoded JSON strings.
+        var search_start: usize = 0;
+        while (self.components_count < self.components.len) {
+            const snapshot_attr = "wire:snapshot=\"";
+            const snap_rel = mem.indexOf(u8, html[search_start..], snapshot_attr) orelse break;
+            const snap_start = search_start + snap_rel + snapshot_attr.len;
+            const after_snapshot = html[snap_start..];
+            const snap_end = mem.indexOfScalar(u8, after_snapshot, '"') orelse break;
+            const raw_snapshot = after_snapshot[0..snap_end];
+
+            const after_snapshot_attr = after_snapshot[snap_end..];
+            const id_attr = "wire:id=\"";
+            const id_rel = mem.indexOf(u8, after_snapshot_attr, id_attr) orelse break;
+            const id_start = snap_start + snap_end + id_rel + id_attr.len;
+            const id_after = html[id_start..];
+            const id_end = mem.indexOfScalar(u8, id_after, '"') orelse break;
+            const wire_id = id_after[0..id_end];
+
+            var comp = &self.components[self.components_count];
+            comp.id_len = @min(wire_id.len, comp.id.len);
+            @memcpy(comp.id[0..comp.id_len], wire_id[0..comp.id_len]);
+
+            comp.snapshot_len = try decodeHtmlAttributeInto(comp.snapshot[0 .. comp.snapshot.len - 1], raw_snapshot);
+            const decoded_snapshot = comp.snapshot[0..comp.snapshot_len];
+
+            var parsed_snapshot = std.json.parseFromSlice(std.json.Value, allocator, decoded_snapshot, .{}) catch {
+                return DigistalloneError.JsonParseFailed;
+            };
+            defer parsed_snapshot.deinit();
+
+            if (parsed_snapshot.value.object.get("memo")) |memo_value| {
+                if (memo_value.object.get("name")) |name_value| {
+                    const name = name_value.string;
+                    comp.name_len = @min(name.len, comp.name.len);
+                    @memcpy(comp.name[0..comp.name_len], name[0..comp.name_len]);
+                }
+            }
+
+            if (self.current_email_len == 0) {
+                if (parsed_snapshot.value.object.get("data")) |data_value| {
+                    if (data_value.object.get("email")) |email_value| {
+                        if (email_value != .null) {
+                            const email = email_value.string;
+                            const copy_len = @min(email.len, self.current_email.len - 1);
+                            @memcpy(self.current_email[0..copy_len], email[0..copy_len]);
+                            self.current_email_len = copy_len;
+                        }
                     }
                 }
             }
-            if (snap_end == 0) break;
 
-            const raw_snapshot = after_tag[0..snap_end];
-
-            // Extract wire:id
-            var wire_id: [64]u8 = [_]u8{0} ** 64;
-            var wire_id_len: usize = 0;
-            if (mem.indexOf(u8, after_tag[snap_end..], "wire:id=\"")) |id_search_offset| {
-                const id_part = after_tag[snap_end + id_search_offset + "wire:id=\"".len ..];
-                const id_end = mem.indexOfScalar(u8, id_part, '"') orelse 0;
-                const copy = @min(id_end, 63);
-                @memcpy(wire_id[0..copy], id_part[0..copy]);
-                wire_id_len = copy;
-            }
-
-            // Extract component name from snapshot JSON
-            var comp_name: [64]u8 = [_]u8{0} ** 64;
-            var comp_name_len: usize = 0;
-            if (mem.indexOf(u8, raw_snapshot, "\"name\":\"")) |name_start| {
-                const name_part = raw_snapshot[name_start + "\"name\":\"".len ..];
-                const name_end = mem.indexOfScalar(u8, name_part, '"') orelse 0;
-                const copy = @min(name_end, 63);
-                @memcpy(comp_name[0..copy], name_part[0..copy]);
-                comp_name_len = copy;
-            }
-
-            // Extract email from snapshot
-            if (mem.indexOf(u8, raw_snapshot, "\"email\":\"")) |email_start| {
-                const email_part = raw_snapshot[email_start + "\"email\":\"".len ..];
-                const email_end = mem.indexOfScalar(u8, email_part, '"') orelse 0;
-                const copy = @min(email_end, self.current_email.len - 1);
-                @memcpy(self.current_email[0..copy], email_part[0..copy]);
-                self.current_email_len = copy;
-            }
-
-            // Store component state
-            if (idx < self.components.len) {
-                var comp = &self.components[idx];
-                comp.name_len = comp_name_len;
-                @memcpy(comp.name[0..comp_name_len], comp_name[0..comp_name_len]);
-                comp.id_len = wire_id_len;
-                @memcpy(comp.id[0..wire_id_len], wire_id[0..wire_id_len]);
-
-                // Build proper snapshot JSON
-                // The raw_snapshot from HTML is URL-escaped — we need to unescape it
-                // For simplicity, store as-is and build the JSON wrapper
-                const snap_copy = @min(raw_snapshot.len, comp.snapshot.len - 1);
-                @memcpy(comp.snapshot[0..snap_copy], raw_snapshot[0..snap_copy]);
-                comp.snapshot_len = snap_copy;
-            }
-
-            self.components_count = idx + 1;
+            self.components_count += 1;
+            search_start = snap_start + snap_end;
         }
     }
 
@@ -749,12 +790,7 @@ pub const LivewireClient = struct {
         const comp = &self.components[component_idx];
         if (comp.snapshot_len == 0) return DigistalloneError.LivewireStateInvalid;
 
-        // Build calls JSON
-        var calls_buf: [256]u8 = undefined;
-        const calls_str = if (params_json) |pj|
-            std.fmt.bufPrint(&calls_buf, "[{{\"method\":\"{s}\",\"params\":{s}}}]", .{ method, pj }) catch return DigistalloneError.BufferTooSmall
-        else
-            std.fmt.bufPrint(&calls_buf, "[{{\"method\":\"{s}\",\"params\":[]}}]", .{method}) catch return DigistalloneError.BufferTooSmall;
+        const params_str = params_json orelse "[]";
 
         // Build updates JSON
         var updates_buf: [512]u8 = undefined;
@@ -767,12 +803,13 @@ pub const LivewireClient = struct {
         // Build full request JSON with snapshot
         return std.fmt.allocPrint(
             allocator,
-            "{{\"_token\":\"{s}\",\"components\":[{{\"snapshot\":{s},\"updates\":{s},\"calls\":{s}}}]}}",
+            "{{\"_token\":{f},\"components\":[{{\"snapshot\":{f},\"updates\":{s},\"calls\":[{{\"path\":\"\",\"method\":{f},\"params\":{s}}}]}}]}}",
             .{
-                self.csrf_token[0..self.csrf_token_len],
-                comp.snapshot[0..comp.snapshot_len],
+                std.json.fmt(self.csrf_token[0..self.csrf_token_len], .{}),
+                std.json.fmt(comp.snapshot[0..comp.snapshot_len], .{}),
                 updates_str,
-                calls_str,
+                std.json.fmt(method, .{}),
+                params_str,
             },
         ) catch return DigistalloneError.OutOfMemory;
     }
@@ -780,10 +817,12 @@ pub const LivewireClient = struct {
     /// Send Livewire update and return response body
     pub fn sendUpdate(
         self: *LivewireClient,
+        http: *HttpClient,
         allocator: mem.Allocator,
         request_json: []const u8,
     ) DigistalloneError![]u8 {
-        const response = try self.http.postJson(allocator, "/livewire/update", request_json);
+        _ = self;
+        const response = try http.postJson(allocator, "/livewire/update", request_json);
         return response;
     }
 
@@ -824,6 +863,7 @@ pub const LivewireClient = struct {
     /// SOURCE: <form wire:submit.prevent="create"> in GET /mailbox HTML
     pub fn createEmail(
         self: *LivewireClient,
+        http: *HttpClient,
         allocator: mem.Allocator,
         username: []const u8,
         domain: []const u8,
@@ -846,7 +886,8 @@ pub const LivewireClient = struct {
         );
         defer allocator.free(request);
 
-        const response = try self.sendUpdate(allocator, request);
+        const response = try self.sendUpdate(http, allocator, request);
+        defer allocator.free(response);
 
         // Update state from response
         self.updateStateFromResponse(allocator, response) catch {};
@@ -868,6 +909,7 @@ pub const LivewireClient = struct {
     /// SOURCE: __dispatch("fetchMessages", {}) call in Livewire update request
     pub fn pollInbox(
         self: *LivewireClient,
+        http: *HttpClient,
         allocator: mem.Allocator,
     ) DigistalloneError![]u8 {
         // Build fetchMessages request
@@ -880,7 +922,7 @@ pub const LivewireClient = struct {
         );
         defer allocator.free(request);
 
-        const response = try self.sendUpdate(allocator, request);
+        const response = try self.sendUpdate(http, allocator, request);
         return response;
     }
 };
@@ -949,17 +991,16 @@ pub const DigistalloneClient = struct {
 
     pub fn init(
         allocator: mem.Allocator,
-        io: anytype,
     ) DigistalloneError!DigistalloneClient {
         var http = try HttpClient.init(
             allocator,
-            io,
-            DIGISTALLONE_IP,
+            DIGISTALLONE_HOST,
             DIGISTALLONE_PORT,
             DIGISTALLONE_SNI,
         );
+        errdefer http.deinit();
 
-        var livewire = LivewireClient.init(&http);
+        var livewire = LivewireClient.init();
 
         // Step 1: GET /mailbox to get CSRF token and initial state
         const html = try http.get(allocator, "/mailbox", "");
@@ -988,6 +1029,19 @@ pub const DigistalloneClient = struct {
     ) DigistalloneError![]const u8 {
         const allocator = self.allocator;
 
+        if (self.livewire.current_email_len > 0) {
+            const current_email = self.livewire.current_email[0..self.livewire.current_email_len];
+            if (preferred_domain) |domain| {
+                if (mem.indexOfScalar(u8, current_email, '@')) |at_pos| {
+                    if (mem.eql(u8, current_email[at_pos + 1 ..], domain)) {
+                        return allocator.dupe(u8, current_email) catch return DigistalloneError.OutOfMemory;
+                    }
+                }
+            } else {
+                return allocator.dupe(u8, current_email) catch return DigistalloneError.OutOfMemory;
+            }
+        }
+
         // Generate random username using Linux getrandom syscall
         var username_buf: [16]u8 = undefined;
         const charset = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -1010,7 +1064,7 @@ pub const DigistalloneClient = struct {
             break :blk self.livewire.domains[idx];
         };
 
-        return try self.livewire.createEmail(allocator, username, domain);
+        return try self.livewire.createEmail(&self.http, allocator, username, domain);
     }
 
     /// Poll inbox for GitHub verification code
@@ -1026,7 +1080,7 @@ pub const DigistalloneClient = struct {
         var attempt: usize = 0;
         while (attempt < max_attempts) : (attempt += 1) {
             // Poll inbox
-            const response = try self.livewire.pollInbox(allocator);
+            const response = try self.livewire.pollInbox(&self.http, allocator);
             defer allocator.free(response);
 
             // Check if there are messages
@@ -1074,7 +1128,7 @@ pub const DigistalloneClient = struct {
     /// Refresh the mailbox state (syncEmail + fetchMessages)
     pub fn refresh(self: *DigistalloneClient) DigistalloneError!void {
         const allocator = self.allocator;
-        const response = try self.livewire.pollInbox(allocator);
+        const response = try self.livewire.pollInbox(&self.http, allocator);
         defer allocator.free(response);
         self.livewire.updateStateFromResponse(allocator, response) catch {};
     }
@@ -1163,4 +1217,73 @@ test "isFromGitHub: detect GitHub emails" {
     try std.testing.expect(isFromGitHub("github.com sent you a message"));
     try std.testing.expect(isFromGitHub("Welcome to GitHub!"));
     try std.testing.expect(!isFromGitHub("From: noreply@example.com"));
+}
+
+test "parseInitialState: decodes Livewire snapshots and bootstrap email" {
+    const allocator = std.testing.allocator;
+    const html =
+        \\<meta name="csrf-token" content="csrf-123" />
+        \\<div wire:snapshot="{&quot;data&quot;:{&quot;email&quot;:null},&quot;memo&quot;:{&quot;id&quot;:&quot;actions-id&quot;,&quot;name&quot;:&quot;frontend.actions&quot;},&quot;checksum&quot;:&quot;sum-actions&quot;}" wire:effects="{}" wire:id="actions-id"></div>
+        \\<div wire:snapshot="{&quot;data&quot;:{&quot;email&quot;:null},&quot;memo&quot;:{&quot;id&quot;:&quot;app-id&quot;,&quot;name&quot;:&quot;frontend.app&quot;},&quot;checksum&quot;:&quot;sum-app&quot;}" wire:effects="{}" wire:id="app-id"></div>
+        \\<script>
+        \\document.addEventListener('DOMContentLoaded', () => {
+        \\    const email = 'alpha@lunaro.forum';
+        \\    Livewire.dispatch('syncEmail', { email });
+        \\});
+        \\</script>
+    ;
+
+    var livewire = LivewireClient.init();
+    try livewire.parseInitialState(allocator, html);
+
+    try std.testing.expectEqualStrings("csrf-123", livewire.csrf_token[0..livewire.csrf_token_len]);
+    try std.testing.expectEqual(@as(usize, 2), livewire.components_count);
+    try std.testing.expectEqualStrings("frontend.actions", livewire.components[0].name[0..livewire.components[0].name_len]);
+    try std.testing.expectEqualStrings("actions-id", livewire.components[0].id[0..livewire.components[0].id_len]);
+    try std.testing.expectEqualStrings("frontend.app", livewire.components[1].name[0..livewire.components[1].name_len]);
+    try std.testing.expectEqualStrings("app-id", livewire.components[1].id[0..livewire.components[1].id_len]);
+    try std.testing.expectEqualStrings("alpha@lunaro.forum", livewire.current_email[0..livewire.current_email_len]);
+    try std.testing.expectEqualStrings(
+        "{\"data\":{\"email\":null},\"memo\":{\"id\":\"actions-id\",\"name\":\"frontend.actions\"},\"checksum\":\"sum-actions\"}",
+        livewire.components[0].snapshot[0..livewire.components[0].snapshot_len],
+    );
+}
+
+test "buildUpdateRequest: matches Livewire client payload shape" {
+    const allocator = std.testing.allocator;
+    const html =
+        \\<meta name="csrf-token" content="csrf-123" />
+        \\<div wire:snapshot="{&quot;data&quot;:{&quot;email&quot;:null},&quot;memo&quot;:{&quot;id&quot;:&quot;actions-id&quot;,&quot;name&quot;:&quot;frontend.actions&quot;},&quot;checksum&quot;:&quot;sum-actions&quot;}" wire:effects="{}" wire:id="actions-id"></div>
+    ;
+
+    var livewire = LivewireClient.init();
+    try livewire.parseInitialState(allocator, html);
+
+    const request = try livewire.buildUpdateRequest(
+        allocator,
+        "create",
+        null,
+        0,
+        "{\"user\":\"tester\",\"domain\":\"lunaro.forum\"}",
+    );
+    defer allocator.free(request);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("csrf-123", root.get("_token").?.string);
+
+    const component = root.get("components").?.array.items[0].object;
+    try std.testing.expectEqualStrings(
+        "{\"data\":{\"email\":null},\"memo\":{\"id\":\"actions-id\",\"name\":\"frontend.actions\"},\"checksum\":\"sum-actions\"}",
+        component.get("snapshot").?.string,
+    );
+    try std.testing.expectEqualStrings("tester", component.get("updates").?.object.get("user").?.string);
+    try std.testing.expectEqualStrings("lunaro.forum", component.get("updates").?.object.get("domain").?.string);
+
+    const call = component.get("calls").?.array.items[0].object;
+    try std.testing.expectEqualStrings("", call.get("path").?.string);
+    try std.testing.expectEqualStrings("create", call.get("method").?.string);
+    try std.testing.expectEqual(@as(usize, 0), call.get("params").?.array.items.len);
 }

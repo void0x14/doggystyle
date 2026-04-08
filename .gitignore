@@ -9,3 +9,6 @@ network_core
 tests/
 logs/
 .qwen/
+
+# Stakpak session files
+.stakpak/session*

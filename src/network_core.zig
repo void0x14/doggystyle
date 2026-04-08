@@ -7495,6 +7495,206 @@ pub const GitHubHttpClient = struct {
 
         return error.ReadTimeout;
     }
+
+    pub fn extractSignupHiddenFields(allocator: std.mem.Allocator, html_buffer: []const u8, payload_list: *std.array_list.Managed(u8)) !void {
+        _ = allocator;
+        var search_start: usize = 0;
+
+        // Let's find the signup form
+        const form_start_str = "action=\"/signup\"";
+        const form_start = mem.indexOf(u8, html_buffer, form_start_str) orelse 0;
+        search_start = form_start;
+
+        while (mem.indexOfPos(u8, html_buffer, search_start, "<input")) |input_start| {
+            const input_end = mem.indexOfScalarPos(u8, html_buffer, input_start, '>') orelse html_buffer.len;
+            search_start = input_end;
+
+            const input_tag = html_buffer[input_start..input_end];
+
+            // Ensure type="hidden"
+            if (mem.indexOf(u8, input_tag, "type=\"hidden\"") == null and mem.indexOf(u8, input_tag, "type='hidden'") == null) {
+                continue;
+            }
+
+            // Extract name
+            const name_attr = "name=\"";
+            const name_idx = mem.indexOf(u8, input_tag, name_attr) orelse continue;
+            const name_start = name_idx + name_attr.len;
+            const name_end = mem.indexOfScalarPos(u8, input_tag, name_start, '"') orelse continue;
+            const name = input_tag[name_start..name_end];
+
+            // Extract value
+            const value_attr = "value=\"";
+            const value_idx = mem.indexOf(u8, input_tag, value_attr) orelse {
+                continue;
+            };
+            const value_start = value_idx + value_attr.len;
+            const value_end = mem.indexOfScalarPos(u8, input_tag, value_start, '"') orelse continue;
+            const value = input_tag[value_start..value_end];
+
+            if (payload_list.items.len > 0) {
+                try payload_list.appendSlice("&");
+            }
+            try urlEncode(payload_list, name);
+            try payload_list.appendSlice("=");
+            try urlEncode(payload_list, value);
+        }
+    }
+
+    // SOURCE: RFC 9113, Section 8.1 - HTTP/2 request POST
+    pub fn performSignup(
+        self: *GitHubHttpClient,
+        allocator: std.mem.Allocator,
+        html_buffer: []const u8,
+        username: []const u8,
+        email: []const u8,
+        password: []const u8,
+        sock: anytype,
+        dst_ip: u32,
+    ) !bool {
+        std.debug.print("[Layer 4 (Logic)] Preparing HTTP/2 POST request to /signup\n", .{});
+        const path = "/signup";
+
+        var payload_list = std.array_list.Managed(u8).init(allocator);
+        defer payload_list.deinit();
+
+        try extractSignupHiddenFields(allocator, html_buffer, &payload_list);
+
+        if (payload_list.items.len > 0) {
+            try payload_list.appendSlice("&");
+        }
+        try urlEncode(&payload_list, "user[login]");
+        try payload_list.appendSlice("=");
+        try urlEncode(&payload_list, username);
+
+        try payload_list.appendSlice("&");
+        try urlEncode(&payload_list, "user[email]");
+        try payload_list.appendSlice("=");
+        try urlEncode(&payload_list, email);
+
+        try payload_list.appendSlice("&");
+        try urlEncode(&payload_list, "user[password]");
+        try payload_list.appendSlice("=");
+        try urlEncode(&payload_list, password);
+
+        // Sometimes GitHub also checks user[opt_in]=true or something, but we'll stick to login, email, password.
+
+        const payload = payload_list.items;
+
+        _ = self.tls_session orelse return error.NoTlsSession;
+        if (self.hpack_decoder == null) {
+            self.hpack_decoder = http2_core.HpackDecoder.init(allocator);
+        }
+
+        try self.ensureHttp2ConnectionReady(allocator, sock, dst_ip);
+
+        // Build cookies
+        var cookie_buf = std.array_list.Managed(u8).init(allocator);
+        defer cookie_buf.deinit();
+        if (self.cookie_jar.user_session.len > 0) {
+            try cookie_buf.appendSlice("user_session=");
+            try cookie_buf.appendSlice(self.cookie_jar.user_session[0..self.cookie_jar.user_session_len]);
+        }
+        if (self.cookie_jar.gh_sess.len > 0) {
+            if (cookie_buf.items.len > 0) try cookie_buf.appendSlice("; ");
+            try cookie_buf.appendSlice("_gh_sess=");
+            try cookie_buf.appendSlice(self.cookie_jar.gh_sess[0..self.cookie_jar.gh_sess_len]);
+        }
+
+        const hpack_block = try http2_core.buildGitHubSignupHeaders(allocator, path, self.host, payload.len, cookie_buf.items);
+        defer allocator.free(hpack_block);
+
+        const stream_id = try self.nextClientStreamId();
+
+        const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, stream_id, false);
+        defer allocator.free(headers_frame);
+
+        try self.sendTlsApplicationData(
+            allocator,
+            sock,
+            dst_ip,
+            headers_frame,
+            "HTTP/2 POST HEADERS",
+        );
+
+        // Send payload in chunks
+        const MAX_DATA_PAYLOAD = 1400;
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            const end = @min(offset + MAX_DATA_PAYLOAD, payload.len);
+            const chunk = payload[offset..end];
+            const is_last = (end == payload.len);
+
+            const data_frame = try packInDataFrame(allocator, chunk, stream_id, is_last);
+            defer allocator.free(data_frame);
+
+            try self.sendTlsApplicationData(
+                allocator,
+                sock,
+                dst_ip,
+                data_frame,
+                "HTTP/2 POST DATA CHUNK",
+            );
+            offset = end;
+        }
+
+        var response_parser = http2_core.Http2ResponseParser.init(
+            allocator,
+            &(self.hpack_decoder.?),
+            stream_id,
+        );
+        defer response_parser.deinit();
+
+        const timeout_start = currentTimestampMs();
+        while (currentTimestampMs() - timeout_start < 5000) {
+            const remaining_timeout = 5000 - (currentTimestampMs() - timeout_start);
+            const plaintext = try receiveTlsApplicationData(self, allocator, sock, remaining_timeout);
+            defer allocator.free(plaintext);
+
+            try response_parser.processApplicationData(plaintext);
+            const window_increment = response_parser.takeWindowUpdateIncrement();
+            if (window_increment > 0) {
+                const connection_window_update = http2_core.buildWindowUpdateFrame(0, window_increment);
+                try self.sendTlsApplicationData(
+                    allocator,
+                    sock,
+                    dst_ip,
+                    &connection_window_update,
+                    "HTTP/2 connection WINDOW_UPDATE",
+                );
+                const stream_window_update = http2_core.buildWindowUpdateFrame(stream_id, window_increment);
+                try self.sendTlsApplicationData(
+                    allocator,
+                    sock,
+                    dst_ip,
+                    &stream_window_update,
+                    "HTTP/2 stream WINDOW_UPDATE",
+                );
+            }
+            if (response_parser.isComplete()) {
+                var response = try response_parser.finish();
+                defer response.deinit(allocator);
+
+                // Update cookies
+                try extractCookiesFromHttp2Response(&response, &self.cookie_jar);
+
+                if (response.status_code == 302 or response.status_code == 200) {
+                    // Check if it redirects to onboarding
+                    if (mem.indexOf(u8, response.body, "onboarding/guidance") != null or response.status_code == 302) {
+                        return true;
+                    }
+                }
+
+                // If we get an Arkose challenge here unexpectedly
+                if (mem.indexOf(u8, response.body, "challenge_required") != null and mem.indexOf(u8, response.body, "true") != null) {
+                    return error.UnexpectedChallenge;
+                }
+                return false;
+            }
+        }
+
+        return error.ReadTimeout;
+    }
 };
 
 fn urlEncode(list: *std.array_list.Managed(u8), input: []const u8) !void {

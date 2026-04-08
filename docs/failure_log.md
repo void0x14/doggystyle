@@ -6,6 +6,129 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-09] — Digistallone Livewire Snapshot Parser Ham HTML Attribute Değerini Yanlış Kullandığı İçin Mailbox Akışı Çöküyordu
+
+**Hata:** `LivewireClient.parseInitialState` `wire:snapshot="..."` aramasında bulunan offset’i kullanmıyordu; ilk component snapshot’ı fiilen `"\n<html dir="` ile başlıyordu. Üstelik attribute içindeki `&quot;` entity’leri decode edilmeden saklanıyor, `buildUpdateRequest` de bu veriyi JSON string yerine ham/object gibi POST ediyordu. Sonuç: request gövdesi geçersiz hale geliyor ve create akışı bozuluyordu. Ayrıca istemci, `GET /mailbox` içinde zaten bootstrap edilen mevcut email’i (`const email = '...'`) hiç okumadığı için gereksiz yere bozuk `create` yoluna giriyordu.
+
+**Kök sebep:** Canlı site davranışı tarayıcıdaki Livewire istemcisine göre tasarlanmış. Livewire JS `wire:snapshot` attribute’unu DOM’dan decode edilmiş JSON string olarak okuyor ve request payload’ında `snapshot: this.component.snapshotEncoded` şeklinde string olarak gönderiyor. Mevcut Zig kodu ise ham HTML source üstünde çalıştığı halde DOM decode semantiğini taklit etmiyordu; ayrıca inline bootstrap email’i yok sayıyordu.
+
+**Kaynak:** `https://digistallone.com/mailbox` — inline bootstrap script: `const email = '...'` + `Livewire.dispatch('syncEmail', { email })`
+**Kaynak:** `https://digistallone.com/vendor/livewire/livewire.min.js?id=df3a17f2` — `this.snapshotEncoded = t.getAttribute("wire:snapshot")` ve request body: `JSON.stringify({_token:At(),components:t})` with `snapshot:this.component.snapshotEncoded`, `calls:[{path:"",method,...}]`
+
+**Düzeltme:**
+1. `parseInitialState` gerçek `wire:snapshot` başlangıç offset’ini kullanacak şekilde düzeltildi.
+2. `wire:snapshot` attribute içeriği HTML entity decode edilerek saklanmaya başlandı.
+3. Snapshot metadata (`memo.name`) JSON parse ile okunuyor; bootstrap email inline script’ten çıkarılıyor.
+4. `buildUpdateRequest` artık Livewire JS ile uyumlu olarak `snapshot` alanını JSON string ve `calls[].path` alanını içerir biçimde üretiyor.
+5. `getNewEmailAddress(null)` önce bootstrap edilen mevcut mailbox’ı döndürüyor; smoke test canlı sitede `current=...` ve `returned=...` eşitliğini doğruladı.
+
+## [2026-04-09] — Livewire createEmail Response Sahipliği Unutulduğu İçin DebugAllocator Leak Veriyordu
+
+**Hata:** `LivewireClient.createEmail` içinde `sendUpdate` çağrısından dönen response body parse ediliyor ama hiç `free` edilmiyordu. `recvFullResponse` body’yi `allocator.alloc` ile verdiği için shutdown sonunda DebugAllocator leak raporu üretiyordu.
+
+**Kök sebep:** Caller-owned allocation zinciri yarıda kesildi. `HttpClient.recvFullResponse` -> `HttpClient.postJson` -> `LivewireClient.sendUpdate` -> `LivewireClient.createEmail` zincirinde son sahip `createEmail` idi ama ownership devri belgelense de serbest bırakma yoktu.
+
+**Kaynak:** `vendor/zig-std/std/mem/Allocator.zig` — `alloc` sonrası allocator bilinmiyorsa doğru kod iş bitince `free` çağırmalıdır
+**Kaynak:** `src/digistallone.zig` — `recvFullResponse` body’yi `allocator.alloc(u8, cl)` ile üretir
+
+**Düzeltme:**
+1. `LivewireClient.createEmail` içinde `const response = try self.sendUpdate(...)` sonrası `defer allocator.free(response);` eklendi.
+2. Response parse aynı buffer üzerinden yapılıyor; email alanı internal state’e kopyalandıktan sonra response güvenle serbest bırakılıyor.
+
+---
+
+## [2026-04-09] — Digistallone TLS/HTTP Zinciri Embedded Reader Kopyası ve Flush Sözleşmesi Yüzünden Bozuldu
+
+**Hata:** `src/digistallone.zig` içinde bağlantı zinciri parça parça ele alındığı için gerçek kırılma noktası gizlendi. Sorun tek bir `TcpConnectFailed` değildi; aynı zincirde birden fazla sözleşme ihlali vardı:
+1. `std.crypto.tls.Client.reader` local değişkene kopyalanıyordu; vendored std içindeki `@fieldParentPtr("reader", r)` hesabı artık gerçek `Client` yerine stack kopyasına bakıyordu.
+2. HTTP request plaintext’i TLS writer’a yazıldıktan sonra yalnızca buffer’da kalıyor, ciphertext TCP stream’e flush edilmiyordu; sunucu `HTTP/1.1 408 Request Time-out` döndürüyordu.
+3. HTTP response parser `Content-Length` başlığını casing-duyarlı okuyordu ve body’yi `take(remaining)` ile tek hamlede tüketmeye çalışıyordu; bu da TLS reader buffer sözleşmesiyle çatışıyordu.
+4. Bağlantı yolu sabit IP’ye kilitliydi; runtime’da hostname çözümlemesi kullanılmıyordu.
+
+**Kök sebep:** Kök neden tek fonksiyonluk bir bug değil, stdlib I/O sözleşmelerinin ihlaliydi. `std.Io.net.Stream.Reader/Writer`, `std.crypto.tls.Client.reader/writer` ve `std.Io.Reader/Writer` buffer/flush/lifetime kuralları birlikte izlenmeden lokal hotfix’ler uygulandı.
+
+**Kaynak:** `vendor/zig-std/std/crypto/tls/Client.zig` — embedded `reader`/`writer` alanları `@fieldParentPtr` ile gerçek `Client` adresine bağlı
+**Kaynak:** `vendor/zig-std/std/Io/Writer.zig` — `flush` buffered veriyi sink’e itmek için zorunlu
+**Kaynak:** `vendor/zig-std/std/Io/net.zig` — `Stream.Reader.init` / `Stream.Writer.init` stdlib I/O sözleşmesini sağlar
+**Kaynak:** `vendor/zig-std/std/Io/net/HostName.zig` — `HostName.connect` runtime DNS çözümlemesi yapar
+
+**Düzeltme:**
+1. Bağlantı yolu `std.Io.Threaded` + `std.Io.net.HostName.connect` / `IpAddress.connect` tabanına taşındı.
+2. `recvFullResponse` artık `&self.tls.reader` pointer’ı ile çalışıyor; embedded reader kopyalanmıyor.
+3. `sendRaw` hem TLS writer’ı hem de alttaki `Stream.Writer`’ı flush ediyor.
+4. Response header parse case-insensitive yapıldı ve body `peekGreedy(1)` + `toss()` ile parçalı okunuyor.
+5. `DigistalloneClient.init` hata yolunda `http.deinit()` ile temiz kapanıyor.
+
+---
+
+## [2026-04-09] — Zig 0.16.0 Ağ API Drift'i Yanlış Namespace Seçimine Yol Açtı
+
+**Tetikleyici:** `src/digistallone.zig` bağlantı katmanını standart kütüphane ile sadeleştirirken `std.net.Address.parseIp4` önerisinin yerel vendor std ile birebir uyuşmaması
+**Dosyalar:** `src/digistallone.zig`
+**Tip:** Build/runtime safety fix — aynı niyet, yanlış namespace seçilirse Zig 0.16.0 yerel kodla drift oluşuyor
+
+---
+
+### Hata: 0.16.0 yerel stdlib doğrulanmadan farklı namespace önerisi uygulanabilirdi
+
+**Hata:** Görev niyeti doğruydu: manuel IPv4 parsing olmamalı, stdlib kullanılmalı. Ancak bu workspace'in vendor std kopyasında kanıtlanmış API `std.Io.net.IpAddress.parseIp4`. `std.net.Address.parseIp4` bu yerel ağaçta yok. Yerel kod doğrulanmadan kör namespace değişimi yapılsaydı gereksiz yeni compile/runtime hata riski doğacaktı.
+
+**Kök Sebep:** Zig işleri için önce yerel 0.16.0 kaynak ağacını doğrulama kuralı atlanırsa, farklı Zig sürümlerindeki ağ API isimleri birbirine karışabiliyor.
+
+**Kaynak:** `vendor/zig-std/std/Io/net.zig` — `pub fn parseIp4(text: []const u8, port: u16) Ip4Address.ParseError!IpAddress`
+
+**Düzeltme:**
+1. `resolveTcpTargetAddress` helper'ı eklendi
+2. Helper içinde doğrulanmış yerel API `std.Io.net.IpAddress.parseIp4` kullanıldı
+3. `HttpClient.init` doğrudan bu helper'dan aldığı adres ile `posix.socket` / `posix.connect` çağırıyor
+4. Domain adı ile IP adresi ayrımı test ile kilitlendi: IPv4 kabul, domain reddi
+
+**Tekrar olmaması için:**
+- Zig ağ API'leri için önce yerel vendor std okunacak
+- Sürüm belirtilmemiş stdlib önerileri doğrudan koda uygulanmayacak
+- Socket adres çözümleme davranışı test ile korunacak
+
+---
+
+## [2026-04-09] — Manuel IPv4 Parsing Döngüsü TcpConnectFailed Hatasına Neden Oluyor
+
+**Tetikleyici:** Module 3.2 — Digistallone HttpClient bağlantı aşamasında `TcpConnectFailed` hatası
+**Dosyalar:** `src/digistallone.zig` (`HttpClient.init` fonksiyonu)
+**Tip:** Runtime protocol/string parsing error — Manuel IP parsing döngüsü domain adını IP olarak parse etmeye çalışıyordu
+
+---
+
+### Hata: Manuel IPv4 parsing döngüsü domain adını IP olarak parse etmeye çalışıyordu
+
+**Hata:** `HttpClient.init` içinde IP adresini parse etmek için manuel bir `while` döngüsü yazılmıştı.
+Bu döngü string'i `.` karakterine göre split edip her parçayı `u8` olarak parse etmeye çalışıyordu.
+Sorun:
+1. Eğer `ip` parametresine domain adı (örn. "digistallone.com") geçirilirse, döngü `part_idx != 4` kontrolünde kalıyordu
+2. Manuel parsing gereksiz karmaşıktı ve Zig stdlib'deki `std.net.Address.parseIp4` fonksiyonunu görmezden geliyordu
+3. `posix.system.socket` ve `posix.system.connect` yerine düşük seviyeli syscall wrapper kullanılıyordu
+
+**Kök Sebep:** AGENTS.md Section 2.1 (Manuel Offset Yasağı) ve Section 0 (Tahmin Yasağı) kurallarına aykırı olarak, standart kütüphane yerine manuel parsing implementasyonu yazılmıştı.
+
+**Kaynak:** man 7 ip — IPv4 address format
+**Kaynak:** man 2 socket — POSIX socket API
+**Kaynak:** man 2 connect — TCP connect syscall
+**Kaynak:** Zig stdlib — `std.net.Address.parseIp4`
+
+**Düzeltme:**
+1. Manuel IPv4 parsing döngüsü tamamen kaldırıldı
+2. `std.net.Address.parseIp4(ip, port)` ile güvenli adres çözümlemesi kullanıldı
+3. `posix.socket(addr.any.family, posix.SOCK.STREAM, posix.IPPROTO.TCP)` ile standart socket oluşturma
+4. `posix.connect(sock, &addr.any, addr.getOsSockLen())` ile standart connect
+5. `posix.system.close` yerine `posix.close` kullanıldı
+6. SNI ayarı `.host = .{ .explicit = sni }` ile korundu (TLS için domain adı, socket için IP)
+
+**Tekrar olmaması için:**
+- Manuel string parsing yerine Zig stdlib fonksiyonları kullanılacak
+- AGENTS.md Section 2.1: Ham byte/string işlemlerinde struct veya stdlib kullanılacak
+- Socket işlemlerinde `posix.*` namespace'i kullanılacak, `posix.system.*` değil
+
+---
+
 ## [2026-04-08] — Protokol İhlali ve Test Eksikliği
 **Hata:** `extractAuthenticityToken`, `performRiskCheck` ve `buildGitHubPostHeaders` fonksiyonları eklendi ancak AGENTS.md içindeki Zorunlu Protokol kuralları (Kaynak belirtme, Assert katmanı, Test zorunluluğu, Network Stack farkındalığı) hiçe sayıldı.
 **Kök sebep:** Kod yazılırken hız ve işlevsellik ön planda tutuldu, derleyici uzantısı rolü ve AGENTS.md içerisindeki [PROTOCOL: ABSOLUTE WIRE-TRUTH] kuralları göz ardı edildi.
