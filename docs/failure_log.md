@@ -6,6 +6,123 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-08] — Module 3.2: std.crypto.tls.Client lifetime + std.Io API uyumluluğu
+
+**Tetikleyici:** Module 3.2 — Autonomous Mailbox Controller & Code Extractor implementasyonu
+**Dosyalar:** `src/digistallone.zig`, `build.zig`
+**Tip:** Proaktif — Zig 0.16.0-dev.3135 API değişiklikleri ve lifetime yönetimi
+
+---
+
+### Hata 1: `std.crypto.tls.Client` local değişken olarak oluşturulup pointer'ı return ediliyordu
+
+**Hata:** `HttpClient.init()` içinde `const tls_client = crypto.tls.Client.init(...)` local
+değişken olarak tanımlanıp `return .{ .tls = &tls_client }` ile pointer return ediliyordu.
+Fonksiyon return ettikten sonra `tls_client` stack'ten silinir → use-after-free (UB).
+
+**Kök Sebep:** Zig'de fonksiyon scope'unda tanımlanan değişkenler fonksiyon return ettiğinde
+geçersiz olur. Pointer'ları heap'te allocate edilmeli.
+
+**Kaynak:** Zig memory semantics — stack allocation is function-scoped.
+
+**Düzeltme:**
+```zig
+// ÖNCEKİ (YANLIŞ):
+const tls_client = crypto.tls.Client.init(...) catch return error.TlsHandshakeFailed;
+return .{ .tls = &tls_client };
+
+// SONRAKİ (DOĞRU):
+const tls_ptr = try allocator.create(crypto.tls.Client);
+tls_ptr.* = crypto.tls.Client.init(...) catch {
+    allocator.destroy(tls_ptr);
+    return error.TlsHandshakeFailed;
+};
+return .{ .tls = tls_ptr };
+```
+
+---
+
+### Hata 2: `std.Io.net.Stream.Reader/Writer` interface pointer lifetime
+
+**Hata:** `tls.Client.init()` `*Reader` ve `*Writer` pointer'larını kabul eder ve bunları
+internal olarak saklar. Eğer Reader/Writer local değişken ise, TLS handshake sonrası
+bu pointer'lar dangling olur.
+
+**Kök Sebep:** `std.crypto.tls.Client` struct'ı:
+```zig
+input: *Reader,   // pointer to encrypted reader interface
+output: *Writer,  // pointer to encrypted writer interface
+```
+Bu pointer'lar, `init` çağrısından sonra da geçerli olmalı.
+
+**Çözüm:** Reader ve Writer'ı da heap'te allocate et ve HttpClient struct'ında sakla:
+```zig
+const reader_ptr = try allocator.create(std.Io.net.Stream.Reader);
+const writer_ptr = try allocator.create(std.Io.net.Stream.Writer);
+reader_ptr.* = std.Io.net.Stream.Reader.init(stream, io, reader_buf);
+writer_ptr.* = std.Io.net.Stream.Writer.init(stream, io, writer_buf);
+
+tls_ptr.* = crypto.tls.Client.init(
+    &reader_ptr.*.interface,
+    &writer_ptr.*.interface,
+    ...
+);
+
+return .{
+    .tls = tls_ptr,
+    .reader_ptr = reader_ptr,  // lifetime managed
+    .writer_ptr = writer_ptr,  // lifetime managed
+};
+```
+
+---
+
+### Hata 3: `std.io.fixedBufferStream` Zig 0.16'da yok
+
+**Hata:** `std.io.fixedBufferStream(buf)` kullanıldı. Zig 0.16'da `std.io` modülü
+kaldırılmış, yerine `std.Io` gelmiş. Ama `std.Io`'da `fixedBufferStream` eşdeğeri yok.
+
+**Kaynak:** Zig 0.16 stdlib değişiklikleri — `std.io` → `std.Io` (büyük harf)
+
+**Çözüm:** Manuel byte-offset ile buffer yazma:
+```zig
+var pos: usize = 0;
+const prefix = "XSRF-TOKEN=";
+@memcpy(buf[0..prefix.len], prefix);
+pos += prefix.len;
+@memcpy(buf[pos .. pos + self.xsrf_token_len], self.xsrf_token[0..self.xsrf_token_len]);
+pos += self.xsrf_token_len;
+```
+
+---
+
+### Eklenen API'ler
+
+| Fonksiyon | Amaç |
+|---|---|
+| `DigistalloneClient.init()` | TLS handshake + CSRF token extraction |
+| `getNewEmailAddress()` | Yeni email oluştur (domain rotation) |
+| `pollInboxForGitHubCode()` | Inbox polling + 6-digit code extraction |
+| `extractGitHubCode()` | Regex-free 6-digit code pattern matching |
+| `CookieJar.setCookie()` | Set-Cookie header parsing |
+| `LivewireClient.createEmail()` | Livewire form submit |
+| `LivewireClient.pollInbox()` | fetchMessages dispatch |
+
+### Doğrulama
+
+```
+✅ vendor/zig/zig test src/digistallone.zig → 6/6 test geçti
+✅ vendor/zig/zig build test → 82/82 test geçti (48+28+6)
+```
+
+---
+
+*Son güncelleme: 2026-04-08*
+*Güncelleyen: Module 3.2 implementasyonu*
+*Tetikleyen: Digistallone mailbox controller geliştirme*
+
+---
+
 ## [2026-04-07] — Zig 0.16 packed struct + [N]u8 + @bitCast uyumsuzluğu
 
 **Tetikleyici:** Module 2.1 — TLS 1.3 Server Response Parser implementasyonu
@@ -600,3 +717,4 @@ if (total_len > MTU_LIMIT) {
 *Son güncelleme: 2026-04-07*
 *Güncelleyen: Module 3.1 implementasyonu*
 *Tetikleyen: Zig 0.16.0-dev.3135 API uyumluluk testleri*
+
