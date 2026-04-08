@@ -562,3 +562,41 @@ if (total_len > MTU_LIMIT) {
 *Son güncelleme: 2026-04-07*
 *Güncelleyen: void0x14*
 *Tetikleyen: Module 2.4 implementasyonu ve zig build test*
+
+---
+
+## [2026-04-07] — Module 3.1 Implementasyonu: Zig 0.16 Crypto/Base64/Fmt API Uyumluluk Hataları
+
+**Tetikleyici:** Module 3.1 — Identity Forgery & BDA Synthesis implementasyonu
+**Dosyalar:** `src/network_core.zig`
+**Tip:** Proaktif — Zig 0.16.0-dev.3135 API değişiklikleri
+
+### Hata 1: `std.fmt.formatIntBuf` yok, `std.fmt.printInt` kullanılmalı
+**Sorun:** `std.fmt.formatIntBuf` Zig 0.16'da kaldırılmış.
+**Çözüm:** Tüm çağrılar `std.fmt.printInt(&buf, value, base, case, options)` ile değiştirildi.
+
+### Hata 2: `std.crypto.aes.Aes128` yolu yanlış
+**Sorun:** `std.crypto.aes.Aes128` test modunda erişilemiyor.
+**Çözüm:** `std.crypto.core.aes.Aes128` kullanıldı.
+
+### Hata 3: `std.crypto.hash.Sha256` yolu yanlış
+**Sorun:** `std.crypto.hash.Sha256` Zig 0.16'da yok.
+**Çözüm:** `std.crypto.hash.sha2.Sha256` kullanıldı.
+
+### Hata 4: AES encrypt/decrypt pointer tipleri
+**Sorun:** `aes_ctx.encrypt(dst: *[16]u8, src: *const [16]u8)` bekliyor, slice veriyorduk.
+**Çözüm:** `ciphertext[i .. i + 16][0..16]` ile `[16]u8` pointer'a cast edildi.
+
+### Hata 5: `std.base64.standard.Encoder.init(.{})` yanlış
+**Sorun:** `std.base64.standard.Encoder` zaten init edilmiş struct.
+**Çözüm:** Direkt `std.base64.standard.Encoder` kullanıldı, `.init()` kaldırıldı.
+
+### Hata 6: `parseArkoseResponse` memory leak
+**Sorun:** `token` ve `challenge_url` allocate ediliyor ama error durumunda free edilmiyor.
+**Çözüm:** `errdefer` bloğu eklendi, testte de `allocator.free(parsed1.token.?)` ile temizlik yapıldı.
+
+---
+
+*Son güncelleme: 2026-04-07*
+*Güncelleyen: Module 3.1 implementasyonu*
+*Tetikleyen: Zig 0.16.0-dev.3135 API uyumluluk testleri*
