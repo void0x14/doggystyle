@@ -6,6 +6,94 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-08] — Module 3.3: HTTP Cookie Parsing & Redirect Loop Bug
+
+**Tetikleyici:** Module 3.3 — Onboarding Bypass & Session Persistence implementasyonu
+**Dosyalar:** `src/network_core.zig`
+**Tip:** Proaktif — runtime hatası görülmeden, test aşamasında tespit edildi
+
+---
+
+### Hata: extractCookies ikinci header'ı görmüyordu
+
+**Hata:** `extractCookies` fonksiyonu headers parsing loop'unda sadece ilk header'ı okuyordu.
+İkinci header (`Set-Cookie`) parse edilmiyordu, `user_session_len = 0` kalıyordu.
+
+**Kök Sebep:** Loop içinde `while (headers.len > 0)` koşulu vardı ama `mem.indexOf(u8, headers, "\r\n")`
+son header'dan sonra `\r\n` bulamadığı için `null` dönüyordu. Eski kod:
+
+```zig
+// ÖNCEKİ (YANLIŞ):
+while (headers.len > 0) {
+    const crlf = mem.indexOf(u8, headers, "\r\n") orelse break; // ← BURADA break!
+    const header_line = headers[0..crlf];
+    // ... process header ...
+    headers = headers[crlf + 2 ..];
+}
+```
+
+Son header'dan sonra `\r\n` olmadığı için loop break ediyordu.
+
+**Çözüm:** Optional handling ile son header'ı da işle:
+
+```zig
+// SONRAKİ (DOĞRU):
+while (headers.len > 0) {
+    const crlf = mem.indexOf(u8, headers, "\r\n");
+    const header_line = if (crlf) |pos| headers[0..pos] else headers; // ← Son header'ı al
+    
+    // ... process header ...
+    
+    if (crlf) |pos| {
+        headers = headers[pos + 2 ..];
+    } else {
+        break; // ← Son header işlendi, çık
+    }
+}
+```
+
+**Ders:** Header parsing loop'larında son satırın `\r\n` ile bitmeyeceğini hesaba kat.
+Optional pattern matching ile hem `\r\n` olan hem olmayan durumları handle et.
+
+---
+
+### Eklenen API'ler
+
+| Fonksiyon | Amaç |
+|---|---|
+| `GitHubCookieJar.setCookie()` | Set-Cookie header parsing (RFC 6265) |
+| `GitHubCookieJar.cookieHeader()` | Cookie header oluşturma (RFC 6265 Section 4.2) |
+| `HttpResponse.parse()` | HTTP response parsing (RFC 7230) |
+| `HttpResponse.extractCookies()` | Set-Cookie extraction (case-insensitive) |
+| `HttpResponse.locationHeader()` | Location header extraction (RFC 7231) |
+| `HttpResponse.hasLoggedInClass()` | Dashboard session validation |
+| `HttpResponse.extractUserLogin()` | Meta tag username extraction |
+| `GitHubHttpClient.followRedirectsUntil()` | Redirect following with jitter |
+| `GitHubHttpClient.validateSessionState()` | Session validation |
+| `GitHubHttpClient.resolveUrl()` | Relative → Absolute URL resolution |
+
+### Doğrulama
+
+```
+✅ vendor/zig/zig test src/network_core.zig → 56/56 test geçti
+✅ vendor/zig/zig build test → 84/84 test geçti (56 + 28 http2_core)
+```
+
+### Kaynaklar
+
+- RFC 7230, Section 3 - HTTP Message Format
+- RFC 7231, Section 6.4.2 - 302 Found (Redirect)
+- RFC 6265, Section 5.2 - Set-Cookie
+- RFC 6265bis, Section 4.1.3 - __Host- Cookie Prefix
+
+---
+
+*Son güncelleme: 2026-04-08*
+*Güncelleyen: Module 3.3 implementasyonu*
+*Tetikleyen: Onboarding Bypass & Session Persistence geliştirme*
+
+---
+
 ## [2026-04-08] — Module 3.2: std.crypto.tls.Client lifetime + std.Io API uyumluluğu
 
 **Tetikleyici:** Module 3.2 — Autonomous Mailbox Controller & Code Extractor implementasyonu
