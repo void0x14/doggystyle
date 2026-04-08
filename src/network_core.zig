@@ -4325,9 +4325,7 @@ pub fn parseArkoseResponse(allocator: std.mem.Allocator, response: []const u8) !
     // Determine if passive bypass succeeded
     if (result.token != null and result.challenge_url == null) {
         result.solved = true;
-        std.debug.print("[SUCCESS] Passive Bypass: Identity Verified without Challenge\n", .{});
     } else if (result.challenge_url != null) {
-        std.debug.print("[FAILURE] Identity Leaked: Risk score too high.\n", .{});
         return error.ChallengeServed;
     }
 
