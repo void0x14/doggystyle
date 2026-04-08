@@ -12,17 +12,48 @@ const digistallone = @import("digistallone.zig");
 ///   3. Firewall Rules (NOTRACK + INPUT ACCEPT)
 ///   4. TCP SYN Transmission
 ///   5. TCP + TLS 1.3 Handshake (completeHandshakeFull → HandshakeResultFull)
-///   6. HTTP/2 HEADERS Frame (HPACK Literal, H=0)
-///   7. GitHubHttpClient with real socket + TlsSession
-///   8. Mailbox Polling (digistallone.DigistalloneClient)
-///   9. Safe Shutdown + Resource Cleanup
+///   6. HTTP/2 GET Request → Decrypt → Print HTML
+///   7. Safe Shutdown + Resource Cleanup
 ///
 /// KULLANIM:
-///   sudo ./zig-out/bin/ghost_engine [interface|ip] [dest_ip] [dest_port]
+///   sudo ./zig-out/bin/ghost_engine <interface>
+///
+/// ÖRNEK:
+///   sudo ./zig-out/bin/ghost_engine enp37s0
 ///
 /// NOT: Raw socket için root yetkisi gereklidir.
-pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+
+    // =========================================================================
+    // ARGUMENT PARSING — Zig 0.16 init pattern
+    // =========================================================================
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args_iter.deinit();
+
+    _ = args_iter.skip(); // argv[0]
+
+    const iface_name = args_iter.next() orelse {
+        std.debug.print("KULLANIM: sudo ./zig-out/bin/ghost_engine <interface>\n", .{});
+        std.debug.print("ÖRNEK:  sudo ./zig-out/bin/ghost_engine enp37s0\n", .{});
+        std.process.exit(1);
+    };
+
+    // =========================================================================
+    // SABITLER: GitHub Hedefi
+    // =========================================================================
+    const target_host = "github.com";
+    const target_port: u16 = 443;
+    const request_path = "/signup";
+
+    // GitHub.com IP: 140.82.121.4
+    const dst_ip: u32 = blk: {
+        const octets = [_]u8{ 140, 82, 121, 4 };
+        break :blk (@as(u32, octets[0]) << 24) |
+            (@as(u32, octets[1]) << 16) |
+            (@as(u32, octets[2]) << 8) |
+            @as(u32, octets[3]);
+    };
 
     // =========================================================================
     // ADIM 1: Jitter Engine Initialization
@@ -46,23 +77,8 @@ pub fn main() !void {
     }
 
     // =========================================================================
-    // ADIM 3: Interface + Destination Resolution
+    // ADIM 3: Interface Resolution
     // =========================================================================
-    const iface_name = try network.resolveLinuxInterface(allocator, null);
-    defer allocator.free(iface_name);
-
-    const target_host = "github.com";
-    const target_port: u16 = 443;
-
-    // GitHub.com IP: 140.82.121.4
-    const dst_ip: u32 = blk: {
-        const octets = [_]u8{ 140, 82, 121, 4 };
-        break :blk (@as(u32, octets[0]) << 24) |
-            (@as(u32, octets[1]) << 16) |
-            (@as(u32, octets[2]) << 8) |
-            @as(u32, octets[3]);
-    };
-
     const src_ip: u32 = try network.getInterfaceIp(iface_name);
     std.debug.print("[NETWORK] Interface: {s}\n", .{iface_name});
     std.debug.print("[NETWORK] Source IP: {}.{}.{}.{}\n", .{
@@ -154,7 +170,6 @@ pub fn main() !void {
         seq_num, // SYN'nin ISN'i
         tsval, // SYN'nin TSval'i — monotonik artış buradan devam eder
     );
-    defer {} // sock is borrowed, deinit handled above
 
     std.debug.print("[HANDSHAKE] Complete!\n", .{});
     std.debug.print("[HANDSHAKE] Cipher suite: 0x{x:04}\n", .{handshake.cipher_suite});
@@ -169,31 +184,12 @@ pub fn main() !void {
     });
 
     // =========================================================================
-    // ADIM 9: HTTP/2 HPACK Header Preparation
+    // ADIM 9: HTTP/2 GET Request → Decrypt → Display
     // =========================================================================
     std.debug.print("\n", .{});
-    std.debug.print("[HTTP/2] Building HPACK header block (Literal, H=0)...\n", .{});
+    std.debug.print("[HTTP/2] Initializing GitHubHttpClient with real handshake state...\n", .{});
 
-    const request_path = "/login";
-    const hpack_block = try http2.buildGitHubHeaders(allocator, request_path, target_host, true);
-    defer allocator.free(hpack_block);
-
-    std.debug.print("[HPACK] Block: {d} bytes\n", .{hpack_block.len});
-
-    const headers_frame = try http2.packInHeadersFrame(allocator, hpack_block, 1);
-    defer allocator.free(headers_frame);
-
-    std.debug.print("[HTTP/2] HEADERS frame: {d} bytes (stream_id=1, flags=0x05)\n", .{
-        headers_frame.len,
-    });
-
-    // =========================================================================
-    // ADIM 10: GitHubHttpClient with Real Socket + Session
-    // =========================================================================
-    std.debug.print("\n", .{});
-    std.debug.print("[GITHUB] Initializing GitHubHttpClient with real handshake state...\n", .{});
-
-    const github_client = network.GitHubHttpClient.initFromHandshake(
+    var github_client = network.GitHubHttpClient.initFromHandshake(
         target_host,
         target_port,
         handshake.sock_fd,
@@ -208,73 +204,39 @@ pub fn main() !void {
         handshake.server_tsval,
     );
 
-    std.debug.print("[GITHUB] Client initialized:\n", .{});
-    std.debug.print("[GITHUB]   sock_fd: {d}\n", .{github_client.sock_fd.?});
-    std.debug.print("[GITHUB]   src_port: {d}, dst_port: {d}\n", .{
-        github_client.src_port,
-        github_client.dst_port,
-    });
-    std.debug.print("[GITHUB]   client_seq: {d}, server_seq: {d}\n", .{
-        github_client.client_seq,
-        github_client.server_seq,
-    });
+    std.debug.print("[HTTP/2] Client initialized (sock_fd={d})\n", .{github_client.sock_fd.?});
+    std.debug.print("[HTTP/2] Requesting: https://{s}{s}\n", .{ target_host, request_path });
 
-    // =========================================================================
-    // ADIM 11: Cookie Jar State
-    // =========================================================================
-    std.debug.print("\n", .{});
-    std.debug.print("[COOKIES] Jar state: user_session={d}, host_session={d}, gh_sess={d}\n", .{
-        github_client.cookie_jar.user_session_len,
-        github_client.cookie_jar.host_user_session_len,
-        github_client.cookie_jar.gh_sess_len,
-    });
+    // PERFORM THE GET REQUEST — BU KRITIK NOKTA!
+    std.debug.print("\n[HTTP/2] Sending GET request and waiting for response...\n", .{});
 
-    // =========================================================================
-    // ADIM 12: Layer Trace Summary
-    // =========================================================================
+    const response = try github_client.performGet(allocator, "https://github.com/signup", &sock, dst_ip);
+    defer allocator.free(response);
+
+    // Parse HTTP response
+    const http_response = try network.HttpResponse.parse(response);
+
+    // DECRYPT & DISPLAY
     std.debug.print("\n", .{});
     std.debug.print("╔══════════════════════════════════════════════════════════╗\n", .{});
-    std.debug.print("║              LAYER TRACE SUMMARY                        ║\n", .{});
+    std.debug.print("║              DECRYPTED HTTP RESPONSE                     ║\n", .{});
     std.debug.print("╚══════════════════════════════════════════════════════════╝\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("[Layer 1 (Network)]     Raw socket fd={d}, iface={s}, ephemeral={d}\n", .{
-        sock.fd, iface_name, src_port,
-    });
-    std.debug.print("[Layer 2 (TLS)]         TLS 1.3 session active (cipher=0x{x:04}, seq_send={d})\n", .{
-        handshake.cipher_suite, handshake.tls_session.seq_send,
-    });
-    std.debug.print("[Layer 3 (HTTP/2)]      HEADERS frame ready (HPACK Literal, H=0, {d} bytes)\n", .{
-        headers_frame.len,
-    });
-    std.debug.print("[Layer 4 (Logic)]       GET {s} prepared (GitHubHttpClient wired)\n", .{request_path});
+    std.debug.print("[RESPONSE] Status: {d} {s}\n", .{ http_response.status_code, http_response.reason_phrase });
+    std.debug.print("[RESPONSE] Headers:\n{s}\n", .{http_response.headers_start});
+
+    // Display first 1000 bytes of HTML body
+    const display_len = if (response.len > 1000) 1000 else response.len;
+    std.debug.print("\n[HTML BODY - First {d} bytes]:\n", .{display_len});
+    std.debug.print("────────────────────────────────────────────────────────────\n", .{});
+    std.debug.print("{s}", .{response[0..display_len]});
+    std.debug.print("\n────────────────────────────────────────────────────────────\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("[SUCCESS] Received {d} bytes decrypted HTML response\n", .{response.len});
     std.debug.print("\n", .{});
 
     // =========================================================================
-    // ADIM 13: Mailbox Controller (Digistallone) Metadata
-    // =========================================================================
-    std.debug.print("[MAILBOX] Digistallone metadata: {d} domains, poll_interval={d}ms\n", .{
-        digistallone.DEFAULT_DOMAINS_COUNT,
-        digistallone.DEFAULT_POLL_INTERVAL_MS,
-    });
-    std.debug.print("[MAILBOX] Target: {s}:{d} (Livewire v3 over TLS 1.3)\n", .{
-        digistallone.DIGISTALLONE_IP,
-        digistallone.DIGISTALLONE_PORT,
-    });
-
-    // NOTE: DigistalloneClient.init() std.Io.Event gerektirir.
-    // Production'da async I/O loop içinde pollInboxForGitHubCode() çağrılır.
-    // Bu sequenced execution'da metadata gösteriliyor, gerçek polling
-    // GitHub response alındıktan sonra tetiklenir.
-
-    std.debug.print("\n", .{});
-    std.debug.print("[WIRE-TRUTH] All modules connected. Real handshake complete.\n", .{});
-    std.debug.print("[WIRE-TRUTH] TCP+TLS 1.3 handshake verified (cipher=0x{x:04})\n", .{handshake.cipher_suite});
-    std.debug.print("[WIRE-TRUTH] HTTP/2 HPACK engine wired (Module 2.3 → network_core → main)\n", .{});
-    std.debug.print("[WIRE-TRUTH] GitHubHttpClient wired with real socket + TlsSession\n", .{});
-    std.debug.print("\n", .{});
-
-    // =========================================================================
-    // ADIM 14: Safe Shutdown
+    // ADIM 10: Safe Shutdown
     // =========================================================================
     std.debug.print("[SHUTDOWN] Initiating safe shutdown...\n", .{});
     std.debug.print("[SHUTDOWN] Firewall cleanup (defer removeRstSuppression)...\n", .{});

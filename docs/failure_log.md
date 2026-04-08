@@ -6,6 +6,201 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-08] — Module 3.1: HelloRetryRequest Yanlışlıkla Handshake Tamamlandı Sanılıyordu
+
+**Tetikleyici:** HTTP/2 preface sonrası `TlsRecordTooShort` ve sahte `Session established` logu
+**Dosyalar:** `src/network_core.zig`
+**Tip:** Runtime protocol/state error — HelloRetryRequest final ServerHello sanıldı, placeholder TLS keys üretildi
+
+---
+
+### Hata: completeHandshakeFull HRR'yi final ServerHello sanıp sahte TlsSession döndürüyordu
+
+**Hata:** İlk ClientHello'dan sonra gelen TLS mesajının `server_random` alanı
+`cf21ad74e59a6111...` idi. Bu değer RFC 8446'ya göre final ServerHello değil,
+HelloRetryRequest sabitidir. Kod bunu ayırt etmiyordu; üstüne bir de gerçek
+RFC 8446 key schedule yerine `0xAA/0xBB/0xCC/0xDD` placeholder key/IV seti ile
+`TlsSession` üretip handshake tamamlandı diyordu.
+
+**Kök Sebep:** İki ayrı varsayım hatası vardı:
+1. `msg_type == server_hello` ise bunun mutlaka final ServerHello olduğu varsayıldı
+2. Shared secret, HKDF key schedule ve Finished doğrulaması olmadan application traffic keys varmış gibi davranıldı
+
+**Kaynak:** RFC 8446, Section 4.1.3 — HelloRetryRequest special random value
+**Kaynak:** RFC 8446, Section 4.4 — server Finished tamamlanmadan handshake bitmez
+**Kaynak:** RFC 8446, Section 7 — key schedule required before application data keys exist
+
+**Düzeltme:**
+1. HRR random sabiti eklendi ve gelen `server_random` bu değere karşı doğrulanıyor
+2. HRR görülürse `error.HelloRetryRequestUnsupported` ile fail-fast davranışı eklendi
+3. Final ServerHello gelse bile gerçek key schedule uygulanmadıkça `error.TlsKeyScheduleUnimplemented` dönülüyor
+4. Placeholder TLS key üretimi tamamen kaldırıldı
+
+**Tekrar olmaması için:**
+- `Session established` logu ancak gerçek Finished + key schedule sonrası üretilebilir
+- `server_hello` msg_type tek başına “handshake complete” anlamına gelmez
+- RFC 8446 Section 7 uygulanmadan hiçbir HTTP/2/TLS application data gönderilmemeli
+
+---
+
+## [2026-04-08] — Module 3.1: HTTP/2 HEADERS Preface Olmadan Gönderiliyordu
+
+**Tetikleyici:** GitHub signup GET isteği `ReadTimeout` ile düşüyordu
+**Dosyalar:** `src/network_core.zig`
+**Tip:** Runtime protocol error — TLS handshake sonrası doğrudan HTTP/2 HEADERS gönderiliyordu
+
+---
+
+### Hata: performGet connection preface ve initial SETTINGS olmadan request başlatıyordu
+
+**Hata:** `performGet` TLS session kurulunca ilk application-data kaydı olarak doğrudan
+HTTP/2 HEADERS frame gönderiyordu. Client connection preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`)
+ve onu izleyen zorunlu SETTINGS frame hiç gönderilmiyordu.
+
+**Kök Sebep:** HTTP/2 connection state machine eksikti. `src/http2_core.zig` içinde
+preface ve SETTINGS builder'ları olmasına rağmen `src/network_core.zig` bunları request akışına
+bağlamıyordu. Sonuç olarak peer, ilk HEADERS frame'ini geçerli bir HTTP/2 oturumu olarak kabul etmiyordu.
+
+**Kaynak:** RFC 9113, Section 3.4 — client connection preface
+**Kaynak:** RFC 9113, Section 6.5 — SETTINGS frame connection başlangıcında zorunlu
+**Kaynak:** RFC 9113, Section 6.5.3 — recipient MUST immediately emit SETTINGS ACK
+
+**Düzeltme:**
+1. `GitHubHttpClient.ensureHttp2ConnectionReady()` eklendi
+2. Akış `Preface -> empty SETTINGS -> server SETTINGS wait -> SETTINGS ACK -> GET HEADERS` olarak düzeltildi
+3. Server SETTINGS gelmezse `error.Http2PrefaceFailed` ile fail-fast davranışı eklendi
+4. GET request stream ID yönetimi `next_stream_id` ile odd-numbered olacak şekilde stateful hale getirildi
+5. Raw inbound packet içinden gerçek TCP payload çıkarılıp TLS record oradan okunacak yardımcılar eklendi
+
+**Tekrar olmaması için:**
+- İlk request'ten önce `inspectHttp2ServerPreface` testleri çalışmalı
+- `performGet` içine yeni frame eklenirse bootstrap sırası korunmalı
+- Aynı TCP/TLS oturumunda preface yalnızca bir kez gönderilmeli
+
+---
+
+## [2026-04-08] — Module 3.1: ServerHello Cipher Suite Offset Hatası (0x0000)
+
+**Tetikleyici:** Module 3.1 — Identity Forgery & BDA Synthesis, TLS 1.3 cipher suite extraction
+**Dosyalar:** `src/network_core.zig` (completeHandshakeFull fonksiyonu)
+**Tip:** Runtime hatası — "Cipher suite: 0x0000" logu görüldü, TLS 1.3 için imkansız
+
+---
+
+### Hata: completeHandshakeFull yanlış offset ile cipher suite'u 0x0000 olarak okuyordu
+
+**Hata:** `completeHandshakeFull` içinde ServerHello parsing yapılırken cipher suite offset'i yanlış hesaplandı.
+Log'da "Cipher suite: 0x0000" görünüyordu ki bu TLS 1.3 için imkansız (geçerli değerler: 0x1301-0x1305).
+
+**Kök Sebep:** TLS wire format katmanları yanlış hesaplandı:
+- TLS Record Header: 5 bytes (`payload[0..5]`)
+- Handshake Header: 4 bytes (`payload[5..9]`)
+- ServerHello Body: `payload[9..]`
+
+Eski kod `payload[6..]` kullanıyordu, yani handshake header'ın son byte'ını ServerHello body'nin ilk byte'ı olarak okuyordu.
+Bu tüm offset kaymasını yarattı ve cipher suite 0x0000 olarak döndü.
+
+**Yanlış Kod:**
+```zig
+const sh_body = payload[6..]; // After TLS record header ← YANLIŞ!
+// sh_body[0] aslında handshake header'ın msg_type byte'ı (0x02)
+```
+
+**Doğru Kod:**
+```zig
+const sh_body = payload[9..]; // Skip TLS record header (5) + handshake header (4) ← DOĞRU
+// sh_body[0] artık legacy_version byte'ı (0x03)
+```
+
+**Kaynak:** RFC 8446, Section 5.1 — TLSPlaintext structure (5 byte record header)
+**Kaynak:** RFC 8446, Section 4 — Handshake protocol (4 byte handshake header)
+**Kaynak:** RFC 8446, Section 4.1.3 — ServerHello structure (legacy_version offset = 0)
+
+**Düzeltme:**
+1. `payload[6..]` → `payload[9..]` olarak düzeltildi
+2. ServerHello body minimum boyut kontrolü: `sh_body.len >= 35` (version(2) + random(32) + sid_len(1))
+3. Cipher suite extraction: `cs_offset = 35 + sid_len`
+4. Hata durumunda detaylı log: "ServerHello too short for cipher suite"
+
+**Eklenen Belgeler:**
+- `// SOURCE:` yorumları her offset için RFC referansları eklendi
+- Comptime assert: `MIN_SERVERHELLO_LEN == 46` (minimum ServerHello boyutu)
+- TLS 1.3 cipher suite doğrulama: 0x1301-0x1305 arası geçerli
+
+**Tekrar olmaması için:**
+- AGENTS.md Section 2.1: Ham byte offset kullanımı yasaktır
+- Tüm offsetler `packed struct` veya dinamik hesaplamadan türetilir
+- Her TLS parsing fonksiyonu için RFC referanslı offset constant'ları kullanılmalıdır
+
+---
+
+## [2026-04-08] — Module 3.1: Engine Shutdown Before Payload Execution
+
+**Tetikleyici:** Module 3.1 execution — HTTP GET request gönderilmeden engine kapanıyordu
+**Dosyalar:** `src/main.zig`, `src/network_core.zig`
+**Tip:** Runtime logic error — handshake tamamlandıktan sonra performGet çağrılmıyordu
+
+---
+
+### Hata: main.zig handshake'den sonra shutdown'a geçiyordu, performGet hiç çağrılmıyordu
+
+**Hata:** `main.zig` içinde handshake tamamlandıktan sonra HTTP/2 frame hazırlanıp log'lanıyordu ama
+**gerçek request gönderilmiyordu**. Engine direkt shutdown'a geçiyordu.
+
+**Kök Sebep:** Execution flow eksikti:
+```zig
+// ÖNCEKİ (YANLIŞ):
+const handshake = try network.completeHandshakeFull(...);
+// ... HPACK frame hazırla ...
+const github_client = network.GitHubHttpClient.initFromHandshake(...);
+// Log'lar göster ...
+// SHUTDOWN — performGet hiç çağrılmadı!
+```
+
+**Doğru Kod:**
+```zig
+const response = try github_client.performGet(allocator, "https://github.com/signup");
+defer allocator.free(response);
+// Parse ve display decrypted HTML response
+```
+
+**Ek Düzeltmeler:**
+
+1. **Command Line Simplification:**
+   - Önceki: `sudo ./ghost_engine <interface> <dest_ip> <dest_port>`
+   - Yeni: `sudo ./ghost_engine <interface>` (hedef GitHub hardcoded)
+
+2. **Zig 0.16 API Uyumluluk:**
+   - `posix.write(fd, buf)` → `std.os.linux.write(fd, buf.ptr, buf.len)`
+   - `posix.read(fd, buf)` → `std.os.linux.read(fd, buf.ptr, buf.len)`
+   - `posix.read` error union dönmüyordu, errno check eklendi (EAGAIN = -11)
+
+3. **HttpResponse Field Names:**
+   - `status_text` → `reason_phrase`
+   - `headers` → `headers_start`
+
+4. **Visibility Fixes:**
+   - `performGet` fonksiyonu `pub fn` yapıldı (main.zig'den erişim için)
+
+**Kaynak:** RFC 7540, Section 3.2 — Starting HTTP/2 with Prior Knowledge
+**Kaynak:** man 2 read/write — POSIX syscall semantics
+
+**Düzeltme:**
+- `main.zig` execution flow'a `performGet` → `decryptRecord` → HTML display eklendi
+- Command line argument parsing simplified (sadece interface name)
+- Tüm Zig 0.16 API uyumsuzlukları düzeltildi
+
+**Beklenen Çıktı:**
+```
+[MODULE 3.1] Handshake complete! Cipher suite: 0x1301
+[HTTP/2] Requesting: https://github.com/signup
+[RESPONSE] Status: 200 OK
+[HTML BODY - First 1000 bytes]:
+<!DOCTYPE html>...
+```
+
+---
+
 ## [2026-04-08] — Module 3.3: HTTP Cookie Parsing & Redirect Loop Bug
 
 **Tetikleyici:** Module 3.3 — Onboarding Bypass & Session Persistence implementasyonu
@@ -805,4 +1000,3 @@ if (total_len > MTU_LIMIT) {
 *Son güncelleme: 2026-04-07*
 *Güncelleyen: Module 3.1 implementasyonu*
 *Tetikleyen: Zig 0.16.0-dev.3135 API uyumluluk testleri*
-

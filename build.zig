@@ -66,8 +66,14 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
+    } else {
+        // Default interface if no args provided
+        run_cmd.addArg("enp37s0");
     }
 
     const run_step = b.step("run", "Run the ghost engine");
     run_step.dependOn(&run_cmd.step);
+
+    // Convenience: zig build run -- <interface>
+    // Or with default: zig build run
 }

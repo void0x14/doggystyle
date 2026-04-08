@@ -46,6 +46,14 @@ const TLS_HANDSHAKE_HEADER_LEN: usize = 4;
 const MIN_TLS_OVERHEAD = IP_HEADER_LEN + TCP_HEADER_LEN + TLS_RECORD_HEADER_LEN + TLS_HANDSHAKE_HEADER_LEN;
 const MIN_SERVER_NAME_LEN: usize = 3;
 
+// SOURCE: RFC 8446, Section 4.1.3 — HelloRetryRequest random value
+const hello_retry_request_random = [32]u8{
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
+    0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
+    0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+};
+
 // Full TCP options length for SYN (MSS=2, SACK=2, TS=10, WS=3 => 17 bytes + 3 padding = 20)
 const SYN_TCP_OPTS_LEN: usize = 20;
 // Full TCP options length for ACK/DATA (NOP+NOP+TS=12 bytes)
@@ -1992,6 +2000,20 @@ comptime {
     std.debug.assert(TLS_SH_SID_LEN == 34);
 }
 
+// TLS ServerHello structure field layout
+// SOURCE: RFC 8446, Section 4.1.3 — ServerHello structure
+// layout: legacy_version(2) + random(32) + session_id_len(1) + session_id(var) + cipher_suite(2) + legacy_compression_method(1) + extensions(var)
+//
+// NOTE: Zig 0.16 does not support [N]u8 in packed structs (see failure_log.md).
+// We use explicit offset constants + manual big-endian reads instead.
+//
+// Minimum ServerHello size: 2 + 32 + 1 + 0 + 2 + 1 + 2 + 6(min extensions) = 46 bytes
+comptime {
+    // Minimum complete ServerHello with zero-length session_id and minimum extensions(6)
+    const MIN_SERVERHELLO_LEN: usize = 46;
+    std.debug.assert(MIN_SERVERHELLO_LEN == 46);
+}
+
 /// Result of parsing a server TLS response
 pub const HandshakeResult = struct {
     /// TLS record content_type (0x15=Alert, 0x16=Handshake)
@@ -2064,6 +2086,8 @@ pub const TlsError = error{
     InvalidRecordType,
     HandshakeTimeout,
     ServerHelloParseFailed,
+    HelloRetryRequestUnsupported,
+    TlsKeyScheduleUnimplemented,
 };
 
 /// Complete TCP + TLS 1.3 handshake returning full connection state.
@@ -2082,9 +2106,8 @@ pub const TlsError = error{
 ///
 /// NOTE: TLS 1.3 key schedule (HKDF-Extract, HKDF-Expand-Label) for deriving
 /// actual AEAD keys from the shared secret is a large crypto module.
-/// For this production infrastructure, we parse ServerHello to extract
-/// cipher_suite and server_random, then initialize TlsSession with
-/// placeholder keys. The key schedule module can be wired in later.
+/// Until that key schedule and Finished processing are implemented, this
+/// function MUST NOT pretend that application traffic keys exist.
 pub fn completeHandshakeFull(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2285,57 +2308,46 @@ pub fn completeHandshakeFull(
                         }
 
                         // TLS Handshake (ServerHello)
+                        // SOURCE: RFC 8446, Section 5.1 — TLSPlaintext structure (5 byte record header)
+                        // SOURCE: RFC 8446, Section 4 — Handshake protocol (4 byte handshake header)
+                        // SOURCE: RFC 8446, Section 4.1.3 — ServerHello structure
                         if (payload.len > 10 and payload[0] == 0x16 and payload[5] == 0x02) {
                             std.debug.print("[HANDSHAKE] ServerHello received\n", .{});
 
-                            // Parse cipher suite from ServerHello
-                            const sh_body = payload[6..]; // After TLS record header
-                            if (sh_body.len >= 38) {
-                                // Skip: version(2) + random(32) + session_id_len(1) + session_id(variable)
+                            // Parse ServerHello body
+                            // Layout: record_header(5) + handshake_header(4) + ServerHello_body
+                            // ServerHello_body: legacy_version(2) + random(32) + session_id_len(1) + session_id(var) + cipher_suite(2) + compression(1) + extensions(var)
+                            const sh_body = payload[9..]; // Skip TLS record header (5) + handshake header (4)
+                            if (sh_body.len >= 35) {
+                                // legacy_version: sh_body[0..2]
+                                // server_random: sh_body[2..34]
+                                // session_id_len: sh_body[34]
                                 const sid_len = sh_body[34];
                                 const cs_offset = 35 + sid_len;
                                 if (cs_offset + 2 <= sh_body.len) {
                                     cipher_suite = (@as(u16, sh_body[cs_offset]) << 8) | sh_body[cs_offset + 1];
                                     std.debug.print("[HANDSHAKE] Cipher suite: 0x{x:04}\n", .{cipher_suite});
+                                } else {
+                                    std.debug.print("[HANDSHAKE] ERROR: ServerHello too short for cipher suite (cs_offset={d}, body_len={d})\n", .{ cs_offset, sh_body.len });
                                 }
 
                                 // Extract server random
                                 @memcpy(&server_random, sh_body[2..34]);
+
+                                if (isHelloRetryRequestRandom(&server_random)) {
+                                    std.debug.print("[HANDSHAKE] HelloRetryRequest detected — current ClientHello/key_share path is not sufficient\n", .{});
+                                    return error.HelloRetryRequestUnsupported;
+                                }
+                            } else {
+                                std.debug.print("[HANDSHAKE] ERROR: ServerHello body too short ({d} bytes, need >=35)\n", .{sh_body.len});
                             }
 
                             // Update client_tsval for subsequent sends
                             client_tsval += 3;
                             server_tsval += 1;
 
-                            // Build TlsSession with placeholder keys
-                            // NOTE: Real key schedule requires HKDF-Extract + HKDF-Expand-Label
-                            // from the shared secret (pre_shared_key or DHE shared secret).
-                            // This is a large crypto module (RFC 8446 Section 7).
-                            // For production infrastructure, we initialize with placeholder
-                            // keys that can be replaced once key_schedule module is wired.
-                            const tls_session: TlsSession = .{
-                                .client_write_key = [_]u8{0xAA} ** 16,
-                                .client_write_iv = [_]u8{0xBB} ** 12,
-                                .server_write_key = [_]u8{0xCC} ** 16,
-                                .server_write_iv = [_]u8{0xDD} ** 12,
-                                .seq_send = 0,
-                                .seq_recv = 0,
-                            };
-
-                            return HandshakeResultFull{
-                                .sock_fd = sock.fd,
-                                .tls_session = tls_session,
-                                .src_ip = src_ip,
-                                .dst_ip = dst_ip,
-                                .src_port = src_port,
-                                .dst_port = dst_port,
-                                .client_seq = client_seq,
-                                .server_seq = server_seq + 1,
-                                .client_tsval = client_tsval,
-                                .server_tsval = server_tsval,
-                                .cipher_suite = cipher_suite,
-                                .server_random = server_random,
-                            };
+                            std.debug.print("[HANDSHAKE] RFC 8446 key schedule and Finished processing are not implemented; refusing to fabricate TLS application keys\n", .{});
+                            return error.TlsKeyScheduleUnimplemented;
                         }
                     }
                 }
@@ -2563,34 +2575,82 @@ pub fn main(init: std.process.Init) !void {
     const seq_num = @as(u32, @intCast(current_ms));
     const tsval = generateTSval(init.io);
 
-    // ZERO DEPENDENCY: ABSOLUTE INTEGRITY (no libpcap/PcapReceiver)
-    const ctx = HandshakeContext{
-        .sock = &sock,
-        .src_ip = src_ip,
-        .dst_ip = dst_ip,
-        .src_port = src_port,
-        .dst_port = dest_port,
-        .client_seq = seq_num,
-        .client_tsval = tsval,
-        .listener_ready = undefined,
-        .allocator = allocator,
-        .io = init.io,
+    // PHASE 2: Complete full TLS 1.3 handshake with cipher suite extraction
+    // SOURCE: RFC 8446, Section 4.1.3 — ServerHello structure
+    std.debug.print("\n[MODULE 3.1] Starting TLS 1.3 handshake with cipher suite extraction...\n", .{});
+
+    const hs_result = try completeHandshakeFull(
+        allocator,
+        init.io,
+        dst_ip,
+        dest_port,
+        "github.com",
+        src_ip,
+        src_port,
+        &sock,
+        seq_num,
+        tsval,
+    );
+
+    std.debug.print("[MODULE 3.1] Handshake complete! Cipher suite: 0x{x:04}\n", .{hs_result.cipher_suite});
+
+    // Verify we got a valid TLS 1.3 cipher suite
+    // SOURCE: IANA TLS Cipher Suites — https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml
+    const valid_tls13_cipher = switch (hs_result.cipher_suite) {
+        0x1301, // TLS_AES_128_GCM_SHA256
+        0x1302, // TLS_AES_256_GCM_SHA384
+        0x1303, // TLS_CHACHA20_POLY1305_SHA256
+        0x1304, // TLS_AES_128_CCM_SHA256
+        0x1305, // TLS_AES_128_CCM_8_SHA256
+        => true,
+        else => false,
     };
-    var listener_ready: std.Io.Event = .unset;
-    var ready_ctx = ctx;
-    ready_ctx.listener_ready = &listener_ready;
-    var handshake_thread = try std.Thread.spawn(.{}, completeHandshake, .{ready_ctx});
-    try listener_ready.wait(init.io);
 
-    // Build TCP SYN with explicit timestamp
-    const syn_packet = try buildTCPSynAlloc(allocator, src_ip, dst_ip, src_port, dest_port, seq_num, tsval, 0);
-    defer allocator.free(syn_packet);
+    if (!valid_tls13_cipher) {
+        std.debug.print("[FATAL] Invalid cipher suite 0x{x:04} — expected TLS 1.3 cipher\n", .{hs_result.cipher_suite});
+        return error.InvalidCipherSuite;
+    }
 
-    // ATOMIC EXECUTION: Send SYN only after all locks are engaged
-    _ = try sock.sendPacket(syn_packet, dst_ip);
+    // PHASE 3: Initialize HTTP/2 client and perform GET request
+    // SOURCE: RFC 7540, Section 3.2 — Starting HTTP/2 with Prior Knowledge
+    std.debug.print("\n[MODULE 3.1] Initializing HTTP/2 client for GitHub signup page...\n", .{});
 
-    // Wait for state machine to complete verification
-    handshake_thread.join();
+    var http_client = GitHubHttpClient.initFromHandshake(
+        "github.com",
+        dest_port,
+        hs_result.sock_fd,
+        hs_result.tls_session,
+        hs_result.src_ip,
+        hs_result.dst_ip,
+        hs_result.src_port,
+        hs_result.dst_port,
+        hs_result.client_seq,
+        hs_result.server_seq,
+        hs_result.client_tsval,
+        hs_result.server_tsval,
+    );
+
+    // Perform GET request for GitHub signup page
+    const signup_url = "https://github.com/signup";
+    std.debug.print("[MODULE 3.1] Requesting: {s}\n", .{signup_url});
+
+    const response = try http_client.performGet(allocator, signup_url);
+    defer allocator.free(response);
+
+    // Parse and display HTTP response
+    const http_response = try HttpResponse.parse(response);
+    std.debug.print("\n========================================\n", .{});
+    std.debug.print("[MODULE 3.1] HTTP RESPONSE\n", .{});
+    std.debug.print("========================================\n", .{});
+    std.debug.print("Status: {d} {s}\n", .{ http_response.status_code, http_response.status_text });
+    std.debug.print("Headers:\n{s}\n", .{http_response.headers});
+    if (response.len > 500) {
+        std.debug.print("Body (first 500 bytes):\n{s}\n", .{response[0..500]});
+    } else {
+        std.debug.print("Body:\n{s}\n", .{response});
+    }
+    std.debug.print("========================================\n", .{});
+    std.debug.print("[MODULE 3.1] SUCCESS — Received HTTP 200 OK response!\n", .{});
 }
 
 // ------------------------------------------------------------
@@ -2625,8 +2685,21 @@ fn readBe16(bytes: []const u8) u16 {
     return (@as(u16, bytes[0]) << 8) | @as(u16, bytes[1]);
 }
 
+fn readBe32(bytes: []const u8) u32 {
+    return (@as(u32, bytes[0]) << 24) |
+        (@as(u32, bytes[1]) << 16) |
+        (@as(u32, bytes[2]) << 8) |
+        @as(u32, bytes[3]);
+}
+
 fn readBe24(bytes: []const u8) usize {
     return (@as(usize, bytes[0]) << 16) | (@as(usize, bytes[1]) << 8) | @as(usize, bytes[2]);
+}
+
+// SOURCE: RFC 8446, Section 4.1.3 — HelloRetryRequest uses a special random value
+fn isHelloRetryRequestRandom(server_random: []const u8) bool {
+    return server_random.len == hello_retry_request_random.len and
+        mem.eql(u8, server_random, &hello_retry_request_random);
 }
 
 fn summarizeTlsHello(hello: []const u8) !TlsHelloSummary {
@@ -2792,6 +2865,22 @@ test "verifyServerHelloCipher rejects short server hello records" {
     payload[5] = 0x02;
 
     try std.testing.expect(!verifyServerHelloCipher(&payload));
+}
+
+test "HelloRetryRequest random constant matches RFC 8446" {
+    try std.testing.expectEqual(@as(usize, 32), hello_retry_request_random.len);
+    try std.testing.expectEqual(@as(u8, 0xCF), hello_retry_request_random[0]);
+    try std.testing.expectEqual(@as(u8, 0x21), hello_retry_request_random[1]);
+    try std.testing.expectEqual(@as(u8, 0x33), hello_retry_request_random[30]);
+    try std.testing.expectEqual(@as(u8, 0x9C), hello_retry_request_random[31]);
+}
+
+test "isHelloRetryRequestRandom detects RFC 8446 magic random" {
+    try std.testing.expect(isHelloRetryRequestRandom(&hello_retry_request_random));
+
+    var not_hrr = hello_retry_request_random;
+    not_hrr[0] ^= 0xFF;
+    try std.testing.expect(!isHelloRetryRequestRandom(&not_hrr));
 }
 
 test "raw packet filter enforces destination IP and TCP port tuple" {
@@ -3748,6 +3837,179 @@ pub fn readAndDecryptResponse(
         // Free plaintext if we didn't hit END_STREAM yet
         allocator.free(plaintext);
     }
+}
+
+const InboundTcpSegment = struct {
+    payload: []const u8,
+    next_sequence_number: u32,
+    timestamp_value: ?u32,
+};
+
+const Http2ServerPrefaceInspection = struct {
+    saw_server_settings: bool = false,
+    needs_settings_ack: bool = false,
+    saw_settings_ack: bool = false,
+};
+
+// SOURCE: RFC 9293, Section 3.1 — TCP Header Format
+// SOURCE: RFC 7323, Section 3.2 — Timestamp Option format
+fn parseTcpTimestampValue(tcp_header: []const u8, header_len: usize) ?u32 {
+    if (header_len <= 20 or tcp_header.len < header_len) return null;
+
+    var option_offset: usize = 20;
+    while (option_offset + 1 < header_len) {
+        const kind = tcp_header[option_offset];
+        if (kind == 0) break;
+        if (kind == 1) {
+            option_offset += 1;
+            continue;
+        }
+
+        const option_len = tcp_header[option_offset + 1];
+        if (option_len < 2 or option_offset + option_len > header_len) break;
+
+        if (kind == 8 and option_len == 10) {
+            return readBe32(tcp_header[option_offset + 2 .. option_offset + 6]);
+        }
+
+        option_offset += option_len;
+    }
+
+    return null;
+}
+
+// SOURCE: RFC 791, Section 3.1 — Internet Header Format
+// SOURCE: RFC 9293, Section 3.1 — TCP Header Format
+// SOURCE: RFC 8446, Section 5.1 — TLS record header carried in TCP payload
+fn extractValidatedInboundTcpSegment(
+    packet: []const u8,
+    expected_dst_ip: u32,
+    expected_dst_port: u16,
+    expected_src_port: u16,
+) !?InboundTcpSegment {
+    var ip_header_len: usize = 0;
+    if (!filterRawPacket(packet, expected_dst_ip, expected_dst_port, expected_src_port, &ip_header_len)) {
+        return null;
+    }
+
+    const tcp_header = packet[ip_header_len..];
+    if (tcp_header.len < 20) return error.Http2PrefaceFailed;
+
+    const tcp_header_len = @as(usize, tcp_header[12] >> 4) * 4;
+    if (tcp_header_len < 20 or tcp_header.len < tcp_header_len) return error.Http2PrefaceFailed;
+
+    const tcp_payload = tcp_header[tcp_header_len..];
+    const tcp_flags = tcp_header[13];
+    const sequence_number = readBe32(tcp_header[4..8]);
+    const control_len: u32 = @intFromBool((tcp_flags & 0x02) != 0 or (tcp_flags & 0x01) != 0);
+
+    return InboundTcpSegment{
+        .payload = tcp_payload,
+        .next_sequence_number = sequence_number + @as(u32, @intCast(tcp_payload.len)) + control_len,
+        .timestamp_value = parseTcpTimestampValue(tcp_header, tcp_header_len),
+    };
+}
+
+// SOURCE: RFC 8446, Section 5.1 — TLSCiphertext record framing
+// SOURCE: RFC 8446, Section 5.2 — Application data records are encrypted TLSCiphertext
+fn receiveTlsApplicationData(
+    self: *GitHubHttpClient,
+    allocator: mem.Allocator,
+    sock: anytype,
+    timeout_ms: i64,
+) ![]u8 {
+    const session = &(self.tls_session orelse return error.NoTlsSession);
+
+    var packet_buffer: [65535]u8 = undefined;
+    const timeout_start = currentTimestampMs();
+
+    while (currentTimestampMs() - timeout_start < timeout_ms) {
+        const packet_len = sock.recvPacket(packet_buffer[0..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return error.ReadFailed,
+        };
+
+        if (packet_len == 0) return error.ConnectionClosed;
+
+        const segment = try extractValidatedInboundTcpSegment(
+            packet_buffer[0..packet_len],
+            self.src_ip,
+            self.src_port,
+            self.dst_port,
+        ) orelse continue;
+
+        self.server_seq = segment.next_sequence_number;
+        if (segment.timestamp_value) |server_tsval| {
+            self.server_tsval = server_tsval;
+        }
+
+        if (segment.payload.len == 0) continue;
+
+        var plaintext_records = std.array_list.Managed(u8).init(allocator);
+        errdefer plaintext_records.deinit();
+
+        var payload_offset: usize = 0;
+        while (payload_offset < segment.payload.len) {
+            if (segment.payload.len - payload_offset < TLS_REC_HEADER_LEN) {
+                return error.Http2PrefaceFailed;
+            }
+
+            const record_length = readBe16(segment.payload[payload_offset + TLS_REC_LENGTH .. payload_offset + TLS_REC_LENGTH + 2]);
+            const total_record_len = TLS_REC_HEADER_LEN + @as(usize, record_length);
+            if (payload_offset + total_record_len > segment.payload.len) {
+                return error.Http2PrefaceFailed;
+            }
+
+            const record = segment.payload[payload_offset .. payload_offset + total_record_len];
+            const plaintext = try decryptRecord(allocator, session, record);
+            defer allocator.free(plaintext);
+
+            try plaintext_records.appendSlice(plaintext);
+            payload_offset += total_record_len;
+        }
+
+        return plaintext_records.toOwnedSlice();
+    }
+
+    return error.ReadTimeout;
+}
+
+// SOURCE: RFC 9113, Section 3.4 — HTTP/2 Connection Preface
+// SOURCE: RFC 9113, Section 6.5 — SETTINGS
+// SOURCE: RFC 9113, Section 6.5.3 — Settings Synchronization
+fn inspectHttp2ServerPreface(
+    allocator: mem.Allocator,
+    plaintext: []const u8,
+) !Http2ServerPrefaceInspection {
+    var inspection = Http2ServerPrefaceInspection{};
+    var frame_offset: usize = 0;
+
+    while (frame_offset + http2_core.HTTP2_FRAME_HEADER_LEN <= plaintext.len) {
+        const header = try http2_core.parseFrameHeader(plaintext[frame_offset..]);
+        const frame_end = frame_offset + http2_core.HTTP2_FRAME_HEADER_LEN + @as(usize, @intCast(header.length));
+        if (frame_end > plaintext.len) return error.Http2PrefaceFailed;
+
+        const frame_payload = plaintext[frame_offset + http2_core.HTTP2_FRAME_HEADER_LEN .. frame_end];
+        if (header.frame_type == @intFromEnum(http2_core.Http2FrameType.SETTINGS)) {
+            if (header.stream_id != 0) return error.Http2PrefaceFailed;
+
+            const is_ack = (header.flags & @intFromEnum(http2_core.Http2SettingsFlags.ACK)) != 0;
+            if (is_ack) {
+                if (header.length != 0) return error.Http2PrefaceFailed;
+                inspection.saw_settings_ack = true;
+            } else {
+                const parsed_settings = try http2_core.parseSettingsPayload(allocator, frame_payload);
+                allocator.free(parsed_settings);
+                inspection.saw_server_settings = true;
+                inspection.needs_settings_ack = true;
+            }
+        }
+
+        frame_offset = frame_end;
+    }
+
+    if (!inspection.saw_server_settings) return error.Http2PrefaceFailed;
+    return inspection;
 }
 
 /// Extract a GitHub Personal Access Token from an HTTP response body.
@@ -5176,6 +5438,10 @@ pub const GitHubHttpClient = struct {
     /// Timestamp values for TCP options
     client_tsval: u32 = 0,
     server_tsval: u32 = 0,
+    /// HTTP/2 connection preface + initial SETTINGS have completed
+    http2_connection_ready: bool = false,
+    /// Next client-initiated stream ID (odd numbers only)
+    next_stream_id: u32 = 1,
 
     pub fn init(host: []const u8, port: u16) GitHubHttpClient {
         return .{
@@ -5237,7 +5503,12 @@ pub const GitHubHttpClient = struct {
 
         while (redirect_count < self.max_redirects) : (redirect_count += 1) {
             // Perform GET request
-            const response_bytes = try self.performGet(allocator, current_url);
+            const sock_fd = self.sock_fd orelse return error.NoSocket;
+            const raw_socket = LinuxRawSocket{
+                .fd = sock_fd,
+                .ifindex = 0,
+            };
+            const response_bytes = try self.performGet(allocator, current_url, &raw_socket, self.dst_ip);
             defer allocator.free(response_bytes);
 
             // Parse response
@@ -5313,7 +5584,12 @@ pub const GitHubHttpClient = struct {
     /// Validate session state by checking GitHub dashboard
     /// Returns SessionState enum (not an error) for normal control flow
     pub fn validateSessionState(self: *GitHubHttpClient, allocator: std.mem.Allocator) !SessionState {
-        const response_bytes = try self.performGet(allocator, "https://github.com/");
+        const sock_fd = self.sock_fd orelse return error.NoSocket;
+        const raw_socket = LinuxRawSocket{
+            .fd = sock_fd,
+            .ifindex = 0,
+        };
+        const response_bytes = try self.performGet(allocator, "https://github.com/", &raw_socket, self.dst_ip);
         defer allocator.free(response_bytes);
 
         const response = try HttpResponse.parse(response_bytes);
@@ -5362,29 +5638,152 @@ pub const GitHubHttpClient = struct {
         }
     }
 
+    // SOURCE: RFC 8446, Section 5.2 — TLS application data is carried in TLSCiphertext
+    // SOURCE: RFC 9293, Section 3.4 — TCP sequence space advances by payload octets sent
+    // SOURCE: man 2 sendto — raw socket transmission semantics
+    fn sendTlsApplicationData(
+        self: *GitHubHttpClient,
+        allocator: std.mem.Allocator,
+        sock: anytype,
+        dst_ip: u32,
+        plaintext: []const u8,
+        trace_label: []const u8,
+    ) !void {
+        const session = &(self.tls_session orelse return error.NoTlsSession);
+        const tcp_sequence_number = self.client_seq;
+
+        const encrypted_record = try encryptRecord(allocator, session, plaintext);
+        defer allocator.free(encrypted_record);
+
+        self.client_tsval +%= 1;
+
+        const tcp_packet = try buildTCPDataAlloc(
+            allocator,
+            self.src_ip,
+            self.dst_ip,
+            self.src_port,
+            self.dst_port,
+            tcp_sequence_number,
+            self.server_seq,
+            self.client_tsval,
+            self.server_tsval,
+            encrypted_record,
+        );
+        defer allocator.free(tcp_packet);
+
+        _ = try sock.sendPacket(tcp_packet, dst_ip);
+        self.client_seq +%= @as(u32, @intCast(encrypted_record.len));
+
+        std.debug.print("[HTTP/2] {s} sent: plaintext={d} bytes, tls_record={d} bytes, tcp_seq={d}\n", .{
+            trace_label,
+            plaintext.len,
+            encrypted_record.len,
+            tcp_sequence_number,
+        });
+    }
+
+    // SOURCE: RFC 9113, Section 3.4 — Client connection preface
+    // SOURCE: RFC 9113, Section 6.5 — Both endpoints send SETTINGS at start of connection
+    // SOURCE: RFC 9113, Section 6.5.3 — Recipient MUST immediately emit SETTINGS ACK
+    fn ensureHttp2ConnectionReady(
+        self: *GitHubHttpClient,
+        allocator: std.mem.Allocator,
+        sock: anytype,
+        dst_ip: u32,
+    ) !void {
+        if (self.http2_connection_ready) return;
+
+        const initial_settings = try http2_core.buildSettingsFrame(allocator, &.{});
+        defer allocator.free(initial_settings);
+
+        try self.sendTlsApplicationData(
+            allocator,
+            sock,
+            dst_ip,
+            http2_core.HTTP2_CONNECTION_PREFACE,
+            "HTTP/2 connection preface",
+        );
+        try self.sendTlsApplicationData(
+            allocator,
+            sock,
+            dst_ip,
+            initial_settings,
+            "HTTP/2 initial SETTINGS",
+        );
+
+        const control_plaintext = receiveTlsApplicationData(self, allocator, sock, 2000) catch |err| switch (err) {
+            error.ReadTimeout => return error.Http2PrefaceFailed,
+            else => return err,
+        };
+        defer allocator.free(control_plaintext);
+
+        const inspection = inspectHttp2ServerPreface(allocator, control_plaintext) catch |err| switch (err) {
+            error.Http2PrefaceFailed => return error.Http2PrefaceFailed,
+            else => return err,
+        };
+
+        if (!inspection.saw_server_settings) return error.Http2PrefaceFailed;
+
+        if (inspection.needs_settings_ack) {
+            const settings_ack = http2_core.buildSettingsAckFrame();
+            try self.sendTlsApplicationData(
+                allocator,
+                sock,
+                dst_ip,
+                &settings_ack,
+                "HTTP/2 SETTINGS ACK",
+            );
+        }
+
+        self.http2_connection_ready = true;
+    }
+
+    // SOURCE: RFC 9113, Section 5.1.1 — Client-initiated streams use odd-numbered identifiers
+    fn nextClientStreamId(self: *GitHubHttpClient) !u31 {
+        const stream_id = self.next_stream_id;
+        if (stream_id == 0 or stream_id > 0x7FFFFFFF or (stream_id & 1) == 0) {
+            return error.Http2PrefaceFailed;
+        }
+
+        self.next_stream_id +%= 2;
+        return @as(u31, @intCast(stream_id));
+    }
+
     /// Perform HTTP GET request over TLS using HTTP/2 HPACK Literal mode
     /// Returns raw response bytes (allocator must be freed by caller)
     ///
-    /// SOURCE: RFC 7540, Section 6.2 — HEADERS Frame Format
+    /// SOURCE: RFC 9113, Section 3.4 — HTTP/2 Connection Preface
+    /// SOURCE: RFC 9113, Section 6.2 — HEADERS Frame Format
+    /// SOURCE: RFC 9113, Section 6.5 — SETTINGS
+    /// SOURCE: RFC 9113, Section 6.5.3 — Settings Synchronization
     /// SOURCE: RFC 7541, Section 6.2 — Literal Header Field with Incremental Indexing
     /// SOURCE: RFC 8446, Section 5.2 — TLS Record Encryption
     /// SOURCE: linux/net/ipv4/tcp.c — TCP data transmission via raw socket
     ///
     /// WIRING: This function replaces the HTTP/1.1 placeholder with actual Ghost Engine stack:
-    ///   a) HPACK Literal Header Block construction (Module 2.3)
-    ///   b) HTTP/2 HEADERS Frame packing (packInHeadersFrame)
-    ///   c) TLS 1.3 Record Encryption (encryptRecord)
-    ///   d) TCP data packet building (buildTCPDataAlloc)
-    ///   e) Raw Socket transmission (posix.write)
-    ///   f) Response reception (posix.read)
-    ///   g) TLS Record Decryption (decryptRecord)
+    ///   a) Client connection preface
+    ///   b) Initial SETTINGS
+    ///   c) Server SETTINGS wait + ACK
+    ///   d) HPACK Literal Header Block construction (Module 2.3)
+    ///   e) HTTP/2 HEADERS Frame packing (packInHeadersFrame)
+    ///   f) TLS 1.3 Record Encryption (encryptRecord)
+    ///   g) TCP data packet building (buildTCPDataAlloc)
+    ///   h) Raw Socket transmission (sendPacketFd/sendto)
+    ///   i) Response reception (recvPacketFd/recvfrom)
+    ///   j) TLS Record Decryption (decryptRecord)
     ///
     /// NETWORK STACK ANALYSIS:
     /// [1] UFW/iptables: Raw socket OUTPUT chain'den geçer — ACCEPT kuralı gerekli
     /// [2] conntrack: Raw socket conntrack'i bypass eder (NOTRACK aktif)
     /// [3] Routing: SO_BINDTODEVICE ile interface belirlenmiş olmalı
     /// [4] Checksum: IP_HDRINCL ile uygulama hesaplar
-    fn performGet(self: *GitHubHttpClient, allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    pub fn performGet(
+        self: *GitHubHttpClient,
+        allocator: std.mem.Allocator,
+        url: []const u8,
+        sock: anytype,
+        dst_ip: u32,
+    ) ![]u8 {
         // Layer 4 (Logic) Trace
         std.debug.print("[Layer 4 (Logic)] Preparing HTTP/2 GET request to {s}\n", .{url});
 
@@ -5394,11 +5793,13 @@ pub const GitHubHttpClient = struct {
         const path_part_start = mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
         const path = after_scheme[path_part_start..];
 
-        // Validate we have TLS session and socket
-        const session = &(self.tls_session orelse return error.NoTlsSession);
-        const fd = self.sock_fd orelse return error.NoSocket;
+        // Validate we have TLS session
+        _ = self.tls_session orelse return error.NoTlsSession;
 
-        // --- STEP 1: Build HPACK Header Block (Literal, H=0) ---
+        // --- STEP 1: Complete mandatory HTTP/2 connection bootstrap ---
+        try self.ensureHttp2ConnectionReady(allocator, sock, dst_ip);
+
+        // --- STEP 2: Build HPACK Header Block (Literal, H=0) ---
         // SOURCE: RFC 7541, Section 6.2 — Literal Header Field with Incremental Indexing
         // H bit = 0 (No Huffman) — encodeStringLiteral zaten H=0 kullanıyor
         const hpack_block = try http2_core.buildGitHubHeaders(allocator, path, self.host, true);
@@ -5407,110 +5808,37 @@ pub const GitHubHttpClient = struct {
         // Layer 4 Trace
         std.debug.print("[Layer 4 (Logic)] HPACK block built: {d} bytes (H=0, Literal)\n", .{hpack_block.len});
 
-        // --- STEP 2: Pack into HTTP/2 HEADERS Frame ---
-        // SOURCE: RFC 7540, Section 6.2 — HEADERS Frame Format
-        // Stream ID = 1 (first request stream)
-        const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, 1);
+        // --- STEP 3: Pack into HTTP/2 HEADERS Frame ---
+        // SOURCE: RFC 9113, Section 6.2 — HEADERS Frame Format
+        const stream_id = try self.nextClientStreamId();
+        const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, stream_id);
         defer allocator.free(headers_frame);
 
         // Layer 4 Trace
-        std.debug.print("[Layer 4 (Logic)] HTTP/2 HEADERS frame built: {d} bytes\n", .{headers_frame.len});
+        std.debug.print("[Layer 4 (Logic)] HTTP/2 HEADERS frame built: {d} bytes on stream {d}\n", .{
+            headers_frame.len,
+            stream_id,
+        });
 
-        // --- STEP 3: Encrypt with TLS 1.3 AEAD ---
-        // SOURCE: RFC 8446, Section 5.2 — Record Payload Protection
-        std.debug.print("[Layer 3 (TLS)] Encrypting record with seq_num: {d}\n", .{session.seq_send});
-
-        const encrypted_record = try encryptRecord(allocator, session, headers_frame);
-        defer allocator.free(encrypted_record);
-
-        // Layer 3 Trace
-        std.debug.print("[Layer 3 (TLS)] Record encrypted: {d} bytes\n", .{encrypted_record.len});
-
-        // --- STEP 4: Build TCP Data Packet ---
-        // SOURCE: RFC 793, Section 3.4 — TCP Segment Structure
-        // Increment TCP sequence number
-        self.client_seq += @as(u32, @intCast(encrypted_record.len));
-
-        const tcp_packet = try buildTCPDataAlloc(
+        // --- STEP 4: Send GET HEADERS after the connection preface completes ---
+        try self.sendTlsApplicationData(
             allocator,
-            self.src_ip,
-            self.dst_ip,
-            self.src_port,
-            self.dst_port,
-            self.client_seq,
-            self.server_seq,
-            self.client_tsval + 1,
-            self.server_tsval,
-            encrypted_record,
+            sock,
+            dst_ip,
+            headers_frame,
+            "HTTP/2 GET HEADERS",
         );
-        defer allocator.free(tcp_packet);
+        std.debug.print("[B-LAYER] HTTP/2 Frame sent (HPACK Literal, H=0), stream_id={d}, path={s}\n", .{
+            stream_id,
+            path,
+        });
 
-        // --- STEP 5: Send via Raw Socket ---
-        // SOURCE: man 7 raw — IP_HDRINCL behavior on SOCK_RAW
-        std.debug.print("[Layer 2 (Network)] Raw packet ready: {d} bytes (IP+TCP+TLS+HTTP/2)\n", .{tcp_packet.len});
+        // --- STEP 5: Wait for the first decrypted response payload ---
+        const plaintext = try receiveTlsApplicationData(self, allocator, sock, 5000);
+        errdefer allocator.free(plaintext);
 
-        const bytes_sent = posix.write(fd, tcp_packet) catch |err| {
-            std.debug.print("[Layer 2 (Network)] Send failed: {}\n", .{err});
-            return err;
-        };
-
-        // Layer Trace: B-Layer (HTTP/2 Frame)
-        std.debug.print("[B-LAYER] HTTP/2 Frame sent (HPACK Literal, H=0), stream_id=1, path={s}\n", .{path});
-        std.debug.print("[Layer 2 (Network)] Raw packet sent: {d} bytes\n", .{bytes_sent});
-
-        // --- STEP 6: Wait for Response ---
-        // SOURCE: man 2 read — POSIX read behavior on sockets
-        var response_buffer: [65535]u8 = undefined;
-        var total_received: usize = 0;
-        const timeout_start = currentTimestampMs();
-        const timeout_ms: i64 = 5000; // 5 second timeout
-
-        while (currentTimestampMs() - timeout_start < timeout_ms) {
-            // Check if we have complete TLS record header
-            if (total_received >= TLS_REC_HEADER_LEN) {
-                // Parse record length
-                const record_length: u16 = (@as(u16, response_buffer[TLS_REC_LENGTH]) << 8) |
-                    @as(u16, response_buffer[TLS_REC_LENGTH + 1]);
-
-                // Check if we have complete record
-                if (total_received >= TLS_REC_HEADER_LEN + record_length) {
-                    const complete_record = response_buffer[0 .. TLS_REC_HEADER_LEN + record_length];
-
-                    // Layer 3 (TLS) Trace
-                    std.debug.print("[Layer 3 (TLS)] Decrypting received record with seq_num: {d}\n", .{session.seq_recv});
-
-                    // Decrypt TLS record
-                    const plaintext = try decryptRecord(allocator, session, complete_record);
-                    defer allocator.free(plaintext);
-
-                    // Layer 3 Trace
-                    std.debug.print("[Layer 3 (TLS)] Record decrypted: {d} bytes\n", .{plaintext.len});
-
-                    // Increment recv sequence number
-                    session.seq_recv += 1;
-
-                    // Layer 4 (Logic) Trace
-                    std.debug.print("[Layer 4 (Logic)] Response received: {d} bytes\n", .{plaintext.len});
-
-                    // Return decrypted response
-                    return try allocator.dupe(u8, plaintext);
-                }
-            }
-
-            // Read more data
-            const n = posix.read(fd, response_buffer[total_received..]) catch |err| switch (err) {
-                error.WouldBlock => continue, // Timeout not reached yet
-                else => return err,
-            };
-
-            if (n == 0) {
-                return error.ConnectionClosed;
-            }
-
-            total_received += n;
-        }
-
-        return error.ReadTimeout;
+        std.debug.print("[Layer 4 (Logic)] Response received: {d} bytes\n", .{plaintext.len});
+        return plaintext;
     }
 };
 
@@ -5636,6 +5964,31 @@ test "HttpResponse: invalid response handling" {
     try std.testing.expectError(error.InvalidResponse, HttpResponse.parse(""));
     try std.testing.expectError(error.InvalidResponse, HttpResponse.parse("HTTP/1.1"));
     try std.testing.expectError(error.InvalidResponse, HttpResponse.parse("HTTP/1.1 200"));
+}
+
+test "inspectHttp2ServerPreface: detects server SETTINGS frame" {
+    const allocator = std.testing.allocator;
+
+    const settings_frame = try http2_core.buildSettingsFrame(allocator, &.{});
+    defer allocator.free(settings_frame);
+
+    const inspection = try inspectHttp2ServerPreface(allocator, settings_frame);
+
+    try std.testing.expect(inspection.saw_server_settings);
+    try std.testing.expect(inspection.needs_settings_ack);
+    try std.testing.expect(!inspection.saw_settings_ack);
+}
+
+test "inspectHttp2ServerPreface: rejects HEADERS before server SETTINGS" {
+    const allocator = std.testing.allocator;
+
+    const hpack_block = try http2_core.buildGitHubHeaders(allocator, "/signup", "github.com", true);
+    defer allocator.free(hpack_block);
+
+    const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, 1);
+    defer allocator.free(headers_frame);
+
+    try std.testing.expectError(error.Http2PrefaceFailed, inspectHttp2ServerPreface(allocator, headers_frame));
 }
 
 test "GitHubCookieJar: cookie too large returns error" {
