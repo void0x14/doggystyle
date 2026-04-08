@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "ghost_engine",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/network_core.zig"),
+            .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
         }),

@@ -852,7 +852,8 @@ pub const LiteralHeaderFieldNeverIndexed = struct {
 ///
 /// SOURCE: RFC 7541, Appendix A — Static Table
 /// Kullanılan Indexed Header Fields:
-///   - :method: POST (Index 3) → 1 0000011 = 0x83
+///   - :method: GET (Index 2) → 1 0000010 = 0x82  [GET request için]
+///   - :method: POST (Index 3) → 1 0000011 = 0x83 [POST request için]
 ///   - :scheme: https (Index 7) → 1 0000111 = 0x87
 ///
 /// Kullanılan Literal Header Fields with Incremental Indexing:
@@ -864,17 +865,21 @@ pub const LiteralHeaderFieldNeverIndexed = struct {
 /// Chrome v146 Linux User-Agent string:
 /// SOURCE: Chrome 146 UA pattern (common Chrome UA database)
 /// "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+///
+/// PARAM use_get: true ise :method: GET (Index 2), false ise :method: POST (Index 3)
 pub fn buildGitHubHeaders(
     allocator: mem.Allocator,
     path: []const u8,
     authority: []const u8,
+    use_get: bool,
 ) ![]u8 {
     const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
     const accept_value = "*/*";
 
-    // 1. :method: POST (Indexed, Index 3)
-    // SOURCE: RFC 7541, Appendix A, Index 3
-    const indexed_method = IndexedHeaderField{ .index = 3 };
+    // 1. :method: GET (Indexed, Index 2) veya POST (Indexed, Index 3)
+    // SOURCE: RFC 7541, Appendix A, Index 2 (GET) / Index 3 (POST)
+    const method_index: u64 = if (use_get) 2 else 3;
+    const indexed_method = IndexedHeaderField{ .index = method_index };
     const encoded_method = try indexed_method.encode(allocator);
     defer allocator.free(encoded_method);
 
@@ -1176,7 +1181,7 @@ test "LiteralHeaderFieldIncrementalIndexing: name indexed, value literal" {
 test "buildGitHubHeaders: HPACK block structure doğrulaması" {
     const allocator = std.testing.allocator;
 
-    const block = try buildGitHubHeaders(allocator, "/octocat/repo", "github.com");
+    const block = try buildGitHubHeaders(allocator, "/octocat/repo", "github.com", false);
     defer allocator.free(block);
 
     // İlk byte: Indexed :method: POST (0x83)
@@ -1190,6 +1195,20 @@ test "buildGitHubHeaders: HPACK block structure doğrulaması" {
 
     // HPACK block en az 6 header'dan oluşmalı (her biri en az 1-2 byte)
     try std.testing.expect(block.len >= 10);
+}
+
+test "buildGitHubHeaders: GET method için 0x82 kullanır" {
+    const allocator = std.testing.allocator;
+
+    const block = try buildGitHubHeaders(allocator, "/login", "github.com", true);
+    defer allocator.free(block);
+
+    // İlk byte: Indexed :method: GET (0x82)
+    // SOURCE: RFC 7541, Appendix A, Index 2
+    try std.testing.expectEqual(@as(u8, 0x82), block[0]);
+
+    // İkinci byte: Indexed :scheme: https (0x87)
+    try std.testing.expectEqual(@as(u8, 0x87), block[1]);
 }
 
 test "packInHeadersFrame: HEADERS frame byte-alignment" {
@@ -1238,8 +1257,8 @@ test "packInHeadersFrame: stream_id 0 assertion" {
 test "round-trip: buildGitHubHeaders → packInHeadersFrame → parse" {
     const allocator = std.testing.allocator;
 
-    // 1. HPACK block oluştur
-    const hpack_block = try buildGitHubHeaders(allocator, "/test/repo", "github.com");
+    // 1. HPACK block oluştur (POST için use_get=false)
+    const hpack_block = try buildGitHubHeaders(allocator, "/test/repo", "github.com", false);
     defer allocator.free(hpack_block);
 
     // 2. HEADERS frame'e yerleştir
