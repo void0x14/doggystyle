@@ -2410,6 +2410,8 @@ pub const HandshakeResultFull = struct {
     cipher_suite: u16,
     /// Server random (for key schedule verification)
     server_random: [32]u8,
+    /// TLSCiphertext bytes already received after server Finished but not yet consumed
+    pending_server_tls_ciphertext: []const u8,
 };
 
 fn currentTimestampMs() i64 {
@@ -2948,6 +2950,12 @@ pub fn completeHandshakeFull(
                                                             std.debug.print("[HANDSHAKE] CertificateVerify message was present, but certificate chain/signature validation is not implemented yet\n", .{});
                                                         }
 
+                                                        const pending_ciphertext_start = record_offset + total_record_len;
+                                                        const pending_ciphertext = if (pending_ciphertext_start < tls_record_buffer.items.len)
+                                                            try allocator.dupe(u8, tls_record_buffer.items[pending_ciphertext_start..])
+                                                        else
+                                                            &.{};
+
                                                         std.debug.print("[HANDSHAKE] TLS 1.3 Finished verified; application traffic keys established\n", .{});
                                                         return HandshakeResultFull{
                                                             .sock_fd = sock.fd,
@@ -2965,6 +2973,7 @@ pub fn completeHandshakeFull(
                                                             .server_tsval = server_tsval,
                                                             .cipher_suite = cipher_suite,
                                                             .server_random = server_random,
+                                                            .pending_server_tls_ciphertext = pending_ciphertext,
                                                         };
                                                     },
                                                     else => return error.UnexpectedHandshakeType,
@@ -3268,6 +3277,7 @@ pub fn main(init: std.process.Init) !void {
         dest_port,
         hs_result.sock_fd,
         hs_result.tls_session,
+        hs_result.pending_server_tls_ciphertext,
         hs_result.src_ip,
         hs_result.dst_ip,
         hs_result.src_port,
@@ -4667,6 +4677,7 @@ pub fn readAndDecryptResponse(
 }
 
 const InboundTcpSegment = struct {
+    sequence_number: u32,
     payload: []const u8,
     next_sequence_number: u32,
     timestamp_value: ?u32,
@@ -4676,6 +4687,8 @@ const Http2ServerPrefaceInspection = struct {
     saw_server_settings: bool = false,
     needs_settings_ack: bool = false,
     saw_settings_ack: bool = false,
+    bytes_consumed: usize = 0,
+    needs_more_bytes: bool = false,
 };
 
 // SOURCE: RFC 9293, Section 3.1 — TCP Header Format
@@ -4731,9 +4744,33 @@ fn extractValidatedInboundTcpSegment(
     const control_len: u32 = @intFromBool((tcp_flags & 0x02) != 0 or (tcp_flags & 0x01) != 0);
 
     return InboundTcpSegment{
+        .sequence_number = sequence_number,
         .payload = tcp_payload,
         .next_sequence_number = sequence_number + @as(u32, @intCast(tcp_payload.len)) + control_len,
         .timestamp_value = parseTcpTimestampValue(tcp_header, tcp_header_len),
+    };
+}
+
+const PendingInboundPayload = struct {
+    payload: []const u8,
+    next_sequence_number: u32,
+    timestamp_value: ?u32,
+};
+
+// SOURCE: RFC 9293, Section 3.4 — TCP sequence numbers count octets in the byte stream
+// SOURCE: RFC 9293, Section 3.10.7 — retransmitted octets may arrive again and must not be re-consumed
+fn selectFreshInboundPayload(segment: InboundTcpSegment, expected_sequence: u32) ?PendingInboundPayload {
+    if (segment.payload.len == 0) return null;
+
+    const payload_end = segment.sequence_number + @as(u32, @intCast(segment.payload.len));
+    if (payload_end <= expected_sequence) return null;
+    if (segment.sequence_number > expected_sequence) return null;
+
+    const overlap_len = expected_sequence - segment.sequence_number;
+    return .{
+        .payload = segment.payload[@as(usize, @intCast(overlap_len))..],
+        .next_sequence_number = segment.next_sequence_number,
+        .timestamp_value = segment.timestamp_value,
     };
 }
 
@@ -4749,6 +4786,16 @@ fn receiveTlsApplicationData(
 
     var packet_buffer: [65535]u8 = undefined;
     const timeout_start = currentTimestampMs();
+    var tls_record_buffer = std.array_list.Managed(u8).init(allocator);
+    defer tls_record_buffer.deinit();
+    var plaintext_records = std.array_list.Managed(u8).init(allocator);
+    errdefer plaintext_records.deinit();
+
+    if (self.pending_server_tls_ciphertext.len > 0) {
+        try tls_record_buffer.appendSlice(self.pending_server_tls_ciphertext);
+        allocator.free(self.pending_server_tls_ciphertext);
+        self.pending_server_tls_ciphertext = &.{};
+    }
 
     while (currentTimestampMs() - timeout_start < timeout_ms) {
         const packet_len = sock.recvPacket(packet_buffer[0..]) catch |err| switch (err) {
@@ -4765,37 +4812,64 @@ fn receiveTlsApplicationData(
             self.dst_port,
         ) orelse continue;
 
-        self.server_seq = segment.next_sequence_number;
-        if (segment.timestamp_value) |server_tsval| {
+        const fresh_payload = selectFreshInboundPayload(segment, self.server_seq) orelse continue;
+
+        self.server_seq = fresh_payload.next_sequence_number;
+        if (fresh_payload.timestamp_value) |server_tsval| {
             self.server_tsval = server_tsval;
         }
 
-        if (segment.payload.len == 0) continue;
+        try sendTcpAckForState(
+            allocator,
+            sock,
+            self.dst_ip,
+            self.src_ip,
+            self.src_port,
+            self.dst_port,
+            self.client_seq,
+            self.server_seq,
+            &self.client_tsval,
+            self.server_tsval,
+        );
 
-        var plaintext_records = std.array_list.Managed(u8).init(allocator);
-        errdefer plaintext_records.deinit();
+        try tls_record_buffer.appendSlice(fresh_payload.payload);
 
-        var payload_offset: usize = 0;
-        while (payload_offset < segment.payload.len) {
-            if (segment.payload.len - payload_offset < TLS_REC_HEADER_LEN) {
-                return error.Http2PrefaceFailed;
-            }
-
-            const record_length = readBe16(segment.payload[payload_offset + TLS_REC_LENGTH .. payload_offset + TLS_REC_LENGTH + 2]);
+        var record_offset: usize = 0;
+        while (tls_record_buffer.items.len - record_offset >= TLS_REC_HEADER_LEN) {
+            const record_length = readBe16(
+                tls_record_buffer.items[record_offset + TLS_REC_LENGTH .. record_offset + TLS_REC_LENGTH + 2],
+            );
             const total_record_len = TLS_REC_HEADER_LEN + @as(usize, record_length);
-            if (payload_offset + total_record_len > segment.payload.len) {
-                return error.Http2PrefaceFailed;
+            if (tls_record_buffer.items.len - record_offset < total_record_len) break;
+
+            const record = tls_record_buffer.items[record_offset .. record_offset + total_record_len];
+            const decrypted = try decryptRecordWithInnerType(allocator, session, record);
+            defer allocator.free(decrypted.plaintext);
+
+            // SOURCE: RFC 8446, Section 4.6 — post-handshake messages such as NewSessionTicket are Handshake content
+            // SOURCE: RFC 8446, Section 5.2 — TLSInnerPlaintext.content_type distinguishes handshake from application_data
+            switch (decrypted.inner_content_type) {
+                0x17 => try plaintext_records.appendSlice(decrypted.plaintext),
+                0x16 => {},
+                0x15 => return error.TlsAlertReceived,
+                else => {},
             }
-
-            const record = segment.payload[payload_offset .. payload_offset + total_record_len];
-            const plaintext = try decryptRecord(allocator, session, record);
-            defer allocator.free(plaintext);
-
-            try plaintext_records.appendSlice(plaintext);
-            payload_offset += total_record_len;
+            record_offset += total_record_len;
         }
 
-        return plaintext_records.toOwnedSlice();
+        if (record_offset > 0) {
+            const remaining_len = tls_record_buffer.items.len - record_offset;
+            mem.copyForwards(
+                u8,
+                tls_record_buffer.items[0..remaining_len],
+                tls_record_buffer.items[record_offset..],
+            );
+            tls_record_buffer.items.len = remaining_len;
+        }
+
+        if (plaintext_records.items.len > 0) {
+            return plaintext_records.toOwnedSlice();
+        }
     }
 
     return error.ReadTimeout;
@@ -4814,9 +4888,17 @@ fn inspectHttp2ServerPreface(
     while (frame_offset + http2_core.HTTP2_FRAME_HEADER_LEN <= plaintext.len) {
         const header = try http2_core.parseFrameHeader(plaintext[frame_offset..]);
         const frame_end = frame_offset + http2_core.HTTP2_FRAME_HEADER_LEN + @as(usize, @intCast(header.length));
-        if (frame_end > plaintext.len) return error.Http2PrefaceFailed;
+        if (frame_end > plaintext.len) {
+            inspection.bytes_consumed = frame_offset;
+            inspection.needs_more_bytes = true;
+            return inspection;
+        }
 
         const frame_payload = plaintext[frame_offset + http2_core.HTTP2_FRAME_HEADER_LEN .. frame_end];
+        if (!inspection.saw_server_settings and header.frame_type != @intFromEnum(http2_core.Http2FrameType.SETTINGS)) {
+            return error.Http2PrefaceFailed;
+        }
+
         if (header.frame_type == @intFromEnum(http2_core.Http2FrameType.SETTINGS)) {
             if (header.stream_id != 0) return error.Http2PrefaceFailed;
 
@@ -4835,7 +4917,12 @@ fn inspectHttp2ServerPreface(
         frame_offset = frame_end;
     }
 
-    if (!inspection.saw_server_settings) return error.Http2PrefaceFailed;
+    inspection.bytes_consumed = frame_offset;
+    if (frame_offset < plaintext.len) {
+        inspection.needs_more_bytes = true;
+    }
+
+    if (!inspection.saw_server_settings and !inspection.needs_more_bytes) return error.Http2PrefaceFailed;
     return inspection;
 }
 
@@ -6250,6 +6337,8 @@ pub const GitHubHttpClient = struct {
     sock_fd: ?posix.socket_t = null,
     /// TLS session state (keys, IVs, sequence numbers)
     tls_session: ?TlsSession = null,
+    /// TLSCiphertext bytes buffered during handshake return path
+    pending_server_tls_ciphertext: []const u8 = &.{},
     /// Next sequence number for TCP (incremented after each send)
     client_seq: u32 = 0,
     /// Server sequence number (from SYN-ACK)
@@ -6283,6 +6372,7 @@ pub const GitHubHttpClient = struct {
         port: u16,
         sock_fd: posix.socket_t,
         session: TlsSession,
+        pending_server_tls_ciphertext: []const u8,
         src_ip: u32,
         dst_ip: u32,
         src_port: u16,
@@ -6297,6 +6387,7 @@ pub const GitHubHttpClient = struct {
             .port = port,
             .sock_fd = sock_fd,
             .tls_session = session,
+            .pending_server_tls_ciphertext = pending_server_tls_ciphertext,
             .src_ip = src_ip,
             .dst_ip = dst_ip,
             .src_port = src_port,
@@ -6538,31 +6629,55 @@ pub const GitHubHttpClient = struct {
             "HTTP/2 initial SETTINGS",
         );
 
-        const control_plaintext = receiveTlsApplicationData(self, allocator, sock, 2000) catch |err| switch (err) {
-            error.ReadTimeout => return error.Http2PrefaceFailed,
-            else => return err,
-        };
-        defer allocator.free(control_plaintext);
+        var control_plaintext = std.array_list.Managed(u8).init(allocator);
+        defer control_plaintext.deinit();
+        const timeout_start = currentTimestampMs();
 
-        const inspection = inspectHttp2ServerPreface(allocator, control_plaintext) catch |err| switch (err) {
-            error.Http2PrefaceFailed => return error.Http2PrefaceFailed,
-            else => return err,
-        };
+        while (currentTimestampMs() - timeout_start < 2000) {
+            const remaining_timeout = 2000 - (currentTimestampMs() - timeout_start);
+            const chunk = receiveTlsApplicationData(self, allocator, sock, remaining_timeout) catch |err| switch (err) {
+                error.ReadTimeout => return error.Http2PrefaceFailed,
+                else => return err,
+            };
+            defer allocator.free(chunk);
 
-        if (!inspection.saw_server_settings) return error.Http2PrefaceFailed;
+            try control_plaintext.appendSlice(chunk);
 
-        if (inspection.needs_settings_ack) {
-            const settings_ack = http2_core.buildSettingsAckFrame();
-            try self.sendTlsApplicationData(
-                allocator,
-                sock,
-                dst_ip,
-                &settings_ack,
-                "HTTP/2 SETTINGS ACK",
-            );
+            const inspection = inspectHttp2ServerPreface(allocator, control_plaintext.items) catch |err| switch (err) {
+                error.Http2PrefaceFailed => return error.Http2PrefaceFailed,
+                else => return err,
+            };
+
+            if (inspection.saw_server_settings) {
+                if (inspection.needs_settings_ack) {
+                    const settings_ack = http2_core.buildSettingsAckFrame();
+                    try self.sendTlsApplicationData(
+                        allocator,
+                        sock,
+                        dst_ip,
+                        &settings_ack,
+                        "HTTP/2 SETTINGS ACK",
+                    );
+                }
+
+                self.http2_connection_ready = true;
+                return;
+            }
+
+            if (inspection.bytes_consumed > 0) {
+                const remaining_len = control_plaintext.items.len - inspection.bytes_consumed;
+                mem.copyForwards(
+                    u8,
+                    control_plaintext.items[0..remaining_len],
+                    control_plaintext.items[inspection.bytes_consumed..],
+                );
+                control_plaintext.items.len = remaining_len;
+            }
+
+            if (!inspection.needs_more_bytes) return error.Http2PrefaceFailed;
         }
 
-        self.http2_connection_ready = true;
+        return error.Http2PrefaceFailed;
     }
 
     // SOURCE: RFC 9113, Section 5.1.1 — Client-initiated streams use odd-numbered identifiers
@@ -6665,6 +6780,19 @@ pub const GitHubHttpClient = struct {
         errdefer allocator.free(plaintext);
 
         std.debug.print("[Layer 4 (Logic)] Response received: {d} bytes\n", .{plaintext.len});
+        var frame_offset: usize = 0;
+        while (frame_offset + http2_core.HTTP2_FRAME_HEADER_LEN <= plaintext.len) {
+            const header = try http2_core.parseFrameHeader(plaintext[frame_offset..]);
+            const frame_end = frame_offset + http2_core.HTTP2_FRAME_HEADER_LEN + @as(usize, @intCast(header.length));
+            if (frame_end > plaintext.len) break;
+            std.debug.print("[HTTP/2] Response frame type=0x{x:02} flags=0x{x:02} stream={d} length={d}\n", .{
+                header.frame_type,
+                header.flags,
+                header.stream_id,
+                header.length,
+            });
+            frame_offset = frame_end;
+        }
         return plaintext;
     }
 };
@@ -6816,6 +6944,57 @@ test "inspectHttp2ServerPreface: rejects HEADERS before server SETTINGS" {
     defer allocator.free(headers_frame);
 
     try std.testing.expectError(error.Http2PrefaceFailed, inspectHttp2ServerPreface(allocator, headers_frame));
+}
+
+test "inspectHttp2ServerPreface: incomplete SETTINGS frame waits for more bytes" {
+    const allocator = std.testing.allocator;
+
+    const settings_frame = try http2_core.buildSettingsFrame(allocator, &.{
+        .{
+            .identifier = @intFromEnum(http2_core.SettingsIdentifier.MAX_FRAME_SIZE),
+            .value = http2_core.CHROME_SETTINGS_MAX_FRAME_SIZE,
+        },
+    });
+    defer allocator.free(settings_frame);
+
+    const truncated_frame = settings_frame[0 .. settings_frame.len - 3];
+    const inspection = try inspectHttp2ServerPreface(allocator, truncated_frame);
+
+    try std.testing.expect(!inspection.saw_server_settings);
+    try std.testing.expect(inspection.needs_more_bytes);
+    try std.testing.expectEqual(@as(usize, 0), inspection.bytes_consumed);
+}
+
+test "selectFreshInboundPayload trims retransmitted prefix" {
+    const segment = InboundTcpSegment{
+        .sequence_number = 1000,
+        .payload = "abcdef",
+        .next_sequence_number = 1006,
+        .timestamp_value = 1234,
+    };
+
+    const fresh = selectFreshInboundPayload(segment, 1003) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("def", fresh.payload);
+    try std.testing.expectEqual(@as(u32, 1006), fresh.next_sequence_number);
+    try std.testing.expectEqual(@as(?u32, 1234), fresh.timestamp_value);
+}
+
+test "selectFreshInboundPayload drops stale or out-of-order payload" {
+    const stale_segment = InboundTcpSegment{
+        .sequence_number = 1000,
+        .payload = "abc",
+        .next_sequence_number = 1003,
+        .timestamp_value = null,
+    };
+    try std.testing.expect(selectFreshInboundPayload(stale_segment, 1003) == null);
+
+    const gap_segment = InboundTcpSegment{
+        .sequence_number = 1005,
+        .payload = "xyz",
+        .next_sequence_number = 1008,
+        .timestamp_value = null,
+    };
+    try std.testing.expect(selectFreshInboundPayload(gap_segment, 1003) == null);
 }
 
 test "GitHubCookieJar: cookie too large returns error" {

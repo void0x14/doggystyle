@@ -194,6 +194,7 @@ pub fn main(init: std.process.Init) !void {
         target_port,
         handshake.sock_fd,
         handshake.tls_session,
+        handshake.pending_server_tls_ciphertext,
         handshake.src_ip,
         handshake.dst_ip,
         handshake.src_port,

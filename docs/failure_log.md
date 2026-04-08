@@ -6,6 +6,44 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-08] — Module 3.1: HTTP/2 Bootstrap Öncesi TCP/TLS Katmanları Temiz Sanılıyordu
+
+**Tetikleyici:** `Http2PrefaceFailed`, `TlsAeadDecryptFailed`, ardından canlı koşuda HTTP/2 SETTINGS/HEADERS aşamasına kadar ilerleme
+**Dosyalar:** `src/network_core.zig`
+**Tip:** Runtime protocol/state error — raw TCP tekrarları, post-handshake TLS mesajları ve kısmi HTTP/2 frame’ler aynı buffer’da yanlış katmanda ele alınıyordu
+
+---
+
+### Hata: HTTP/2 bootstrap yolu temiz bir frame akışı varsayıyordu
+
+**Hata:** `receiveTlsApplicationData` ve `ensureHttp2ConnectionReady` şu yanlış varsayımları birlikte yapıyordu:
+1. Gelen TCP payload her zaman yeni ve sıralı kabul ediliyordu
+2. Decrypt edilen her TLS application record doğrudan HTTP/2 frame başlangıcı sanılıyordu
+3. `inner_content_type = 0x16` post-handshake TLS mesajları (`NewSessionTicket`) HTTP/2 bytes gibi buffer’a ekleniyordu
+4. Kısmi HTTP/2 frame fatal sanılıyor veya tam record başlangıcı kaybolunca parser sonsuza kadar yanlış uzunluk bekliyordu
+
+**Kök Sebep:** Raw socket kullanırken kernel TCP stream reassembly yapmıyor. Bu yüzden tekrar gelen / örtüşen octet’leri uygulama ayıklamak zorunda. Üstüne TLS 1.3’te server, HTTP/2 SETTINGS’ten önce post-handshake `Handshake` içerikleri gönderebilir. Kod bu katmanları ayırmıyordu.
+
+**Kaynak:** RFC 9293, Section 3.4 — TCP sequence numbers octet stream’i taşır  
+**Kaynak:** RFC 9293, Section 3.10.7 — retransmission/duplicate octets yeniden gelebilir  
+**Kaynak:** RFC 8446, Section 4.6 — NewSessionTicket post-handshake mesajıdır  
+**Kaynak:** RFC 8446, Section 5.2 — TLSInnerPlaintext.content_type handshake/application_data ayrımını yapar  
+**Kaynak:** RFC 9113, Section 4.1 — HTTP/2 frame header + length tam gelmeden frame parse edilemez
+
+**Düzeltme:**
+1. Inbound TCP payload için sequence-aware trimming eklendi; eski/örtüşen octet’ler decrypt’e sokulmuyor
+2. Application receive yoluna explicit ACK gönderimi taşındı
+3. `inner_content_type = 0x16` post-handshake mesajları HTTP/2 plaintext buffer’ına eklenmiyor
+4. HTTP/2 server preface parse yolu kısmi frame’i “need more bytes” olarak ele alıyor
+5. Handshake sonrası elde kalmış TLS ciphertext parçaları `pending_server_tls_ciphertext` ile HTTP/2 katmanına taşınıyor
+
+**Tekrar olmaması için:**
+- Raw socket üstünde “bir packet = yeni temiz stream verisi” varsayımı yapılmayacak
+- TLS `inner_content_type` ayrımı yapılmadan plaintext üst katmana verilmeyecek
+- HTTP/2 frame parse her zaman `9-byte header + declared length` tamamlanınca yapılacak
+
+---
+
 ## [2026-04-08] — Module 3.1: HelloRetryRequest Yanlışlıkla Handshake Tamamlandı Sanılıyordu
 
 **Tetikleyici:** HTTP/2 preface sonrası `TlsRecordTooShort` ve sahte `Session established` logu
