@@ -3287,25 +3287,30 @@ pub fn main(init: std.process.Init) !void {
         hs_result.client_tsval,
         hs_result.server_tsval,
     );
+    defer http_client.deinit(allocator);
 
     // Perform GET request for GitHub signup page
     const signup_url = "https://github.com/signup";
     std.debug.print("[MODULE 3.1] Requesting: {s}\n", .{signup_url});
 
-    const response = try http_client.performGet(allocator, signup_url);
-    defer allocator.free(response);
+    const raw_socket = LinuxRawSocket{
+        .fd = hs_result.sock_fd,
+        .ifindex = 0,
+    };
+    var response = try http_client.performGet(allocator, signup_url, &raw_socket, hs_result.dst_ip);
+    defer response.deinit(allocator);
 
-    // Parse and display HTTP response
-    const http_response = try HttpResponse.parse(response);
     std.debug.print("\n========================================\n", .{});
     std.debug.print("[MODULE 3.1] HTTP RESPONSE\n", .{});
     std.debug.print("========================================\n", .{});
-    std.debug.print("Status: {d} {s}\n", .{ http_response.status_code, http_response.status_text });
-    std.debug.print("Headers:\n{s}\n", .{http_response.headers});
-    if (response.len > 500) {
-        std.debug.print("Body (first 500 bytes):\n{s}\n", .{response[0..500]});
+    std.debug.print("Status: {d}\n", .{response.status_code});
+    for (response.headers) |header| {
+        std.debug.print("{s}: {s}\n", .{ header.name, header.value });
+    }
+    if (response.body.len > 500) {
+        std.debug.print("Body (first 500 bytes):\n{s}\n", .{response.body[0..500]});
     } else {
-        std.debug.print("Body:\n{s}\n", .{response});
+        std.debug.print("Body:\n{s}\n", .{response.body});
     }
     std.debug.print("========================================\n", .{});
     std.debug.print("[MODULE 3.1] SUCCESS — Received HTTP 200 OK response!\n", .{});
@@ -4843,16 +4848,28 @@ fn receiveTlsApplicationData(
             if (tls_record_buffer.items.len - record_offset < total_record_len) break;
 
             const record = tls_record_buffer.items[record_offset .. record_offset + total_record_len];
-            const decrypted = try decryptRecordWithInnerType(allocator, session, record);
-            defer allocator.free(decrypted.plaintext);
+            switch (record[0]) {
+                0x14 => {
+                    // SOURCE: RFC 8446, Appendix D.4 — middlebox compatibility ChangeCipherSpec records contain a single 0x01 byte
+                    if (record_length != 1 or record[TLS_REC_HEADER_LEN] != 0x01) {
+                        return error.UnexpectedContentType;
+                    }
+                },
+                0x17 => {
+                    const decrypted = try decryptRecordWithInnerType(allocator, session, record);
+                    defer allocator.free(decrypted.plaintext);
 
-            // SOURCE: RFC 8446, Section 4.6 — post-handshake messages such as NewSessionTicket are Handshake content
-            // SOURCE: RFC 8446, Section 5.2 — TLSInnerPlaintext.content_type distinguishes handshake from application_data
-            switch (decrypted.inner_content_type) {
-                0x17 => try plaintext_records.appendSlice(decrypted.plaintext),
-                0x16 => {},
+                    // SOURCE: RFC 8446, Section 4.6 — post-handshake messages such as NewSessionTicket are Handshake content
+                    // SOURCE: RFC 8446, Section 5.2 — TLSInnerPlaintext.content_type distinguishes handshake from application_data
+                    switch (decrypted.inner_content_type) {
+                        0x17 => try plaintext_records.appendSlice(decrypted.plaintext),
+                        0x16 => {},
+                        0x15 => return error.TlsAlertReceived,
+                        else => {},
+                    }
+                },
                 0x15 => return error.TlsAlertReceived,
-                else => {},
+                else => return error.UnexpectedContentType,
             }
             record_offset += total_record_len;
         }
@@ -4868,6 +4885,9 @@ fn receiveTlsApplicationData(
         }
 
         if (plaintext_records.items.len > 0) {
+            if (tls_record_buffer.items.len > 0) {
+                self.pending_server_tls_ciphertext = try allocator.dupe(u8, tls_record_buffer.items);
+            }
             return plaintext_records.toOwnedSlice();
         }
     }
@@ -6326,6 +6346,14 @@ pub const HttpResponse = struct {
     }
 };
 
+fn extractCookiesFromHttp2Response(response: *const http2_core.Http2Response, jar: *GitHubCookieJar) !void {
+    for (response.headers) |header| {
+        if (ascii.eqlIgnoreCase(header.name, "set-cookie")) {
+            try jar.setCookie(header.value);
+        }
+    }
+}
+
 /// HTTP Client for GitHub onboarding flow
 /// Manages cookies, redirects, and session validation
 pub const GitHubHttpClient = struct {
@@ -6337,6 +6365,8 @@ pub const GitHubHttpClient = struct {
     sock_fd: ?posix.socket_t = null,
     /// TLS session state (keys, IVs, sequence numbers)
     tls_session: ?TlsSession = null,
+    /// HPACK decoding context for server response headers on this connection
+    hpack_decoder: ?http2_core.HpackDecoder = null,
     /// TLSCiphertext bytes buffered during handshake return path
     pending_server_tls_ciphertext: []const u8 = &.{},
     /// Next sequence number for TCP (incremented after each send)
@@ -6364,6 +6394,17 @@ pub const GitHubHttpClient = struct {
             .host = host,
             .port = port,
         };
+    }
+
+    pub fn deinit(self: *GitHubHttpClient, allocator: std.mem.Allocator) void {
+        if (self.hpack_decoder) |*decoder| {
+            decoder.deinit();
+            self.hpack_decoder = null;
+        }
+        if (self.pending_server_tls_ciphertext.len > 0) {
+            allocator.free(self.pending_server_tls_ciphertext);
+            self.pending_server_tls_ciphertext = &.{};
+        }
     }
 
     /// Initialize client with raw socket and TLS session from handshake
@@ -6426,19 +6467,16 @@ pub const GitHubHttpClient = struct {
                 .fd = sock_fd,
                 .ifindex = 0,
             };
-            const response_bytes = try self.performGet(allocator, current_url, &raw_socket, self.dst_ip);
-            defer allocator.free(response_bytes);
-
-            // Parse response
-            const response = try HttpResponse.parse(response_bytes);
+            var response = try self.performGet(allocator, current_url, &raw_socket, self.dst_ip);
+            defer response.deinit(allocator);
 
             // Extract and store cookies
-            try response.extractCookies(&self.cookie_jar);
+            try extractCookiesFromHttp2Response(&response, &self.cookie_jar);
 
             // Check status code
             if (response.status_code >= 300 and response.status_code < 400) {
                 // Redirect: extract Location header
-                const location = response.locationHeader() orelse return error.MissingLocationHeader;
+                const location = response.headerValue("location") orelse return error.MissingLocationHeader;
 
                 // Resolve relative URL if needed
                 const new_url = try self.resolveUrl(allocator, location);
@@ -6507,17 +6545,15 @@ pub const GitHubHttpClient = struct {
             .fd = sock_fd,
             .ifindex = 0,
         };
-        const response_bytes = try self.performGet(allocator, "https://github.com/", &raw_socket, self.dst_ip);
-        defer allocator.free(response_bytes);
-
-        const response = try HttpResponse.parse(response_bytes);
+        var response = try self.performGet(allocator, "https://github.com/", &raw_socket, self.dst_ip);
+        defer response.deinit(allocator);
 
         // Extract cookies from response
-        try response.extractCookies(&self.cookie_jar);
+        try extractCookiesFromHttp2Response(&response, &self.cookie_jar);
 
         // Check for redirect to /login (session expired)
         if (response.status_code == 302) {
-            const location = response.locationHeader() orelse return .loggedOut;
+            const location = response.headerValue("location") orelse return .loggedOut;
             if (mem.indexOf(u8, location, "/login") != null) {
                 return .expired;
             }
@@ -6692,7 +6728,7 @@ pub const GitHubHttpClient = struct {
     }
 
     /// Perform HTTP GET request over TLS using HTTP/2 HPACK Literal mode
-    /// Returns raw response bytes (allocator must be freed by caller)
+    /// Returns a native HTTP/2 response object.
     ///
     /// SOURCE: RFC 9113, Section 3.4 — HTTP/2 Connection Preface
     /// SOURCE: RFC 9113, Section 6.2 — HEADERS Frame Format
@@ -6725,7 +6761,7 @@ pub const GitHubHttpClient = struct {
         url: []const u8,
         sock: anytype,
         dst_ip: u32,
-    ) ![]u8 {
+    ) !http2_core.Http2Response {
         // Layer 4 (Logic) Trace
         std.debug.print("[Layer 4 (Logic)] Preparing HTTP/2 GET request to {s}\n", .{url});
 
@@ -6737,6 +6773,9 @@ pub const GitHubHttpClient = struct {
 
         // Validate we have TLS session
         _ = self.tls_session orelse return error.NoTlsSession;
+        if (self.hpack_decoder == null) {
+            self.hpack_decoder = http2_core.HpackDecoder.init(allocator);
+        }
 
         // --- STEP 1: Complete mandatory HTTP/2 connection bootstrap ---
         try self.ensureHttp2ConnectionReady(allocator, sock, dst_ip);
@@ -6775,25 +6814,47 @@ pub const GitHubHttpClient = struct {
             path,
         });
 
-        // --- STEP 5: Wait for the first decrypted response payload ---
-        const plaintext = try receiveTlsApplicationData(self, allocator, sock, 5000);
-        errdefer allocator.free(plaintext);
+        // --- STEP 5: Collect a complete response on the target stream ---
+        var response_parser = http2_core.Http2ResponseParser.init(
+            allocator,
+            &(self.hpack_decoder.?),
+            stream_id,
+        );
+        defer response_parser.deinit();
 
-        std.debug.print("[Layer 4 (Logic)] Response received: {d} bytes\n", .{plaintext.len});
-        var frame_offset: usize = 0;
-        while (frame_offset + http2_core.HTTP2_FRAME_HEADER_LEN <= plaintext.len) {
-            const header = try http2_core.parseFrameHeader(plaintext[frame_offset..]);
-            const frame_end = frame_offset + http2_core.HTTP2_FRAME_HEADER_LEN + @as(usize, @intCast(header.length));
-            if (frame_end > plaintext.len) break;
-            std.debug.print("[HTTP/2] Response frame type=0x{x:02} flags=0x{x:02} stream={d} length={d}\n", .{
-                header.frame_type,
-                header.flags,
-                header.stream_id,
-                header.length,
-            });
-            frame_offset = frame_end;
+        const timeout_start = currentTimestampMs();
+        while (currentTimestampMs() - timeout_start < 5000) {
+            const remaining_timeout = 5000 - (currentTimestampMs() - timeout_start);
+            const plaintext = try receiveTlsApplicationData(self, allocator, sock, remaining_timeout);
+            defer allocator.free(plaintext);
+
+            std.debug.print("[Layer 4 (Logic)] Response chunk received: {d} bytes\n", .{plaintext.len});
+            try response_parser.processApplicationData(plaintext);
+            const window_increment = response_parser.takeWindowUpdateIncrement();
+            if (window_increment > 0) {
+                const connection_window_update = http2_core.buildWindowUpdateFrame(0, window_increment);
+                try self.sendTlsApplicationData(
+                    allocator,
+                    sock,
+                    dst_ip,
+                    &connection_window_update,
+                    "HTTP/2 connection WINDOW_UPDATE",
+                );
+                const stream_window_update = http2_core.buildWindowUpdateFrame(stream_id, window_increment);
+                try self.sendTlsApplicationData(
+                    allocator,
+                    sock,
+                    dst_ip,
+                    &stream_window_update,
+                    "HTTP/2 stream WINDOW_UPDATE",
+                );
+            }
+            if (response_parser.isComplete()) {
+                return try response_parser.finish();
+            }
         }
-        return plaintext;
+
+        return error.ReadTimeout;
     }
 };
 

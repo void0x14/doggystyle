@@ -204,6 +204,7 @@ pub fn main(init: std.process.Init) !void {
         handshake.client_tsval,
         handshake.server_tsval,
     );
+    defer github_client.deinit(allocator);
 
     std.debug.print("[HTTP/2] Client initialized (sock_fd={d})\n", .{github_client.sock_fd.?});
     std.debug.print("[HTTP/2] Requesting: https://{s}{s}\n", .{ target_host, request_path });
@@ -211,11 +212,8 @@ pub fn main(init: std.process.Init) !void {
     // PERFORM THE GET REQUEST — BU KRITIK NOKTA!
     std.debug.print("\n[HTTP/2] Sending GET request and waiting for response...\n", .{});
 
-    const response = try github_client.performGet(allocator, "https://github.com/signup", &sock, dst_ip);
-    defer allocator.free(response);
-
-    // Parse HTTP response
-    const http_response = try network.HttpResponse.parse(response);
+    var response = try github_client.performGet(allocator, "https://github.com/signup", &sock, dst_ip);
+    defer response.deinit(allocator);
 
     // DECRYPT & DISPLAY
     std.debug.print("\n", .{});
@@ -223,17 +221,20 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("║              DECRYPTED HTTP RESPONSE                     ║\n", .{});
     std.debug.print("╚══════════════════════════════════════════════════════════╝\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("[RESPONSE] Status: {d} {s}\n", .{ http_response.status_code, http_response.reason_phrase });
-    std.debug.print("[RESPONSE] Headers:\n{s}\n", .{http_response.headers_start});
+    std.debug.print("[RESPONSE] Status: {d}\n", .{response.status_code});
+    std.debug.print("[RESPONSE] Headers:\n", .{});
+    for (response.headers) |header| {
+        std.debug.print("{s}: {s}\n", .{ header.name, header.value });
+    }
 
     // Display first 1000 bytes of HTML body
-    const display_len = if (response.len > 1000) 1000 else response.len;
+    const display_len = if (response.body.len > 1000) 1000 else response.body.len;
     std.debug.print("\n[HTML BODY - First {d} bytes]:\n", .{display_len});
     std.debug.print("────────────────────────────────────────────────────────────\n", .{});
-    std.debug.print("{s}", .{response[0..display_len]});
+    std.debug.print("{s}", .{response.body[0..display_len]});
     std.debug.print("\n────────────────────────────────────────────────────────────\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("[SUCCESS] Received {d} bytes decrypted HTML response\n", .{response.len});
+    std.debug.print("[SUCCESS] Received {d} bytes decrypted HTML response\n", .{response.body.len});
     std.debug.print("\n", .{});
 
     // =========================================================================

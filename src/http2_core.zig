@@ -1,9 +1,20 @@
 const std = @import("std");
 const mem = std.mem;
+const ascii = std.ascii;
+const hpack_tables = @import("hpack_tables.zig");
 
 const Http2Error = error{
     BufferTooShort,
     InvalidSettingsPayload,
+    InvalidFrame,
+    InvalidHpackInteger,
+    InvalidHpackString,
+    InvalidHpackIndex,
+    InvalidHpackHuffman,
+    InvalidDynamicTableSize,
+    InvalidResponseHeaders,
+    InvalidStatusCode,
+    ResponseIncomplete,
 };
 
 // ============================================================
@@ -1033,6 +1044,590 @@ pub fn packInHeadersFrame(
     return result;
 }
 
+// SOURCE: RFC 9113, Section 6.9 — WINDOW_UPDATE frame carries a 31-bit positive increment
+pub fn buildWindowUpdateFrame(stream_id: u32, increment: u32) [HTTP2_FRAME_HEADER_LEN + 4]u8 {
+    std.debug.assert(stream_id <= 0x7FFFFFFF);
+    std.debug.assert(increment > 0 and increment <= 0x7FFFFFFF);
+
+    var frame: [HTTP2_FRAME_HEADER_LEN + 4]u8 = undefined;
+    @memset(&frame, 0);
+    frame[0] = 0x00;
+    frame[1] = 0x00;
+    frame[2] = 0x04;
+    frame[3] = @intFromEnum(Http2FrameType.WINDOW_UPDATE);
+    frame[4] = 0x00;
+    std.mem.writeInt(u32, frame[5..9], stream_id & 0x7FFFFFFF, .big);
+    std.mem.writeInt(u32, frame[9..13], increment & 0x7FFFFFFF, .big);
+    return frame;
+}
+
+pub const OwnedHeaderField = struct {
+    name: []u8,
+    value: []u8,
+
+    pub fn deinit(self: *OwnedHeaderField, allocator: mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.value);
+    }
+};
+
+pub const Http2Response = struct {
+    status_code: u16,
+    headers: []OwnedHeaderField,
+    body: []u8,
+
+    pub fn deinit(self: *Http2Response, allocator: mem.Allocator) void {
+        for (self.headers) |*header| header.deinit(allocator);
+        allocator.free(self.headers);
+        allocator.free(self.body);
+    }
+
+    pub fn headerValue(self: *const Http2Response, name: []const u8) ?[]const u8 {
+        for (self.headers) |header| {
+            if (ascii.eqlIgnoreCase(header.name, name)) return header.value;
+        }
+        return null;
+    }
+
+    pub fn hasLoggedInClass(self: *const Http2Response) bool {
+        return mem.indexOf(u8, self.body, "logged-in") != null;
+    }
+
+    pub fn extractUserLogin(self: *const Http2Response, buf: []u8) !?[]const u8 {
+        const user_login_marker = "user-login";
+        const content_attr = "content=\"";
+
+        if (mem.indexOf(u8, self.body, user_login_marker)) |marker_pos| {
+            const search_start = marker_pos + user_login_marker.len;
+            if (search_start >= self.body.len) return null;
+
+            const after_marker = mem.indexOf(u8, self.body[search_start..], content_attr) orelse return null;
+            const content_start = search_start + after_marker + content_attr.len;
+            if (content_start >= self.body.len) return null;
+
+            const content_end = mem.indexOfScalarPos(u8, self.body, content_start, '"') orelse return null;
+            const username = self.body[content_start..content_end];
+            if (username.len > buf.len) return error.BufferTooSmall;
+            @memcpy(buf[0..username.len], username);
+            return buf[0..username.len];
+        }
+
+        return null;
+    }
+};
+
+const HpackBorrowedHeaderField = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+const HpackDynamicTableEntry = struct {
+    name: []u8,
+    value: []u8,
+    size: usize,
+
+    fn deinit(self: *HpackDynamicTableEntry, allocator: mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.value);
+    }
+};
+
+const HpackIntegerDecode = struct {
+    value: u64,
+    consumed: usize,
+};
+
+const HpackStringDecode = struct {
+    value: []u8,
+    consumed: usize,
+};
+
+const HpackLiteralHeaderDecode = struct {
+    name: []u8,
+    value: []u8,
+    consumed: usize,
+};
+
+pub const HpackDecoder = struct {
+    allocator: mem.Allocator,
+    dynamic_table: std.array_list.Managed(HpackDynamicTableEntry),
+    current_size: usize = 0,
+    max_size: usize = 4096,
+    protocol_max_size: usize = 4096,
+
+    pub fn init(allocator: mem.Allocator) HpackDecoder {
+        return .{
+            .allocator = allocator,
+            .dynamic_table = std.array_list.Managed(HpackDynamicTableEntry).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *HpackDecoder) void {
+        for (self.dynamic_table.items) |*entry| entry.deinit(self.allocator);
+        self.dynamic_table.deinit();
+    }
+
+    fn clearDynamicTable(self: *HpackDecoder) void {
+        for (self.dynamic_table.items) |*entry| entry.deinit(self.allocator);
+        self.dynamic_table.clearRetainingCapacity();
+        self.current_size = 0;
+    }
+
+    // SOURCE: RFC 7541, Section 2.3.3 — Static and dynamic tables share one index space
+    fn getIndexedHeader(self: *const HpackDecoder, index: u64) !HpackBorrowedHeaderField {
+        if (index == 0) return error.InvalidHpackIndex;
+
+        if (index <= hpack_tables.STATIC_TABLE.len) {
+            const entry = hpack_tables.STATIC_TABLE[index - 1];
+            return .{ .name = entry.name, .value = entry.value };
+        }
+
+        const dynamic_index = index - hpack_tables.STATIC_TABLE.len;
+        if (dynamic_index == 0 or dynamic_index > self.dynamic_table.items.len) {
+            return error.InvalidHpackIndex;
+        }
+
+        const entry = self.dynamic_table.items[dynamic_index - 1];
+        return .{ .name = entry.name, .value = entry.value };
+    }
+
+    // SOURCE: RFC 7541, Section 4.1 — Dynamic table entry size = name length + value length + 32
+    fn entrySize(name: []const u8, value: []const u8) usize {
+        return name.len + value.len + 32;
+    }
+
+    // SOURCE: RFC 7541, Section 4.2 — Maximum table size is bounded by protocol settings
+    // SOURCE: RFC 7541, Section 4.3 — Evict oldest entries when size shrinks
+    fn setDynamicTableSize(self: *HpackDecoder, new_size: u64) !void {
+        if (new_size > self.protocol_max_size) return error.InvalidDynamicTableSize;
+        self.max_size = @intCast(new_size);
+        while (self.current_size > self.max_size and self.dynamic_table.items.len > 0) {
+            var entry = self.dynamic_table.pop().?;
+            self.current_size -= entry.size;
+            entry.deinit(self.allocator);
+        }
+    }
+
+    // SOURCE: RFC 7541, Section 3.2 — Incrementally indexed literals are inserted at the beginning
+    // SOURCE: RFC 7541, Section 4.4 — Oversized new entries empty the table and are not inserted
+    fn insertDynamic(self: *HpackDecoder, name: []const u8, value: []const u8) !void {
+        const size = entrySize(name, value);
+        if (size > self.max_size) {
+            self.clearDynamicTable();
+            return;
+        }
+
+        while (self.current_size + size > self.max_size and self.dynamic_table.items.len > 0) {
+            var evicted = self.dynamic_table.pop().?;
+            self.current_size -= evicted.size;
+            evicted.deinit(self.allocator);
+        }
+
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
+
+        try self.dynamic_table.insert(0, .{
+            .name = owned_name,
+            .value = owned_value,
+            .size = size,
+        });
+        self.current_size += size;
+    }
+
+    // SOURCE: RFC 7541, Section 3.2 — Header block is processed sequentially
+    // SOURCE: RFC 7541, Section 6 — Header field representation formats
+    pub fn decodeHeaderBlock(self: *HpackDecoder, allocator: mem.Allocator, block: []const u8) ![]OwnedHeaderField {
+        var headers = std.array_list.Managed(OwnedHeaderField).init(allocator);
+        errdefer {
+            for (headers.items) |*header| header.deinit(allocator);
+            headers.deinit();
+        }
+
+        var offset: usize = 0;
+        while (offset < block.len) {
+            const first = block[offset];
+            if ((first & 0x80) != 0) {
+                const indexed = try decodeInteger(block[offset..], 7);
+                const field = try self.getIndexedHeader(indexed.value);
+                try headers.append(.{
+                    .name = try allocator.dupe(u8, field.name),
+                    .value = try allocator.dupe(u8, field.value),
+                });
+                offset += indexed.consumed;
+                continue;
+            }
+
+            if ((first & 0x40) != 0) {
+                const literal = try decodeLiteralHeaderField(allocator, self, block[offset..], 6);
+                try headers.append(.{ .name = literal.name, .value = literal.value });
+                try self.insertDynamic(literal.name, literal.value);
+                offset += literal.consumed;
+                continue;
+            }
+
+            if ((first & 0x20) != 0) {
+                const update = try decodeInteger(block[offset..], 5);
+                try self.setDynamicTableSize(update.value);
+                offset += update.consumed;
+                continue;
+            }
+
+            if ((first & 0x10) != 0) {
+                const literal = try decodeLiteralHeaderField(allocator, self, block[offset..], 4);
+                try headers.append(.{ .name = literal.name, .value = literal.value });
+                offset += literal.consumed;
+                continue;
+            }
+
+            const literal = try decodeLiteralHeaderField(allocator, self, block[offset..], 4);
+            try headers.append(.{ .name = literal.name, .value = literal.value });
+            offset += literal.consumed;
+        }
+
+        return headers.toOwnedSlice();
+    }
+};
+
+// SOURCE: RFC 7541, Section 5.1 — Integer Representation
+fn decodeInteger(buf: []const u8, prefix_bits: u4) !HpackIntegerDecode {
+    if (buf.len == 0) return error.InvalidHpackInteger;
+
+    const prefix_mask: u8 = (@as(u8, 1) << @as(u3, @intCast(prefix_bits))) - 1;
+    const first_value = buf[0] & prefix_mask;
+    if (first_value < prefix_mask) {
+        return .{ .value = first_value, .consumed = 1 };
+    }
+
+    var value: u64 = prefix_mask;
+    var shift: u6 = 0;
+    var offset: usize = 1;
+    while (offset < buf.len) : (offset += 1) {
+        const byte = buf[offset];
+        value += @as(u64, byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) {
+            return .{ .value = value, .consumed = offset + 1 };
+        }
+        shift += 7;
+        if (shift >= 63) return error.InvalidHpackInteger;
+    }
+
+    return error.InvalidHpackInteger;
+}
+
+fn isHuffmanPrefix(bits: u32, bit_len: u8) bool {
+    for (hpack_tables.HUFFMAN_CODES, hpack_tables.HUFFMAN_CODE_LENGTHS) |code, code_len| {
+        if (code_len >= bit_len and (code >> @intCast(code_len - bit_len)) == bits) return true;
+    }
+    return false;
+}
+
+// SOURCE: RFC 7541, Section 5.2 — String literals may use the static Huffman code
+// SOURCE: RFC 7541, Appendix B — Canonical code table and EOS padding rules
+fn decodeHuffman(allocator: mem.Allocator, encoded: []const u8) ![]u8 {
+    var decoded = std.array_list.Managed(u8).init(allocator);
+    errdefer decoded.deinit();
+
+    var current: u32 = 0;
+    var current_len: u8 = 0;
+
+    for (encoded) |byte| {
+        var bit_index: i8 = 7;
+        while (bit_index >= 0) : (bit_index -= 1) {
+            current = (current << 1) | @as(u32, @intCast((byte >> @intCast(bit_index)) & 0x01));
+            current_len += 1;
+
+            var matched = false;
+            for (hpack_tables.HUFFMAN_CODES, hpack_tables.HUFFMAN_CODE_LENGTHS, 0..) |code, code_len, symbol| {
+                if (code_len == current_len and code == current) {
+                    if (symbol == 256) return error.InvalidHpackHuffman;
+                    try decoded.append(@intCast(symbol));
+                    current = 0;
+                    current_len = 0;
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched and !isHuffmanPrefix(current, current_len)) {
+                return error.InvalidHpackHuffman;
+            }
+        }
+    }
+
+    if (current_len > 7) return error.InvalidHpackHuffman;
+    if (current_len > 0 and current != ((@as(u32, 1) << @as(u5, @intCast(current_len))) - 1)) {
+        return error.InvalidHpackHuffman;
+    }
+
+    return decoded.toOwnedSlice();
+}
+
+// SOURCE: RFC 7541, Section 5.2 — String Literal Representation
+fn decodeStringLiteral(allocator: mem.Allocator, buf: []const u8) !HpackStringDecode {
+    if (buf.len == 0) return error.InvalidHpackString;
+
+    const is_huffman = (buf[0] & 0x80) != 0;
+    const length = try decodeInteger(buf, 7);
+    const string_len: usize = @intCast(length.value);
+    if (buf.len < length.consumed + string_len) return error.InvalidHpackString;
+
+    const string_bytes = buf[length.consumed .. length.consumed + string_len];
+    const decoded = if (is_huffman)
+        try decodeHuffman(allocator, string_bytes)
+    else
+        try allocator.dupe(u8, string_bytes);
+
+    return .{
+        .value = decoded,
+        .consumed = length.consumed + string_len,
+    };
+}
+
+// SOURCE: RFC 7541, Section 6.2 — Literal Header Field Representation
+fn decodeLiteralHeaderField(
+    allocator: mem.Allocator,
+    decoder: *HpackDecoder,
+    buf: []const u8,
+    prefix_bits: u4,
+) !HpackLiteralHeaderDecode {
+    const name_index = try decodeInteger(buf, prefix_bits);
+    var offset = name_index.consumed;
+
+    const name = if (name_index.value == 0) blk: {
+        const decoded_name = try decodeStringLiteral(allocator, buf[offset..]);
+        offset += decoded_name.consumed;
+        break :blk decoded_name.value;
+    } else blk: {
+        const borrowed = try decoder.getIndexedHeader(name_index.value);
+        break :blk try allocator.dupe(u8, borrowed.name);
+    };
+    errdefer allocator.free(name);
+
+    const value = try decodeStringLiteral(allocator, buf[offset..]);
+    offset += value.consumed;
+
+    return .{
+        .name = name,
+        .value = value.value,
+        .consumed = offset,
+    };
+}
+
+const HEADERS_FLAG_END_STREAM: u8 = 0x01;
+const HEADERS_FLAG_END_HEADERS: u8 = 0x04;
+const HEADERS_FLAG_PADDED: u8 = 0x08;
+const HEADERS_FLAG_PRIORITY: u8 = 0x20;
+const DATA_FLAG_END_STREAM: u8 = 0x01;
+const DATA_FLAG_PADDED: u8 = 0x08;
+
+pub const Http2ResponseParser = struct {
+    allocator: mem.Allocator,
+    decoder: *HpackDecoder,
+    stream_id: u32,
+    frame_buffer: std.array_list.Managed(u8),
+    header_block: std.array_list.Managed(u8),
+    headers: std.array_list.Managed(OwnedHeaderField),
+    body: std.array_list.Managed(u8),
+    awaiting_continuation: bool = false,
+    continuation_stream: u32 = 0,
+    saw_headers: bool = false,
+    response_complete: bool = false,
+    pending_window_update: usize = 0,
+
+    pub fn init(
+        allocator: mem.Allocator,
+        decoder: *HpackDecoder,
+        stream_id: u32,
+    ) Http2ResponseParser {
+        return .{
+            .allocator = allocator,
+            .decoder = decoder,
+            .stream_id = stream_id,
+            .frame_buffer = std.array_list.Managed(u8).init(allocator),
+            .header_block = std.array_list.Managed(u8).init(allocator),
+            .headers = std.array_list.Managed(OwnedHeaderField).init(allocator),
+            .body = std.array_list.Managed(u8).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Http2ResponseParser) void {
+        self.frame_buffer.deinit();
+        self.header_block.deinit();
+        for (self.headers.items) |*header| header.deinit(self.allocator);
+        self.headers.deinit();
+        self.body.deinit();
+    }
+
+    // SOURCE: RFC 9113, Section 4.1 — Frames are parsed only when header+payload are complete
+    pub fn processApplicationData(self: *Http2ResponseParser, plaintext: []const u8) !void {
+        try self.frame_buffer.appendSlice(plaintext);
+
+        var offset: usize = 0;
+        while (self.frame_buffer.items.len - offset >= HTTP2_FRAME_HEADER_LEN) {
+            const header = try parseFrameHeader(self.frame_buffer.items[offset..]);
+            const frame_end = offset + HTTP2_FRAME_HEADER_LEN + @as(usize, @intCast(header.length));
+            if (frame_end > self.frame_buffer.items.len) break;
+
+            const payload = self.frame_buffer.items[offset + HTTP2_FRAME_HEADER_LEN .. frame_end];
+            try self.processFrame(header, payload);
+            offset = frame_end;
+            if (self.response_complete) break;
+        }
+
+        if (offset > 0) {
+            const remaining_len = self.frame_buffer.items.len - offset;
+            mem.copyForwards(u8, self.frame_buffer.items[0..remaining_len], self.frame_buffer.items[offset..]);
+            self.frame_buffer.items.len = remaining_len;
+        }
+    }
+
+    fn processFrame(self: *Http2ResponseParser, header: ParsedFrameHeader, payload: []const u8) !void {
+        if (self.awaiting_continuation and
+            !(header.frame_type == @intFromEnum(Http2FrameType.CONTINUATION) and header.stream_id == self.continuation_stream))
+        {
+            return error.InvalidFrame;
+        }
+
+        switch (header.frame_type) {
+            @intFromEnum(Http2FrameType.HEADERS) => {
+                if (header.stream_id != self.stream_id) return;
+                const fragment = try parseHeadersPayloadFragment(payload, header.flags);
+                try self.header_block.appendSlice(fragment);
+                self.awaiting_continuation = (header.flags & HEADERS_FLAG_END_HEADERS) == 0;
+                self.continuation_stream = header.stream_id;
+                if (!self.awaiting_continuation) {
+                    try self.flushHeaderBlock();
+                }
+                if ((header.flags & HEADERS_FLAG_END_STREAM) != 0 and !self.awaiting_continuation) {
+                    self.response_complete = true;
+                }
+            },
+            @intFromEnum(Http2FrameType.CONTINUATION) => {
+                if (!self.awaiting_continuation or header.stream_id != self.continuation_stream) {
+                    return error.InvalidFrame;
+                }
+                try self.header_block.appendSlice(payload);
+                if ((header.flags & HEADERS_FLAG_END_HEADERS) != 0) {
+                    self.awaiting_continuation = false;
+                    try self.flushHeaderBlock();
+                }
+            },
+            @intFromEnum(Http2FrameType.DATA) => {
+                if (header.stream_id != self.stream_id) return;
+                const data = try parseDataPayload(payload, header.flags);
+                try self.body.appendSlice(data);
+                self.pending_window_update += data.len;
+                if ((header.flags & DATA_FLAG_END_STREAM) != 0) {
+                    self.response_complete = true;
+                }
+            },
+            @intFromEnum(Http2FrameType.RST_STREAM) => {
+                if (header.stream_id == self.stream_id) return error.InvalidFrame;
+            },
+            else => {},
+        }
+    }
+
+    fn flushHeaderBlock(self: *Http2ResponseParser) !void {
+        const decoded = try self.decoder.decodeHeaderBlock(self.allocator, self.header_block.items);
+        defer self.allocator.free(decoded);
+        try self.headers.appendSlice(decoded);
+        self.header_block.clearRetainingCapacity();
+        self.saw_headers = true;
+    }
+
+    // SOURCE: RFC 9113, Section 8.1.1 — Response field section carries exactly one :status pseudo-header
+    pub fn finish(self: *Http2ResponseParser) !Http2Response {
+        if (!self.saw_headers or !self.response_complete or self.awaiting_continuation) {
+            return error.ResponseIncomplete;
+        }
+
+        var status_code: ?u16 = null;
+        var saw_regular_header = false;
+        var filtered_headers = std.array_list.Managed(OwnedHeaderField).init(self.allocator);
+        errdefer {
+            for (filtered_headers.items) |*header| header.deinit(self.allocator);
+            filtered_headers.deinit();
+        }
+
+        for (self.headers.items) |header| {
+            if (header.name.len > 0 and header.name[0] == ':') {
+                if (saw_regular_header) return error.InvalidResponseHeaders;
+                if (!mem.eql(u8, header.name, ":status")) return error.InvalidResponseHeaders;
+                if (status_code != null or header.value.len != 3) return error.InvalidStatusCode;
+
+                var parsed: u16 = 0;
+                for (header.value) |digit| {
+                    if (digit < '0' or digit > '9') return error.InvalidStatusCode;
+                    parsed = parsed * 10 + (digit - '0');
+                }
+                status_code = parsed;
+                self.allocator.free(header.name);
+                self.allocator.free(header.value);
+            } else {
+                saw_regular_header = true;
+                try filtered_headers.append(header);
+            }
+        }
+
+        self.headers.deinit();
+        self.headers = std.array_list.Managed(OwnedHeaderField).init(self.allocator);
+
+        return .{
+            .status_code = status_code orelse return error.InvalidResponseHeaders,
+            .headers = try filtered_headers.toOwnedSlice(),
+            .body = try self.body.toOwnedSlice(),
+        };
+    }
+
+    pub fn isComplete(self: *const Http2ResponseParser) bool {
+        return self.response_complete and !self.awaiting_continuation;
+    }
+
+    pub fn takeWindowUpdateIncrement(self: *Http2ResponseParser) u32 {
+        const capped: usize = @min(self.pending_window_update, 0x7FFFFFFF);
+        self.pending_window_update -= capped;
+        return @intCast(capped);
+    }
+};
+
+// SOURCE: RFC 9113, Section 6.2 — HEADERS payload may include optional Pad Length and Priority fields
+fn parseHeadersPayloadFragment(payload: []const u8, flags: u8) ![]const u8 {
+    var offset: usize = 0;
+    var pad_length: usize = 0;
+
+    if ((flags & HEADERS_FLAG_PADDED) != 0) {
+        if (payload.len == 0) return error.InvalidFrame;
+        pad_length = payload[0];
+        offset += 1;
+    }
+
+    if ((flags & HEADERS_FLAG_PRIORITY) != 0) {
+        if (payload.len < offset + 5) return error.InvalidFrame;
+        offset += 5;
+    }
+
+    if (payload.len < offset + pad_length) return error.InvalidFrame;
+    return payload[offset .. payload.len - pad_length];
+}
+
+// SOURCE: RFC 9113, Section 6.1 — DATA payload may include optional Pad Length field
+fn parseDataPayload(payload: []const u8, flags: u8) ![]const u8 {
+    var offset: usize = 0;
+    var pad_length: usize = 0;
+
+    if ((flags & DATA_FLAG_PADDED) != 0) {
+        if (payload.len == 0) return error.InvalidFrame;
+        pad_length = payload[0];
+        offset += 1;
+    }
+
+    if (payload.len < offset + pad_length) return error.InvalidFrame;
+    return payload[offset .. payload.len - pad_length];
+}
+
 // ============================================================
 // HPACK TESTS
 // ============================================================
@@ -1279,4 +1874,76 @@ test "round-trip: buildGitHubHeaders → packInHeadersFrame → parse" {
     // 5. HPACK block içeriği doğrulama
     try std.testing.expectEqual(@as(u8, 0x83), payload[0]); // :method: POST
     try std.testing.expectEqual(@as(u8, 0x87), payload[1]); // :scheme: https
+}
+
+test "HpackDecoder: RFC 7541 C.6.1 response block with Huffman coding" {
+    const allocator = std.testing.allocator;
+    var decoder = HpackDecoder.init(allocator);
+    defer decoder.deinit();
+
+    const block = [_]u8{
+        0x48, 0x82, 0x64, 0x02, 0x58, 0x85, 0xae, 0xc3,
+        0x77, 0x1a, 0x4b, 0x61, 0x96, 0xd0, 0x7a, 0xbe,
+        0x94, 0x10, 0x54, 0xd4, 0x44, 0xa8, 0x20, 0x05,
+        0x95, 0x04, 0x0b, 0x81, 0x66, 0xe0, 0x82, 0xa6,
+        0x2d, 0x1b, 0xff, 0x6e, 0x91, 0x9d, 0x29, 0xad,
+        0x17, 0x18, 0x63, 0xc7, 0x8f, 0x0b, 0x97, 0xc8,
+        0xe9, 0xae, 0x82, 0xae, 0x43, 0xd3,
+    };
+
+    const headers = try decoder.decodeHeaderBlock(allocator, &block);
+    defer {
+        for (headers) |*header| header.deinit(allocator);
+        allocator.free(headers);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), headers.len);
+    try std.testing.expectEqualStrings(":status", headers[0].name);
+    try std.testing.expectEqualStrings("302", headers[0].value);
+    try std.testing.expectEqualStrings("cache-control", headers[1].name);
+    try std.testing.expectEqualStrings("private", headers[1].value);
+    try std.testing.expectEqualStrings("location", headers[3].name);
+    try std.testing.expectEqualStrings("https://www.example.com", headers[3].value);
+}
+
+test "Http2ResponseParser: reassembles HEADERS and DATA across chunks" {
+    const allocator = std.testing.allocator;
+    var decoder = HpackDecoder.init(allocator);
+    defer decoder.deinit();
+
+    var parser = Http2ResponseParser.init(allocator, &decoder, 1);
+    defer parser.deinit();
+
+    const headers_frame = [_]u8{
+        0x00, 0x00, 0x01,
+        0x01,
+        0x04,
+        0x00, 0x00, 0x00, 0x01,
+        0x88,
+    };
+    const data_frame = [_]u8{
+        0x00, 0x00, 0x05,
+        0x00,
+        0x01,
+        0x00, 0x00, 0x00, 0x01,
+        'h', 'e', 'l', 'l', 'o',
+    };
+
+    try parser.processApplicationData(headers_frame[0..5]);
+    try std.testing.expect(!parser.isComplete());
+
+    var second_chunk = std.array_list.Managed(u8).init(allocator);
+    defer second_chunk.deinit();
+    try second_chunk.appendSlice(headers_frame[5..]);
+    try second_chunk.appendSlice(&data_frame);
+    try parser.processApplicationData(second_chunk.items);
+
+    try std.testing.expect(parser.isComplete());
+
+    var response = try parser.finish();
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(@as(usize, 0), response.headers.len);
+    try std.testing.expectEqualStrings("hello", response.body);
 }

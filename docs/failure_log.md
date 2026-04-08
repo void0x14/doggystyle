@@ -44,6 +44,48 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-08] — Module 3.1: HTTP/2 Response Yolu Hâlâ HTTP/1.1 Varsayımı ve Eksik Flow Control Taşıyordu
+
+**Tetikleyici:** Bootstrap sonrası canlı koşuda `InvalidResponse`, ardından native parser sonrası `ReadTimeout`
+**Dosyalar:** `src/http2_core.zig`, `src/network_core.zig`, `src/main.zig`, `src/hpack_tables.zig`
+**Tip:** Runtime protocol/state error — response bytes gerçek HTTP/2 frame’lerdi ama parser hattı eksikti
+
+---
+
+### Hata: bootstrap düzeldiği halde response katmanı yanlış protokol ve eksik akış kontrolü kullanıyordu
+
+**Hata:** TLS ve HTTP/2 preface/SETTINGS safhası başarılı olduktan sonra istemci:
+1. decrypted HTTP/2 response bytes’ını `HttpResponse.parse()` ile HTTP/1.1 status-line bekleyerek açmaya çalışıyordu
+2. HEADERS/DATA frame’lerini native olarak parse etmiyordu
+3. HPACK header block decode etmediği için `:status`, `set-cookie`, `location` gibi alanları çıkaramıyordu
+4. büyük response gövdelerinde `WINDOW_UPDATE` göndermediği için server bir noktadan sonra akışı durduruyordu
+5. bir `receiveTlsApplicationData` çağrısından sonraki trailing kısmi TLS ciphertext’i sonraki çağrıya taşımadığı için record sınırları kayabiliyordu
+
+**Kök Sebep:** HTTP/2 state-machine’in request tarafı düzeltilmişti ama response tarafı hâlâ “HTTP/1.1 metni gelecek” varsayımıyla bırakılmıştı. Ayrıca RFC 9113 stream/connection flow-control kuralları uygulanmamıştı.
+
+**Kaynak:** RFC 9113, Section 6.1 — DATA frames stream payload taşır  
+**Kaynak:** RFC 9113, Section 6.2 — HEADERS ve CONTINUATION ile field section taşınır  
+**Kaynak:** RFC 9113, Section 6.9 — WINDOW_UPDATE connection ve stream flow-control penceresini büyütür  
+**Kaynak:** RFC 7541, Section 3.2 — Header block sequential decode edilir  
+**Kaynak:** RFC 7541, Appendix A — static table  
+**Kaynak:** RFC 7541, Appendix B — Huffman code table
+
+**Düzeltme:**
+1. `http2_core.zig` içine native `HpackDecoder`, `Http2ResponseParser`, static table ve Huffman table eklendi
+2. Response yolu artık HEADERS/CONTINUATION/DATA frame’lerini native HTTP/2 olarak parse ediyor
+3. `:status` pseudo-header ve regular headers ayrıştırılıyor; `set-cookie`, `location`, body artık gerçek response alanlarından okunuyor
+4. Büyük body transferlerinde hem connection hem stream için `WINDOW_UPDATE` gönderiliyor
+5. `receiveTlsApplicationData` trailing kısmi TLS ciphertext’i sonraki çağrıya taşıyor
+6. `main.zig` ve `network_core.zig` çağrı zinciri artık HTTP/1.1 parser yerine native HTTP/2 response tipini kullanıyor
+
+**Tekrar olmaması için:**
+- HTTP/2 response bytes hiçbir yerde HTTP/1.1 status-line parser’a verilmeyecek
+- DATA tüketildikçe connection ve stream window büyütülecek
+- HPACK decode olmadan `:status` ve header alanları var sayılmayacak
+- trailing partial TLS record state’i çağrılar arasında korunacak
+
+---
+
 ## [2026-04-08] — Module 3.1: HelloRetryRequest Yanlışlıkla Handshake Tamamlandı Sanılıyordu
 
 **Tetikleyici:** HTTP/2 preface sonrası `TlsRecordTooShort` ve sahte `Session established` logu
