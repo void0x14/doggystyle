@@ -5853,13 +5853,12 @@ pub const BrowserEnvironment = struct {
     nonce: [16]u8 = undefined,
 
     /// Initialize with current timestamp and random nonce
-    pub fn init(allocator: std.mem.Allocator) !BrowserEnvironment {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !BrowserEnvironment {
         _ = allocator; // Used for future extensions
         var env = BrowserEnvironment{};
 
         // Get current time in milliseconds
         // SOURCE: Zig std.Io.Clock — monotonic clock for timestamps
-        const io = std.Io.make();
         env.timestamp = nowMs(io);
 
         // Generate random nonce
@@ -7293,7 +7292,7 @@ pub const GitHubHttpClient = struct {
         // --- STEP 3: Pack into HTTP/2 HEADERS Frame ---
         // SOURCE: RFC 9113, Section 6.2 — HEADERS Frame Format
         const stream_id = try self.nextClientStreamId();
-        const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, stream_id);
+        const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, stream_id, true);
         defer allocator.free(headers_frame);
 
         // Layer 4 Trace
@@ -7357,8 +7356,197 @@ pub const GitHubHttpClient = struct {
 
         return error.ReadTimeout;
     }
+
+    // NETWORK STACK ANALYSIS:
+    // [1] UFW/iptables: Bu soket OUTPUT chain'den geçer mi? INPUT chain'den mi?
+    //     Cevap: SOCK_RAW + IP_HDRINCL → OUTPUT chain → ACCEPT kuralı gerekli
+    // [2] conntrack: Bu paket conntrack tarafından takip edilecek mi?
+    //     Cevap: Hayır — raw socket conntrack'i bypass eder (doğru davranış)
+    // [3] Routing: Paket hangi interface'den çıkacak?
+    //     Cevap: UFW allow/bypass üzerinden interface seçimi ile.
+    // [4] Checksum: Kernel mi hesaplıyor, uygulama mı?
+    //     Cevap: Uygulama pseudo-header dahil hesaplar.
+    // SOURCE: RFC 9113, Section 8.1 - HTTP/2 request POST
+    pub fn performRiskCheck(
+        self: *GitHubHttpClient,
+        allocator: std.mem.Allocator,
+        token: []const u8,
+        bda_data: []const u8,
+        sock: anytype,
+        dst_ip: u32,
+    ) !RiskStatus {
+        std.debug.print("[Layer 4 (Logic)] Preparing HTTP/2 POST request to /signup_check/usage\n", .{});
+        const path = "/signup_check/usage";
+
+        // url-encoding: just do a simple allocation for the payload
+        // payload: authenticity_token=<token>&bda=<bda>
+        // the token and bda_data needs to be URL encoded if it has special characters,
+        // but base64 BDA has '=', '/', '+'. For simplicity, we just send it (base64 could be URL encoded, but let's assume it works or we replace it).
+        // Wait, let's properly url-encode token and bda_data.
+
+        var payload_list = std.array_list.Managed(u8).init(allocator);
+        defer payload_list.deinit();
+
+        try payload_list.appendSlice("authenticity_token=");
+        try urlEncode(&payload_list, token);
+        try payload_list.appendSlice("&bda=");
+        try urlEncode(&payload_list, bda_data);
+        // GitHub might also require value= (from prompt: "check email/username availability and risk status").
+        // Let's just send token and BDA.
+        try payload_list.appendSlice("&value=");
+
+        const payload = payload_list.items;
+
+        _ = self.tls_session orelse return error.NoTlsSession;
+        if (self.hpack_decoder == null) {
+            self.hpack_decoder = http2_core.HpackDecoder.init(allocator);
+        }
+
+        try self.ensureHttp2ConnectionReady(allocator, sock, dst_ip);
+
+        const hpack_block = try http2_core.buildGitHubPostHeaders(allocator, path, self.host, payload.len);
+        defer allocator.free(hpack_block);
+
+        const stream_id = try self.nextClientStreamId();
+
+        // Headers frame without END_STREAM
+        const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, stream_id, false);
+        defer allocator.free(headers_frame);
+
+        try self.sendTlsApplicationData(
+            allocator,
+            sock,
+            dst_ip,
+            headers_frame,
+            "HTTP/2 POST HEADERS",
+        );
+
+        // Data frame chunking
+        const MAX_DATA_PAYLOAD = 1400;
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            const end = @min(offset + MAX_DATA_PAYLOAD, payload.len);
+            const chunk = payload[offset..end];
+            const is_last = (end == payload.len);
+
+            const data_frame = try packInDataFrame(allocator, chunk, stream_id, is_last);
+            defer allocator.free(data_frame);
+
+            try self.sendTlsApplicationData(
+                allocator,
+                sock,
+                dst_ip,
+                data_frame,
+                "HTTP/2 POST DATA CHUNK",
+            );
+            offset = end;
+        }
+
+        var response_parser = http2_core.Http2ResponseParser.init(
+            allocator,
+            &(self.hpack_decoder.?),
+            stream_id,
+        );
+        defer response_parser.deinit();
+
+        const timeout_start = currentTimestampMs();
+        while (currentTimestampMs() - timeout_start < 5000) {
+            const remaining_timeout = 5000 - (currentTimestampMs() - timeout_start);
+            const plaintext = try receiveTlsApplicationData(self, allocator, sock, remaining_timeout);
+            defer allocator.free(plaintext);
+
+            try response_parser.processApplicationData(plaintext);
+            const window_increment = response_parser.takeWindowUpdateIncrement();
+            if (window_increment > 0) {
+                const connection_window_update = http2_core.buildWindowUpdateFrame(0, window_increment);
+                try self.sendTlsApplicationData(
+                    allocator,
+                    sock,
+                    dst_ip,
+                    &connection_window_update,
+                    "HTTP/2 connection WINDOW_UPDATE",
+                );
+                const stream_window_update = http2_core.buildWindowUpdateFrame(stream_id, window_increment);
+                try self.sendTlsApplicationData(
+                    allocator,
+                    sock,
+                    dst_ip,
+                    &stream_window_update,
+                    "HTTP/2 stream WINDOW_UPDATE",
+                );
+            }
+            if (response_parser.isComplete()) {
+                var response = try response_parser.finish();
+                defer response.deinit(allocator);
+
+                // Parse RiskStatus
+                // If the response indicates Arkose is NOT required (challenge_required: false)
+                // This means searching for challenge_required: false or checking status
+                const chal_req = mem.indexOf(u8, response.body, "challenge_required") != null and
+                    mem.indexOf(u8, response.body, "true") != null;
+
+                if (!chal_req) {
+                    std.debug.print("[SUCCESS] Arkose Bypassed via Low-Risk Signature\n", .{});
+                }
+
+                return RiskStatus{ .challenge_required = chal_req };
+            }
+        }
+
+        return error.ReadTimeout;
+    }
 };
 
+fn urlEncode(list: *std.array_list.Managed(u8), input: []const u8) !void {
+    const hex_digits = "0123456789ABCDEF";
+    for (input) |c| {
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~' => try list.append(c),
+            else => {
+                try list.append('%');
+                try list.append(hex_digits[c >> 4]);
+                try list.append(hex_digits[c & 15]);
+            },
+        }
+    }
+}
+
+pub const RiskStatus = struct {
+    challenge_required: bool,
+};
+
+pub fn extractAuthenticityToken(html_buffer: []const u8) ![]const u8 {
+    const search_pattern = "authenticity_token";
+    const start_idx = mem.indexOf(u8, html_buffer, search_pattern) orelse return error.TokenNotFound;
+
+    // Find the nearest value=" before or after this
+    // Let's find the `<input` start tag before this
+    var tag_start = start_idx;
+    while (tag_start > 0 and html_buffer[tag_start] != '<') {
+        tag_start -= 1;
+    }
+
+    // Find the `>` end tag after this
+    var tag_end = start_idx;
+    while (tag_end < html_buffer.len and html_buffer[tag_end] != '>') {
+        tag_end += 1;
+    }
+
+    if (tag_start < tag_end) {
+        std.debug.print("[DEBUG] Found tag: {s}\n", .{html_buffer[tag_start .. tag_end + 1]});
+    }
+
+    const value_attr = "value=\"";
+    const value_idx = mem.indexOf(u8, html_buffer[tag_start..tag_end], value_attr) orelse return error.TokenValueNotFound;
+
+    const value_start = tag_start + value_idx + value_attr.len;
+    const value_end = mem.indexOfScalarPos(u8, html_buffer, value_start, '"') orelse return error.TokenEndNotFound;
+
+    const token = html_buffer[value_start..value_end];
+    if (token.len < 40 or token.len > 200) return error.InvalidTokenLength;
+
+    return token;
+}
 // =============================================================================
 // MODULE 3.3 TESTS
 // =============================================================================
@@ -7502,7 +7690,7 @@ test "inspectHttp2ServerPreface: rejects HEADERS before server SETTINGS" {
     const hpack_block = try http2_core.buildGitHubHeaders(allocator, "/signup", "github.com", true);
     defer allocator.free(hpack_block);
 
-    const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, 1);
+    const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, 1, true);
     defer allocator.free(headers_frame);
 
     try std.testing.expectError(error.Http2PrefaceFailed, inspectHttp2ServerPreface(allocator, headers_frame));

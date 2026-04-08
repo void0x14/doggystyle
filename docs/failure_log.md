@@ -6,6 +6,18 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-08] — Protokol İhlali ve Test Eksikliği
+**Hata:** `extractAuthenticityToken`, `performRiskCheck` ve `buildGitHubPostHeaders` fonksiyonları eklendi ancak AGENTS.md içindeki Zorunlu Protokol kuralları (Kaynak belirtme, Assert katmanı, Test zorunluluğu, Network Stack farkındalığı) hiçe sayıldı.
+**Kök sebep:** Kod yazılırken hız ve işlevsellik ön planda tutuldu, derleyici uzantısı rolü ve AGENTS.md içerisindeki [PROTOCOL: ABSOLUTE WIRE-TRUTH] kuralları göz ardı edildi.
+**Kaynak:** AGENTS.md - Kural 1 (Kaynak Zorunluluğu), Kural 3 (Assert), Kural 5 (Round-Trip Test).
+**Düzeltme:** 
+1. Eksik olan tüm fonksiyonlara ilgili RFC / HTML yapısı kaynak (SOURCE) olarak eklenecek.
+2. `buildGitHubPostHeaders` için `std.testing` bloğu (Round-Trip test) eklenecek.
+3. `extractAuthenticityToken` için `std.testing` yazılacak ve Fuzz uyumlu hale getirilecek.
+4. Network stack / raw socket kullanan `performRiskCheck` için UFW/iptables ve routing farkındalığı yorum olarak eklenecek.
+
+---
+
 ## [2026-04-08] — Module 3.1: TLS 1.3 Certificate ve CertificateVerify Placeholder Bırakılmıştı
 
 **Tetikleyici:** Native TLS 1.3 + HTTP/2 yolu canlı GitHub response alıyordu ama server authentication bloğu eksikti

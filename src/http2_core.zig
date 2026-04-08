@@ -1000,8 +1000,9 @@ pub fn buildGitHubHeaders(
 /// Sadece Header Block Fragment var.
 pub fn packInHeadersFrame(
     allocator: mem.Allocator,
-    hpack_block: []u8,
+    hpack_block: []const u8,
     stream_id: u31,
+    end_stream: bool,
 ) ![]u8 {
     std.debug.assert(stream_id > 0); // HEADERS frame MUST use non-zero stream ID (RFC 7540, Section 5.1.1)
     std.debug.assert(hpack_block.len <= 16777215); // Max frame size: 2^24 - 1 (RFC 7540, Section 4.2)
@@ -1023,7 +1024,7 @@ pub fn packInHeadersFrame(
     // Flags: END_STREAM (0x1) | END_HEADERS (0x4) = 0x05
     // END_HEADERS: Header Block Fragment tam, CONTINUATION frame gelmeyecek
     // END_STREAM: Bu stream'de başka veri gelmeyecek (typical for simple GET/POST)
-    result[HTTP2_FRAME_HDR_FLAGS] = 0x01 | 0x04; // END_STREAM | END_HEADERS
+    result[HTTP2_FRAME_HDR_FLAGS] = if (end_stream) 0x01 | 0x04 else 0x04; // END_STREAM | END_HEADERS
 
     // Stream ID: 31-bit big-endian, MSB reserved (0)
     {
@@ -1039,7 +1040,6 @@ pub fn packInHeadersFrame(
 
     // Doğrulama
     std.debug.assert(result[HTTP2_FRAME_HDR_TYPE] == 0x01); // HEADERS type
-    std.debug.assert(result[HTTP2_FRAME_HDR_FLAGS] == 0x05); // END_STREAM | END_HEADERS
 
     return result;
 }
@@ -1814,7 +1814,7 @@ test "packInHeadersFrame: HEADERS frame byte-alignment" {
     defer allocator.free(hpack_block);
     @memset(hpack_block, 0xAA);
 
-    const frame = try packInHeadersFrame(allocator, hpack_block, 1);
+    const frame = try packInHeadersFrame(allocator, hpack_block, 1, true);
     defer allocator.free(frame);
 
     // Toplam: 9 (header) + 5 (payload) = 14 byte
@@ -1857,7 +1857,7 @@ test "round-trip: buildGitHubHeaders → packInHeadersFrame → parse" {
     defer allocator.free(hpack_block);
 
     // 2. HEADERS frame'e yerleştir
-    const frame = try packInHeadersFrame(allocator, hpack_block, 3);
+    const frame = try packInHeadersFrame(allocator, hpack_block, 3, true);
     defer allocator.free(frame);
 
     // 3. Parse header
@@ -1916,17 +1916,16 @@ test "Http2ResponseParser: reassembles HEADERS and DATA across chunks" {
 
     const headers_frame = [_]u8{
         0x00, 0x00, 0x01,
-        0x01,
-        0x04,
-        0x00, 0x00, 0x00, 0x01,
+        0x01, 0x04, 0x00,
+        0x00, 0x00, 0x01,
         0x88,
     };
     const data_frame = [_]u8{
         0x00, 0x00, 0x05,
-        0x00,
-        0x01,
-        0x00, 0x00, 0x00, 0x01,
-        'h', 'e', 'l', 'l', 'o',
+        0x00, 0x01, 0x00,
+        0x00, 0x00, 0x01,
+        'h',  'e',  'l',
+        'l',  'o',
     };
 
     try parser.processApplicationData(headers_frame[0..5]);
@@ -1946,4 +1945,134 @@ test "Http2ResponseParser: reassembles HEADERS and DATA across chunks" {
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try std.testing.expectEqual(@as(usize, 0), response.headers.len);
     try std.testing.expectEqualStrings("hello", response.body);
+}
+
+// SOURCE: RFC 7541, Appendix A — Static Table Definitions
+pub fn buildGitHubPostHeaders(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    authority: []const u8,
+    content_length: usize,
+) ![]u8 {
+    const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+    const accept_value = "application/json";
+    const content_type = "application/x-www-form-urlencoded";
+
+    // 1. :method: POST (Indexed, Index 3)
+    const indexed_method = IndexedHeaderField{ .index = 3 };
+    const encoded_method = try indexed_method.encode(allocator);
+    defer allocator.free(encoded_method);
+
+    // 2. :scheme: https (Indexed, Index 7)
+    const indexed_scheme = IndexedHeaderField{ .index = 7 };
+    const encoded_scheme = try indexed_scheme.encode(allocator);
+    defer allocator.free(encoded_scheme);
+
+    // 3. :path
+    const literal_path = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 4,
+        .name = null,
+        .value = path,
+    };
+    const encoded_path = try literal_path.encode(allocator);
+    defer allocator.free(encoded_path);
+
+    // 4. :authority
+    const literal_authority = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 1,
+        .name = null,
+        .value = authority,
+    };
+    const encoded_authority = try literal_authority.encode(allocator);
+    defer allocator.free(encoded_authority);
+
+    // 5. user-agent
+    const literal_ua = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 58,
+        .name = null,
+        .value = user_agent,
+    };
+    const encoded_ua = try literal_ua.encode(allocator);
+    defer allocator.free(encoded_ua);
+
+    // 6. accept
+    const literal_accept = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 19,
+        .name = null,
+        .value = accept_value,
+    };
+    const encoded_accept = try literal_accept.encode(allocator);
+    defer allocator.free(encoded_accept);
+
+    // 7. content-type
+    const literal_ct = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 31, // content-type is 31 in static table
+        .name = null,
+        .value = content_type,
+    };
+    const encoded_ct = try literal_ct.encode(allocator);
+    defer allocator.free(encoded_ct);
+
+    // 8. content-length
+    var cl_buf: [32]u8 = undefined;
+    const cl_str = try std.fmt.bufPrint(&cl_buf, "{d}", .{content_length});
+    const literal_cl = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 28, // content-length is 28 in static table
+        .name = null,
+        .value = cl_str,
+    };
+    const encoded_cl = try literal_cl.encode(allocator);
+    defer allocator.free(encoded_cl);
+
+    const total_len = encoded_method.len + encoded_scheme.len +
+        encoded_path.len + encoded_authority.len +
+        encoded_ua.len + encoded_accept.len + encoded_ct.len + encoded_cl.len;
+
+    const result = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+
+    @memcpy(result[offset .. offset + encoded_method.len], encoded_method);
+    offset += encoded_method.len;
+
+    @memcpy(result[offset .. offset + encoded_scheme.len], encoded_scheme);
+    offset += encoded_scheme.len;
+
+    @memcpy(result[offset .. offset + encoded_path.len], encoded_path);
+    offset += encoded_path.len;
+
+    @memcpy(result[offset .. offset + encoded_authority.len], encoded_authority);
+    offset += encoded_authority.len;
+
+    @memcpy(result[offset .. offset + encoded_ua.len], encoded_ua);
+    offset += encoded_ua.len;
+
+    @memcpy(result[offset .. offset + encoded_accept.len], encoded_accept);
+    offset += encoded_accept.len;
+
+    @memcpy(result[offset .. offset + encoded_ct.len], encoded_ct);
+    offset += encoded_ct.len;
+
+    @memcpy(result[offset .. offset + encoded_cl.len], encoded_cl);
+    offset += encoded_cl.len;
+
+    return result;
+}
+
+test "buildGitHubPostHeaders: round-trip" {
+    const allocator = std.testing.allocator;
+    const block = try buildGitHubPostHeaders(allocator, "/test", "github.com", 123);
+    defer allocator.free(block);
+
+    var decoder = HpackDecoder.init(allocator);
+    defer decoder.deinit();
+
+    const headers = try decoder.decodeHeaderBlock(allocator, block);
+    defer {
+        for (headers) |*header| header.deinit(allocator);
+        allocator.free(headers);
+    }
+
+    try std.testing.expectEqual(@as(usize, 8), headers.len);
+    try std.testing.expectEqualStrings(":method", headers[0].name);
+    try std.testing.expectEqualStrings("POST", headers[0].value);
 }

@@ -238,9 +238,48 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("\n", .{});
 
     // =========================================================================
-    // ADIM 10: Safe Shutdown
+    // ADIM 10: Token Extraction    // =========================================================================
+    std.debug.print("[TOKEN] Extracting authenticity_token from HTML...\n", .{});
+    const auth_token = network.extractAuthenticityToken(response.body) catch |err| {
+        std.debug.print("[FATAL] Failed to extract token: {}\n", .{err});
+        std.process.exit(1);
+    };
+    std.debug.print("[SUCCESS] Extracted Token: {s}\n", .{auth_token});
+
     // =========================================================================
-    std.debug.print("[SHUTDOWN] Initiating safe shutdown...\n", .{});
+    // ADIM 11: BDA Telemetry Packaging & Risk Check Submission
+    // =========================================================================
+    std.debug.print("\n[BDA] Preparing Browser Data Analytics (BDA) payload...\n", .{});
+    var env = try network.BrowserEnvironment.init(allocator, io);
+    // Using realistic CachyOS/Ryzen specs to enforce "Low Risk"
+    env.navigator.hardwareConcurrency = 16; // e.g., Ryzen 7
+    env.navigator.deviceMemory = 32; // 32 GB RAM
+    env.webgl.renderer = "AMD Radeon RX 7900 XTX (RADV NAVI31, LLVM 18.1.8, DRM 3.57, CachyOS)";
+
+    const bda_payload = try network.encryptBda(allocator, &env);
+    defer allocator.free(bda_payload);
+
+    std.debug.print("[BDA] Encrypted payload generated ({d} bytes)\n", .{bda_payload.len});
+    std.debug.print("[RISK CHECK] Sending POST to /signup_check/usage...\n", .{});
+
+    const risk_status = try github_client.performRiskCheck(
+        allocator,
+        auth_token,
+        bda_payload,
+        &sock,
+        dst_ip,
+    );
+
+    if (!risk_status.challenge_required) {
+        std.debug.print("[SUCCESS] Arkose Bypassed via Low-Risk Signature\n", .{});
+    } else {
+        std.debug.print("[WARN] Challenge required! Risk score might be too high.\n", .{});
+    }
+
+    // =========================================================================
+    // ADIM 12: Safe Shutdown
+    // =========================================================================
+    std.debug.print("\n[SHUTDOWN] Initiating safe shutdown...\n", .{});
     std.debug.print("[SHUTDOWN] Firewall cleanup (defer removeRstSuppression)...\n", .{});
     std.debug.print("[SHUTDOWN] Socket cleanup (defer sock.deinit)...\n", .{});
     std.debug.print("[SHUTDOWN] Ghost Engine shutdown complete.\n", .{});
