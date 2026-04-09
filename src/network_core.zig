@@ -6594,9 +6594,14 @@ pub const GitHubCookieJar = struct {
     gh_sess: [1024]u8 = [_]u8{0} ** 1024,
     gh_sess_len: usize = 0,
 
+    // SOURCE: Live observation of GitHub signup page (2026-04-09)
+    // _octo is a tracking cookie required for form submission validation
+    octo: [128]u8 = [_]u8{0} ** 128,
+    octo_len: usize = 0,
+
     // AGENTS.md Section 2.2: comptime struct size assertion
     comptime {
-        std.debug.assert(@sizeOf(GitHubCookieJar) == 512 + 8 + 512 + 8 + 1024 + 8);
+        std.debug.assert(@sizeOf(GitHubCookieJar) == 512 + 8 + 512 + 8 + 1024 + 8 + 128 + 8);
     }
 
     /// Parse Set-Cookie header and store relevant cookies
@@ -6630,13 +6635,21 @@ pub const GitHubCookieJar = struct {
             const copy_len = value.len;
             @memcpy(self.gh_sess[0..copy_len], value[0..copy_len]);
             self.gh_sess_len = copy_len;
+        } else if (mem.eql(u8, name, "_octo")) {
+            // SOURCE: Live observation — _octo required for CSRF validation on signup
+            if (value.len > self.octo.len) return error.CookieTooLarge;
+            const copy_len = value.len;
+            @memcpy(self.octo[0..copy_len], value[0..copy_len]);
+            self.octo_len = copy_len;
         }
     }
 
     /// Build Cookie header value for outbound requests
     /// SOURCE: RFC 6265, Section 4.2 — Cookie header
     pub fn cookieHeader(self: *const GitHubCookieJar, buf: []u8) ![]u8 {
-        if (self.user_session_len == 0 and self.host_user_session_len == 0 and self.gh_sess_len == 0) {
+        if (self.user_session_len == 0 and self.host_user_session_len == 0 and
+            self.gh_sess_len == 0 and self.octo_len == 0)
+        {
             return error.NoCookies;
         }
 
@@ -6644,53 +6657,51 @@ pub const GitHubCookieJar = struct {
 
         // user_session
         if (self.user_session_len > 0) {
-            const prefix = "user_session=";
-            if (pos + prefix.len + self.user_session_len > buf.len) return error.BufferTooSmall;
-            @memcpy(buf[pos .. pos + prefix.len], prefix);
-            pos += prefix.len;
-            @memcpy(buf[pos .. pos + self.user_session_len], self.user_session[0..self.user_session_len]);
-            pos += self.user_session_len;
-
-            // Add separator if more cookies follow
-            if (self.host_user_session_len > 0 or self.gh_sess_len > 0) {
-                if (pos + 2 > buf.len) return error.BufferTooSmall;
-                buf[pos] = ';';
-                buf[pos + 1] = ' ';
-                pos += 2;
-            }
+            if (pos + 14 + self.user_session_len > buf.len) return error.BufferTooSmall;
+            pos = cookieAppendPair(buf, pos, "user_session=", self.user_session[0..self.user_session_len]);
+            if (self.host_user_session_len > 0 or self.gh_sess_len > 0 or self.octo_len > 0)
+                pos = cookieAppendSep(buf, pos);
         }
 
         // __Host-user_session_same_site
         if (self.host_user_session_len > 0) {
             const prefix = "__Host-user_session_same_site=";
             if (pos + prefix.len + self.host_user_session_len > buf.len) return error.BufferTooSmall;
-            @memcpy(buf[pos .. pos + prefix.len], prefix);
-            pos += prefix.len;
-            @memcpy(buf[pos .. pos + self.host_user_session_len], self.host_user_session[0..self.host_user_session_len]);
-            pos += self.host_user_session_len;
-
-            if (self.gh_sess_len > 0) {
-                if (pos + 2 > buf.len) return error.BufferTooSmall;
-                buf[pos] = ';';
-                buf[pos + 1] = ' ';
-                pos += 2;
-            }
+            pos = cookieAppendPair(buf, pos, prefix, self.host_user_session[0..self.host_user_session_len]);
+            if (self.gh_sess_len > 0 or self.octo_len > 0)
+                pos = cookieAppendSep(buf, pos);
         }
 
         // _gh_sess
         if (self.gh_sess_len > 0) {
-            const prefix = "_gh_sess=";
-            if (pos + prefix.len + self.gh_sess_len > buf.len) return error.BufferTooSmall;
-            @memcpy(buf[pos .. pos + prefix.len], prefix);
-            pos += prefix.len;
-            @memcpy(buf[pos .. pos + self.gh_sess_len], self.gh_sess[0..self.gh_sess_len]);
-            pos += self.gh_sess_len;
+            if (pos + 10 + self.gh_sess_len > buf.len) return error.BufferTooSmall;
+            pos = cookieAppendPair(buf, pos, "_gh_sess=", self.gh_sess[0..self.gh_sess_len]);
+            if (self.octo_len > 0)
+                pos = cookieAppendSep(buf, pos);
+        }
+
+        // _octo — SOURCE: Live observation, required for signup CSRF
+        if (self.octo_len > 0) {
+            if (pos + 7 + self.octo_len > buf.len) return error.BufferTooSmall;
+            pos = cookieAppendPair(buf, pos, "_octo=", self.octo[0..self.octo_len]);
         }
 
         std.debug.assert(pos <= buf.len);
         return buf[0..pos];
     }
 };
+
+fn cookieAppendPair(buf: []u8, pos: usize, name: []const u8, val: []const u8) usize {
+    @memcpy(buf[pos .. pos + name.len], name);
+    @memcpy(buf[pos + name.len .. pos + name.len + val.len], val);
+    return pos + name.len + val.len;
+}
+
+fn cookieAppendSep(buf: []u8, pos: usize) usize {
+    buf[pos] = ';';
+    buf[pos + 1] = ' ';
+    return pos + 2;
+}
 
 /// HTTP Response parser (zero-allocation, slice-based)
 /// SOURCE: RFC 7230, Section 3 - HTTP Message Format
@@ -7350,7 +7361,13 @@ pub const GitHubHttpClient = struct {
                 );
             }
             if (response_parser.isComplete()) {
-                return try response_parser.finish();
+                var response = try response_parser.finish();
+
+                // CRITICAL: Extract Set-Cookie headers from response into cookie_jar
+                // This is how _gh_sess and _octo are captured from the initial GET /signup
+                extractCookiesFromHttp2Response(&response, &self.cookie_jar) catch {};
+
+                return response;
             }
         }
 
@@ -7496,11 +7513,17 @@ pub const GitHubHttpClient = struct {
         return error.ReadTimeout;
     }
 
+    // SOURCE: Live DOM analysis of https://github.com/signup (2026-04-09)
+    // HONEYPOT AVOIDANCE: Skip fields that trap bots
+    //   - "required_field_NNNN": hidden text input, honeypot (hidden="hidden")
+    //   - "filter": country dropdown panel search field, NOT signup payload
+    //   - Empty-name hidden inputs (no name attribute): client-side CSRF tokens,
+    //     browser does NOT submit these. Safe to skip.
     pub fn extractSignupHiddenFields(allocator: std.mem.Allocator, html_buffer: []const u8, payload_list: *std.array_list.Managed(u8)) !void {
         _ = allocator;
         var search_start: usize = 0;
 
-        // Let's find the signup form
+        // Find the signup form
         const form_start_str = "action=\"/signup\"";
         const form_start = mem.indexOf(u8, html_buffer, form_start_str) orelse 0;
         search_start = form_start;
@@ -7516,12 +7539,35 @@ pub const GitHubHttpClient = struct {
                 continue;
             }
 
-            // Extract name
+            // HONEYPOT CHECK 1: Skip hidden inputs that are actually honeypots
+            // These have hidden="hidden" attribute (text type disguised as hidden)
+            if (mem.indexOf(u8, input_tag, "hidden=\"hidden\"") != null) {
+                std.debug.print("[HONEYPOT SKIP] Skipping input with hidden=\"hidden\" attribute\n", .{});
+                continue;
+            }
+
+            // Extract name — skip inputs with NO name attribute (empty-name CSRF tokens)
             const name_attr = "name=\"";
-            const name_idx = mem.indexOf(u8, input_tag, name_attr) orelse continue;
+            const name_idx = mem.indexOf(u8, input_tag, name_attr) orelse {
+                // No name attribute — this is a client-side-only CSRF token, skip
+                std.debug.print("[CSRF SKIP] Skipping hidden input with no name attribute\n", .{});
+                continue;
+            };
             const name_start = name_idx + name_attr.len;
             const name_end = mem.indexOfScalarPos(u8, input_tag, name_start, '"') orelse continue;
             const name = input_tag[name_start..name_end];
+
+            // HONEYPOT CHECK 2: Skip required_field_* (dynamic honeypot name)
+            if (mem.startsWith(u8, name, "required_field_")) {
+                std.debug.print("[HONEYPOT SKIP] Skipping honeypot field: {s}\n", .{name});
+                continue;
+            }
+
+            // HONEYPOT CHECK 3: Skip "filter" — country dropdown panel search, not signup data
+            if (mem.eql(u8, name, "filter")) {
+                std.debug.print("[HONEYPOT SKIP] Skipping country dropdown filter field\n", .{});
+                continue;
+            }
 
             // Extract value
             const value_attr = "value=\"";
@@ -7541,7 +7587,75 @@ pub const GitHubHttpClient = struct {
         }
     }
 
-    // SOURCE: RFC 9113, Section 8.1 - HTTP/2 request POST
+    // SOURCE: RFC 9113, Section 8.1 — HTTP/2 POST with x-www-form-urlencoded body
+    // SOURCE: Live DOM analysis of https://github.com/signup (2026-04-09)
+    // Builds the EXACT wire-order payload from the Recon Report.
+    // NO lazy writer.print — each field is individually URL-encoded and appended.
+    pub fn buildSignupPayload(
+        allocator: std.mem.Allocator,
+        tokens: SignupTokens,
+        username: []const u8,
+        email: []const u8,
+        password: []const u8,
+    ) !std.array_list.Managed(u8) {
+        var buf = std.array_list.Managed(u8).init(allocator);
+        errdefer buf.deinit();
+
+        // --- Field 0: authenticity_token (CRITICAL: key + URL-encoded base64 value) ---
+        try buf.appendSlice("authenticity_token=");
+        try urlEncode(&buf, tokens.authenticity_token);
+
+        // --- Field 1: return_to (empty) ---
+        try buf.appendSlice("&return_to=");
+
+        // --- Field 2: invitation_token (empty) ---
+        try buf.appendSlice("&invitation_token=");
+
+        // --- Field 3: repo_invitation_token (empty) ---
+        try buf.appendSlice("&repo_invitation_token=");
+
+        // --- Field 4: user[email] — URL-encode name + value ---
+        try buf.appendSlice("&");
+        try urlEncode(&buf, "user[email]");
+        try buf.appendSlice("=");
+        try urlEncode(&buf, email);
+
+        // --- Field 6: user[password] — URL-encode name + value ---
+        try buf.appendSlice("&");
+        try urlEncode(&buf, "user[password]");
+        try buf.appendSlice("=");
+        try urlEncode(&buf, password);
+
+        // --- Field 8: user[login] — URL-encode name + value ---
+        try buf.appendSlice("&");
+        try urlEncode(&buf, "user[login]");
+        try buf.appendSlice("=");
+        try urlEncode(&buf, username);
+
+        // --- Field 9: user_signup[country] ---
+        try buf.appendSlice("&");
+        try urlEncode(&buf, "user_signup[country]");
+        try buf.appendSlice("=");
+        try buf.appendSlice("TR"); // detected country from page load
+
+        // --- Field 11/12: user_signup[marketing_consent]=0 ---
+        // Browser submits hidden input (value=0), NOT checkbox (unchecked)
+        try buf.appendSlice("&user_signup%5Bmarketing_consent%5D=0");
+
+        // --- Field 13: octocaptcha-token (empty when captcha not solved) ---
+        try buf.appendSlice("&octocaptcha-token=");
+
+        // --- Field 15: timestamp ---
+        try buf.appendSlice("&timestamp=");
+        try buf.appendSlice(tokens.timestamp);
+
+        // --- Field 16: timestamp_secret (URL-encode for safety) ---
+        try buf.appendSlice("&timestamp_secret=");
+        try urlEncode(&buf, tokens.timestamp_secret);
+
+        return buf;
+    }
+
     pub fn performSignup(
         self: *GitHubHttpClient,
         allocator: std.mem.Allocator,
@@ -7552,60 +7666,55 @@ pub const GitHubHttpClient = struct {
         sock: anytype,
         dst_ip: u32,
     ) !bool {
-        std.debug.print("[Layer 4 (Logic)] Preparing HTTP/2 POST request to /signup\n", .{});
-        const path = "/signup";
+        std.debug.print("[Layer 4 (Logic)] Starting GitHub signup flow\n", .{});
+        const path = "/signup?social=false";
 
-        var payload_list = std.array_list.Managed(u8).init(allocator);
-        defer payload_list.deinit();
-
-        try extractSignupHiddenFields(allocator, html_buffer, &payload_list);
-
-        if (payload_list.items.len > 0) {
-            try payload_list.appendSlice("&");
+        // STEP 1: Extract tokens from HTML
+        const tokens = try extractSignupTokens(html_buffer, allocator);
+        defer {
+            allocator.free(tokens.authenticity_token);
+            allocator.free(tokens.timestamp);
+            allocator.free(tokens.timestamp_secret);
         }
-        try urlEncode(&payload_list, "user[login]");
-        try payload_list.appendSlice("=");
-        try urlEncode(&payload_list, username);
+        std.debug.print("[SIGNUP] Extracted tokens: authenticity_token ({d}B), timestamp ({s}), timestamp_secret ({d}B)\n", .{
+            tokens.authenticity_token.len,
+            tokens.timestamp,
+            tokens.timestamp_secret.len,
+        });
 
-        try payload_list.appendSlice("&");
-        try urlEncode(&payload_list, "user[email]");
-        try payload_list.appendSlice("=");
-        try urlEncode(&payload_list, email);
-
-        try payload_list.appendSlice("&");
-        try urlEncode(&payload_list, "user[password]");
-        try payload_list.appendSlice("=");
-        try urlEncode(&payload_list, password);
-
-        // Sometimes GitHub also checks user[opt_in]=true or something, but we'll stick to login, email, password.
-
+        // STEP 2: Build byte-perfect x-www-form-urlencoded payload
+        var payload_list = try buildSignupPayload(allocator, tokens, username, email, password);
+        defer payload_list.deinit();
         const payload = payload_list.items;
 
+        std.debug.print("[SIGNUP] Payload length: {d} bytes\n", .{payload.len});
+        std.debug.print("[SIGNUP] Payload preview: {s:.100}\n", .{payload});
+
+        // STEP 3: Ensure TLS session and HTTP/2 connection
         _ = self.tls_session orelse return error.NoTlsSession;
         if (self.hpack_decoder == null) {
             self.hpack_decoder = http2_core.HpackDecoder.init(allocator);
         }
-
         try self.ensureHttp2ConnectionReady(allocator, sock, dst_ip);
 
-        // Build cookies
-        var cookie_buf = std.array_list.Managed(u8).init(allocator);
-        defer cookie_buf.deinit();
-        if (self.cookie_jar.user_session.len > 0) {
-            try cookie_buf.appendSlice("user_session=");
-            try cookie_buf.appendSlice(self.cookie_jar.user_session[0..self.cookie_jar.user_session_len]);
-        }
-        if (self.cookie_jar.gh_sess.len > 0) {
-            if (cookie_buf.items.len > 0) try cookie_buf.appendSlice("; ");
-            try cookie_buf.appendSlice("_gh_sess=");
-            try cookie_buf.appendSlice(self.cookie_jar.gh_sess[0..self.cookie_jar.gh_sess_len]);
-        }
+        // STEP 4: Build cookie header — MUST include _gh_sess + _octo
+        var cookie_buf: [4096]u8 = undefined;
+        const cookie_str = self.cookie_jar.cookieHeader(&cookie_buf) catch "";
+        std.debug.print("[SIGNUP] Cookie header length: {d} bytes\n", .{cookie_str.len});
 
-        const hpack_block = try http2_core.buildGitHubSignupHeaders(allocator, path, self.host, payload.len, cookie_buf.items);
+        // STEP 5: Build HPACK headers — includes origin, referer, content-type
+        const hpack_block = try http2_core.buildGitHubSignupHeaders(
+            allocator,
+            path,
+            self.host,
+            payload.len,
+            cookie_str,
+        );
         defer allocator.free(hpack_block);
 
         const stream_id = try self.nextClientStreamId();
 
+        // STEP 6: Send HEADERS frame
         const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, stream_id, false);
         defer allocator.free(headers_frame);
 
@@ -7617,7 +7726,7 @@ pub const GitHubHttpClient = struct {
             "HTTP/2 POST HEADERS",
         );
 
-        // Send payload in chunks
+        // STEP 7: Send body in chunks
         const MAX_DATA_PAYLOAD = 1400;
         var offset: usize = 0;
         while (offset < payload.len) {
@@ -7638,6 +7747,7 @@ pub const GitHubHttpClient = struct {
             offset = end;
         }
 
+        // STEP 8: Parse response
         var response_parser = http2_core.Http2ResponseParser.init(
             allocator,
             &(self.hpack_decoder.?),
@@ -7646,8 +7756,8 @@ pub const GitHubHttpClient = struct {
         defer response_parser.deinit();
 
         const timeout_start = currentTimestampMs();
-        while (currentTimestampMs() - timeout_start < 5000) {
-            const remaining_timeout = 5000 - (currentTimestampMs() - timeout_start);
+        while (currentTimestampMs() - timeout_start < 10000) {
+            const remaining_timeout = 10000 - (currentTimestampMs() - timeout_start);
             const plaintext = try receiveTlsApplicationData(self, allocator, sock, remaining_timeout);
             defer allocator.free(plaintext);
 
@@ -7675,20 +7785,77 @@ pub const GitHubHttpClient = struct {
                 var response = try response_parser.finish();
                 defer response.deinit(allocator);
 
-                // Update cookies
+                // Update cookies from response
                 try extractCookiesFromHttp2Response(&response, &self.cookie_jar);
 
-                if (response.status_code == 302 or response.status_code == 200) {
-                    // Check if it redirects to onboarding
-                    if (mem.indexOf(u8, response.body, "onboarding/guidance") != null or response.status_code == 302) {
-                        return true;
-                    }
+                std.debug.print("[SIGNUP RESPONSE] HTTP Status: {d}\n", .{response.status_code});
+                std.debug.print("[SIGNUP RESPONSE] Body length: {d} bytes\n", .{response.body.len});
+
+                // === SUCCESS CRITERIA ===
+                // 302 redirect → signup succeeded
+                if (response.status_code == 302) {
+                    std.debug.print("[SIGNUP] SUCCESS: 302 redirect (account created)\n", .{});
+                    return true;
                 }
 
-                // If we get an Arkose challenge here unexpectedly
-                if (mem.indexOf(u8, response.body, "challenge_required") != null and mem.indexOf(u8, response.body, "true") != null) {
-                    return error.UnexpectedChallenge;
+                // 200 OK with onboarding redirect → succeeded
+                if (response.status_code == 200 and
+                    mem.indexOf(u8, response.body, "onboarding/guidance") != null)
+                {
+                    std.debug.print("[SIGNUP] SUCCESS: 200 OK with onboarding redirect\n", .{});
+                    return true;
                 }
+
+                // 200 OK with logged-in indicators → succeeded
+                if (response.status_code == 200 and
+                    (mem.indexOf(u8, response.body, "logout") != null or
+                    mem.indexOf(u8, response.body, "dashboard") != null))
+                {
+                    std.debug.print("[SIGNUP] SUCCESS: 200 OK with logged-in indicators\n", .{});
+                    return true;
+                }
+
+                // === FAILURE: 422 Unprocessable Entity ===
+                if (response.status_code == 422) {
+                    std.debug.print("[SIGNUP] FAILED: HTTP 422 Unprocessable Entity\n", .{});
+                    std.debug.print("[SIGNUP] Likely cause: CSRF failure, missing token, or wrong header\n", .{});
+                    const dump_len = @min(response.body.len, 2000);
+                    std.debug.print("[SIGNUP] 422 Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
+                    return false;
+                }
+
+                // === FAILURE: error indicators in 200 response ===
+                if (response.status_code == 200) {
+                    const error_indicators = [_][]const u8{
+                        "signup_errors",
+                        "error-messages",
+                        "form-disabled",
+                        "already registered",
+                        "password is too short",
+                        "password must contain",
+                        "username is already taken",
+                        "email is invalid",
+                    };
+                    for (error_indicators) |indicator| {
+                        if (mem.indexOf(u8, response.body, indicator) != null) {
+                            std.debug.print("[SIGNUP] FAILED: Error indicator found: \"{s}\"\n", .{indicator});
+                            const dump_len = @min(response.body.len, 2000);
+                            std.debug.print("[SIGNUP] Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
+                            return false;
+                        }
+                    }
+
+                    // 200 OK but no success indicators — form re-rendered
+                    std.debug.print("[SIGNUP] FAILED: 200 OK but no success indicators (form re-rendered)\n", .{});
+                    const dump_len = @min(response.body.len, 2000);
+                    std.debug.print("[SIGNUP] Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
+                    return false;
+                }
+
+                // === UNEXPECTED STATUS ===
+                std.debug.print("[SIGNUP] UNEXPECTED: HTTP Status {d}\n", .{response.status_code});
+                const dump_len = @min(response.body.len, 2000);
+                std.debug.print("[SIGNUP] Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
                 return false;
             }
         }
@@ -7711,22 +7878,151 @@ fn urlEncode(list: *std.array_list.Managed(u8), input: []const u8) !void {
     }
 }
 
+// SOURCE: Live DOM analysis of https://github.com/signup (2026-04-09)
+// Password rule from password input attribute:
+// "Password should be at least 15 characters OR at least 8 characters including
+//  a number and a lowercase letter."
+// Apple passwordrules attribute: "minlength: 15; allowed: unicode;"
+/// Validates that a password meets GitHub's 2026 signup requirements.
+/// Returns true if password satisfies EITHER:
+///   Option A: >= 15 characters (any unicode)
+///   Option B: >= 8 characters AND contains at least one digit AND one lowercase letter
+pub fn validateGithubPassword(password: []const u8) bool {
+    if (password.len == 0) return false;
+
+    // Option A: >= 15 chars — automatically valid
+    if (password.len >= 15) return true;
+
+    // Option B: >= 8 chars with number + lowercase
+    if (password.len < 8) return false;
+
+    var has_digit: bool = false;
+    var has_lower: bool = false;
+    for (password) |c| {
+        if (std.ascii.isDigit(c)) has_digit = true;
+        if (std.ascii.isLower(c)) has_lower = true;
+        if (has_digit and has_lower) return true;
+    }
+    return false;
+}
+
+/// Generates a password that satisfies GitHub's 2026 requirements:
+/// >= 15 chars (preferred, using Apple passwordrules minlength: 15)
+/// Uses entropy from /dev/urandom + readable characters
+pub fn generateSecurePassword(allocator: std.mem.Allocator, length: usize) ![]const u8 {
+    if (length < 15) return error.PasswordTooShort;
+
+    // Use alphanumeric charset for compatibility
+    const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const charset_len = charset.len;
+
+    var password = try allocator.alloc(u8, length);
+    errdefer allocator.free(password);
+
+    // Generate random bytes and map to charset
+    const random_bytes = try allocator.alloc(u8, length);
+    defer allocator.free(random_bytes);
+    try fillEntropy(random_bytes);
+
+    for (0..length) |i| {
+        password[i] = charset[random_bytes[i] % charset_len];
+    }
+
+    // Ensure at least one digit and one lowercase (satisfies both Option A and B)
+    password[length - 1] = '7'; // guarantee digit
+    password[length - 2] = 'a'; // guarantee lowercase
+
+    return password;
+}
+
 pub const RiskStatus = struct {
     challenge_required: bool,
 };
 
+// SOURCE: Live DOM analysis of https://github.com/signup (2026-04-09)
+// Extracts THREE critical tokens from the signup page HTML:
+//   1. authenticity_token — Rails CSRF token (base64, ~88 bytes)
+//   2. timestamp — page load timestamp in milliseconds
+//   3. timestamp_secret — anti-automation secret tied to timestamp
+pub const SignupTokens = struct {
+    authenticity_token: []const u8,
+    timestamp: []const u8,
+    timestamp_secret: []const u8,
+};
+
+pub fn extractSignupTokens(
+    html_buffer: []const u8,
+    token_allocator: std.mem.Allocator,
+) !SignupTokens {
+    var authenticity_token: ?[]const u8 = null;
+    var timestamp: ?[]const u8 = null;
+    var timestamp_secret: ?[]const u8 = null;
+
+    var search_start: usize = 0;
+    while (mem.indexOfPos(u8, html_buffer, search_start, "<input")) |input_start| {
+        const input_end = mem.indexOfScalarPos(u8, html_buffer, input_start, '>') orelse {
+            search_start = input_start + 6;
+            continue;
+        };
+        search_start = input_end;
+
+        const input_tag = html_buffer[input_start..input_end];
+
+        // Only interested in hidden inputs
+        if (mem.indexOf(u8, input_tag, "type=\"hidden\"") == null and
+            mem.indexOf(u8, input_tag, "type='hidden'") == null)
+        {
+            continue;
+        }
+
+        // Extract name
+        const name_attr = "name=\"";
+        const name_idx = mem.indexOf(u8, input_tag, name_attr) orelse continue;
+        const name_start = name_idx + name_attr.len;
+        const name_end = mem.indexOfScalarPos(u8, input_tag, name_start, '"') orelse continue;
+        const name = input_tag[name_start..name_end];
+
+        // Extract value
+        const value_attr = "value=\"";
+        const value_idx = mem.indexOf(u8, input_tag, value_attr) orelse continue;
+        const val_start = value_idx + value_attr.len;
+        const val_end = mem.indexOfScalarPos(u8, input_tag, val_start, '"') orelse continue;
+        const value = input_tag[val_start..val_end];
+
+        if (mem.eql(u8, name, "authenticity_token")) {
+            authenticity_token = try token_allocator.dupe(u8, value);
+        } else if (mem.eql(u8, name, "timestamp")) {
+            timestamp = try token_allocator.dupe(u8, value);
+        } else if (mem.eql(u8, name, "timestamp_secret")) {
+            timestamp_secret = try token_allocator.dupe(u8, value);
+        }
+
+        // Early exit if we have all three
+        if (authenticity_token != null and timestamp != null and timestamp_secret != null)
+            break;
+    }
+
+    const token = authenticity_token orelse return error.TokenNotFound;
+    const ts = timestamp orelse return error.TimestampNotFound;
+    const ts_secret = timestamp_secret orelse return error.TimestampSecretNotFound;
+
+    return SignupTokens{
+        .authenticity_token = token,
+        .timestamp = ts,
+        .timestamp_secret = ts_secret,
+    };
+}
+
+// DEPRECATED: kept for non-signup contexts that still need single token extraction
 pub fn extractAuthenticityToken(html_buffer: []const u8) ![]const u8 {
     const search_pattern = "authenticity_token";
     const start_idx = mem.indexOf(u8, html_buffer, search_pattern) orelse return error.TokenNotFound;
 
-    // Find the nearest value=" before or after this
-    // Let's find the `<input` start tag before this
     var tag_start = start_idx;
     while (tag_start > 0 and html_buffer[tag_start] != '<') {
         tag_start -= 1;
     }
 
-    // Find the `>` end tag after this
     var tag_end = start_idx;
     while (tag_end < html_buffer.len and html_buffer[tag_end] != '>') {
         tag_end += 1;
@@ -7766,6 +8062,10 @@ test "GitHubCookieJar: set and retrieve cookies" {
     try jar.setCookie("_gh_sess=session_data_here; Path=/; HttpOnly; Secure");
     try std.testing.expectEqualStrings("session_data_here", jar.gh_sess[0..jar.gh_sess_len]);
 
+    // Set _octo — SOURCE: Live observation 2026-04-09
+    try jar.setCookie("_octo=GH1.1.1820148997.1775692773; Path=/; Secure; SameSite=None");
+    try std.testing.expectEqualStrings("GH1.1.1820148997.1775692773", jar.octo[0..jar.octo_len]);
+
     // Build cookie header
     var buf: [2048]u8 = undefined;
     const cookie_header = try jar.cookieHeader(&buf);
@@ -7773,6 +8073,7 @@ test "GitHubCookieJar: set and retrieve cookies" {
     try std.testing.expect(mem.indexOf(u8, cookie_header, "user_session=abc123xyz789") != null);
     try std.testing.expect(mem.indexOf(u8, cookie_header, "__Host-user_session_same_site=host_session_value") != null);
     try std.testing.expect(mem.indexOf(u8, cookie_header, "_gh_sess=session_data_here") != null);
+    try std.testing.expect(mem.indexOf(u8, cookie_header, "_octo=GH1.1.1820148997.1775692773") != null);
 }
 
 test "GitHubCookieJar: empty jar returns error" {
@@ -7780,6 +8081,93 @@ test "GitHubCookieJar: empty jar returns error" {
     var buf: [1024]u8 = undefined;
 
     try std.testing.expectError(error.NoCookies, jar.cookieHeader(&buf));
+}
+
+test "validateGithubPassword: satisfies GitHub 2026 requirements" {
+    // Option A: >= 15 chars
+    try std.testing.expect(validateGithubPassword("abcdefghijklmnopq")); // exactly 15
+    try std.testing.expect(validateGithubPassword("short-but-strong!")); // 19 chars
+
+    // Option B: >= 8 chars with digit + lowercase
+    try std.testing.expect(validateGithubPassword("abc1defg")); // 8 chars, has digit+lower
+    try std.testing.expect(validateGithubPassword("test1abc")); // 8 chars
+
+    // Failures
+    try std.testing.expect(validateGithubPassword("short") == false); // too short, no option met
+    try std.testing.expect(validateGithubPassword("ABCDEFGH") == false); // 8 chars but no digit, no lower
+    try std.testing.expect(validateGithubPassword("abcdEFGH") == false); // 8 chars but no digit
+    try std.testing.expect(validateGithubPassword("12345678") == false); // 8 chars but no lowercase
+    try std.testing.expect(validateGithubPassword("") == false);
+}
+
+test "urlEncode: encodes base64 characters correctly for form-urlencoded" {
+    var list = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer list.deinit();
+
+    // Base64 token contains + / = which MUST be encoded
+    try urlEncode(&list, "abc+def/ghi=jkl");
+    try std.testing.expectEqualStrings("abc%2Bdef%2Fghi%3Djkl", list.items);
+}
+
+test "urlEncode: leaves safe characters alone" {
+    var list = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer list.deinit();
+
+    try urlEncode(&list, "user[login]");
+    try std.testing.expectEqualStrings("user%5Blogin%5D", list.items);
+}
+
+test "extractSignupTokens: extracts all three tokens from HTML" {
+    const allocator = std.testing.allocator;
+
+    const html =
+        \\<form action="/signup" method="post">
+        \\<input type="hidden" name="authenticity_token" value="abc+def/ghi==">
+        \\<input type="hidden" name="timestamp" value="1775694569904">
+        \\<input type="hidden" name="timestamp_secret" value="7c14a5e0590045005da84c8fe192921f">
+        \\</form>
+    ;
+
+    const tokens = try extractSignupTokens(html, allocator);
+    defer {
+        allocator.free(tokens.authenticity_token);
+        allocator.free(tokens.timestamp);
+        allocator.free(tokens.timestamp_secret);
+    }
+
+    try std.testing.expectEqualStrings("abc+def/ghi==", tokens.authenticity_token);
+    try std.testing.expectEqualStrings("1775694569904", tokens.timestamp);
+    try std.testing.expectEqualStrings("7c14a5e0590045005da84c8fe192921f", tokens.timestamp_secret);
+}
+
+test "buildSignupPayload: URL-encodes base64 token correctly" {
+    const allocator = std.testing.allocator;
+
+    const tokens = SignupTokens{
+        .authenticity_token = "abc+def/ghi==",
+        .timestamp = "1775694569904",
+        .timestamp_secret = "7c14a5e0590045005da8",
+    };
+
+    var payload = try GitHubHttpClient.buildSignupPayload(allocator, tokens, "testuser", "test@example.com", "Pass+word/123=");
+    defer payload.deinit();
+
+    // FIRST FIELD MUST INCLUDE KEY: authenticity_token=...
+    try std.testing.expect(mem.startsWith(u8, payload.items, "authenticity_token="));
+    // authenticity_token value must be URL-encoded (+ → %2B, / → %2F, = → %3D)
+    try std.testing.expect(mem.indexOf(u8, payload.items, "authenticity_token=abc%2Bdef%2Fghi%3D%3D") != null);
+    // user[email] must be URL-encoded (@ → %40)
+    try std.testing.expect(mem.indexOf(u8, payload.items, "test%40example.com") != null);
+    // user[password] must be URL-encoded (+ → %2B, / → %2F, = → %3D)
+    try std.testing.expect(mem.indexOf(u8, payload.items, "Pass%2Bword%2F123%3D") != null);
+    // timestamp must appear unencoded (numeric)
+    try std.testing.expect(mem.indexOf(u8, payload.items, "timestamp=1775694569904") != null);
+    // timestamp_secret must be URL-encoded
+    try std.testing.expect(mem.indexOf(u8, payload.items, "timestamp_secret=7c14a5e0590045005da8") != null);
+    // marketing_consent=0 must appear
+    try std.testing.expect(mem.indexOf(u8, payload.items, "user_signup%5Bmarketing_consent%5D=0") != null);
+    // Content-length = payload length (exact byte match for HPACK)
+    try std.testing.expect(payload.items.len > 300); // sanity: payload is substantial
 }
 
 test "HttpResponse: parse 200 OK response" {

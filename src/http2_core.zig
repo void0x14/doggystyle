@@ -2078,6 +2078,7 @@ test "buildGitHubPostHeaders: round-trip" {
 }
 
 // SOURCE: RFC 7541, Appendix A — Static Table Definitions
+// SOURCE: Live observation of GitHub signup POST (2026-04-09)
 pub fn buildGitHubSignupHeaders(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -2088,6 +2089,8 @@ pub fn buildGitHubSignupHeaders(
     const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
     const accept_value = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
     const content_type = "application/x-www-form-urlencoded";
+    const origin = "https://github.com";
+    const referer = "https://github.com/signup";
 
     // 1. :method: POST (Indexed, Index 3)
     const indexed_method = IndexedHeaderField{ .index = 3 };
@@ -2155,7 +2158,25 @@ pub fn buildGitHubSignupHeaders(
     const encoded_cl = try literal_cl.encode(allocator);
     defer allocator.free(encoded_cl);
 
-    // 9. cookie
+    // 9. origin — REQUIRED by GitHub for CSRF validation on POST
+    const literal_origin = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "origin",
+        .value = origin,
+    };
+    const encoded_origin = try literal_origin.encode(allocator);
+    defer allocator.free(encoded_origin);
+
+    // 10. referer — REQUIRED by GitHub for request validation
+    const literal_referer = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "referer",
+        .value = referer,
+    };
+    const encoded_referer = try literal_referer.encode(allocator);
+    defer allocator.free(encoded_referer);
+
+    // 11. cookie
     const literal_cookie = LiteralHeaderFieldIncrementalIndexing{
         .name_index = 32, // cookie is 32 in static table
         .name = null,
@@ -2166,7 +2187,8 @@ pub fn buildGitHubSignupHeaders(
 
     const total_len = encoded_method.len + encoded_scheme.len +
         encoded_path.len + encoded_authority.len +
-        encoded_ua.len + encoded_accept.len + encoded_ct.len + encoded_cl.len + encoded_cookie.len;
+        encoded_ua.len + encoded_accept.len + encoded_ct.len + encoded_cl.len +
+        encoded_origin.len + encoded_referer.len + encoded_cookie.len;
 
     const result = try allocator.alloc(u8, total_len);
     var offset: usize = 0;
@@ -2195,6 +2217,12 @@ pub fn buildGitHubSignupHeaders(
     @memcpy(result[offset .. offset + encoded_cl.len], encoded_cl);
     offset += encoded_cl.len;
 
+    @memcpy(result[offset .. offset + encoded_origin.len], encoded_origin);
+    offset += encoded_origin.len;
+
+    @memcpy(result[offset .. offset + encoded_referer.len], encoded_referer);
+    offset += encoded_referer.len;
+
     @memcpy(result[offset .. offset + encoded_cookie.len], encoded_cookie);
     offset += encoded_cookie.len;
 
@@ -2215,9 +2243,15 @@ test "buildGitHubSignupHeaders: round-trip" {
         allocator.free(headers);
     }
 
-    try std.testing.expectEqual(@as(usize, 9), headers.len);
+    // 11 headers: :method, :scheme, :path, :authority, user-agent, accept,
+    //             content-type, content-length, origin, referer, cookie
+    try std.testing.expectEqual(@as(usize, 11), headers.len);
     try std.testing.expectEqualStrings(":method", headers[0].name);
     try std.testing.expectEqualStrings("POST", headers[0].value);
-    try std.testing.expectEqualStrings("cookie", headers[8].name);
-    try std.testing.expectEqualStrings("test_cookie=value", headers[8].value);
+    try std.testing.expectEqualStrings("origin", headers[8].name);
+    try std.testing.expectEqualStrings("https://github.com", headers[8].value);
+    try std.testing.expectEqualStrings("referer", headers[9].name);
+    try std.testing.expectEqualStrings("https://github.com/signup", headers[9].value);
+    try std.testing.expectEqualStrings("cookie", headers[10].name);
+    try std.testing.expectEqualStrings("test_cookie=value", headers[10].value);
 }

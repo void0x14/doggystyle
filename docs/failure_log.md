@@ -6,6 +6,73 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-09] — GitHub Signup POST HTTP 422: Eksik Header'lar ve _octo Cookie CSRF Doğrulama Hatası
+
+**Hata:** `performSignup` fonksiyonu geçerli bir `authenticity_token` ve doğru kullanıcı bilgileriyle POST request gönderiyordu ama GitHub Rails backend'i HTTP 422 (Unprocessable Entity) döndürüyordu. Token extraction ve URL encoding doğruydu; sorun request formatındaydı.
+
+**Kök sebep:** Üç kritik eksik vardı:
+1. **`origin: https://github.com` header yoktu** — GitHub CSRF middleware'i origin header'ını bekliyor
+2. **`referer: https://github.com/signup` header yoktu** — Request validation için gerekli
+3. **`_octo` cookie request'e eklenmiyordu** — `GitHubCookieJar` bu cookie'yi parse etmiyor ve outbound request'e dahil etmiyordu. Bu cookie GitHub'ın request tracking/CSRF validasyonu için zorunlu.
+
+Ayrıca `buildGitHubSignupHeaders` fonksiyonu bu üç header'ı içermiyordu ve `cookieHeader` metodu `_octo`'yu bilmiyordu.
+
+**Kaynak:** Live DOM analysis of `https://github.com/signup` via Chrome DevTools MCP (2026-04-09)
+**Kaynak:** Chrome DevTools `document.cookie` — `_octo=GH1.1.1820148997.1775692773` gözlemlendi
+**Kaynak:** Chrome DevTools form input listesi — `origin` ve `referer` header gerekliliği, `_octo` cookie varlığı doğrulandı
+
+**Düzeltme (Iteration 1):**
+1. `GitHubCookieJar` struct'ına `octo: [128]u8` ve `octo_len: usize` field'ları eklendi
+2. `setCookie` metodu `_octo` cookie'sini parse edip saklıyor
+3. `cookieHeader` metodu `_octo`'yu outbound cookie string'e dahil ediyor
+4. `buildGitHubSignupHeaders` (`http2_core.zig`) artık `origin: https://github.com` ve `referer: https://github.com/signup` header'larını HPACK encode ediyor
+
+---
+
+## [2026-04-09] — GitHub Signup POST HTTP 422: STAGE 3 — `timestamp` + `timestamp_secret` Tokens Missing, Payload Built Lazily
+
+**Hata:** Iteration 1'den sonra bile 422 devam ediyordu çünkü:
+1. `extractSignupHiddenFields` tüm hidden input'ları körü körüne payload'a ekliyordu — `timestamp` ve `timestamp_secret` dinamik token'ları HTML'den çıkarılmıyordu
+2. Payload construction lazy'di — `writer.print` benzeri tek seferlik yazım yerine her field ayrı URL-encode edilip append edilmeliydi
+3. `authenticity_token` extraction sadece tek bir token'ı çıkarıyordu — `timestamp` ve `timestamp_secret` aynı anda extract edilmeliydi
+
+**Kök sebep:** Token extraction ve payload construction ayrı katmanlar olarak tasarlanmamıştı. `extractSignupHiddenFields` generic bir hidden field extractor olarak çalışıyordu ama `timestamp`/`timestamp_secret` gibi kritik anti-automation token'ları için dedicated extraction yoktu.
+
+**Kaynak:** Live DOM analysis of `https://github.com/signup` via Chrome DevTools MCP (2026-04-09)
+**Kaynak:** Recon Report — 17 input field, 12'si named, 3'ü honeypot, 11'i payload'a dahil
+
+**Düzeltme (Iteration 2 / STAGE 3):**
+1. `extractSignupTokens()` — yeni fonksiyon, `SignupTokens` struct döndürür:
+   - `authenticity_token` (base64, ~88B)
+   - `timestamp` (ms, ~13B)
+   - `timestamp_secret` (hex, ~64B)
+   - Her token'ı `allocator.dupe` ile heap'e kopyalar (caller owns)
+2. `buildSignupPayload()` — EXACT wire-order payload builder:
+   - `authenticity_token` → URL-encoded (base64 `+`→`%2B`, `/`→`%2F`, `=`→`%3D`)
+   - `return_to` → empty
+   - `invitation_token` → empty
+   - `repo_invitation_token` → empty
+   - `user[email]` → URL-encoded
+   - `user[password]` → URL-encoded
+   - `user[login]` → URL-encoded
+   - `user_signup[country]=TR`
+   - `user_signup[marketing_consent]=0`
+   - `octocaptcha-token=` → empty (captcha not solved)
+   - `timestamp` → extracted value
+   - `timestamp_secret` → extracted value
+3. `performSignup` — tam rewrite, step-by-step:
+   - Token extraction → Payload construction → Cookie building → HPACK headers → Send → Parse response
+   - 422 → explicit body dump (2000 bytes)
+   - Timeout 5s → 10s
+4. `extractAuthenticityToken` → DEPRECATED ama backward compat için korundu
+
+**Tekrar olmaması için:**
+- Her signup POST öncesi Recon Report'taki wire order'a uyulacak
+- Tüm dinamik değerler URL-encoded olacak
+- Honeypot alanlar (`filter`, `required_field_*`, boş isimli CSRF) asla payload'a eklenmeyecek
+
+---
+
 ## [2026-04-09] — Digistallone Livewire Snapshot Parser Ham HTML Attribute Değerini Yanlış Kullandığı İçin Mailbox Akışı Çöküyordu
 
 **Hata:** `LivewireClient.parseInitialState` `wire:snapshot="..."` aramasında bulunan offset’i kullanmıyordu; ilk component snapshot’ı fiilen `"\n<html dir="` ile başlıyordu. Üstelik attribute içindeki `&quot;` entity’leri decode edilmeden saklanıyor, `buildUpdateRequest` de bu veriyi JSON string yerine ham/object gibi POST ediyordu. Sonuç: request gövdesi geçersiz hale geliyor ve create akışı bozuluyordu. Ayrıca istemci, `GET /mailbox` içinde zaten bootstrap edilen mevcut email’i (`const email = '...'`) hiç okumadığı için gereksiz yere bozuk `create` yoluna giriyordu.
