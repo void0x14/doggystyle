@@ -6,6 +6,194 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-09] — Stale Keep-Alive Connection: TcpRecvFailed After 11-Second Idle
+
+**Hata:** `DigistalloneClient` GitHub signup süreci (~11 saniye) boyunca idle kaldıktan sonra `pollInboxForGitHubCode()` çağrıldığında `error.TcpRecvFailed` fırlatıyordu.
+
+**Kök sebep (detaylı analiz):**
+```
+Timeline:
+  T=0s    → DigistalloneClient.init() → TCP+TLS aç → GET /mailbox → CSRF alındı
+  T=0-11s → GitHub signup süreci (BDA, Arkose, form POST, vs.) — Digistallone socket IDLE
+  T=5s    → LiteSpeed Keep-Alive timeout → server TCP'yi SESSİZCE kapattı
+  T=11s   → pollInboxForGitHubCode() → sendRaw() → OS buffer'a yazdı (hata YOK)
+             → recvFullResponse() → reader.take(1) → KAPALI soket → TcpRecvFailed 💥
+```
+
+**Neden sendRaw hata vermedi ama recvFullResponse verdi:**
+- `writer.writeAll()` → OS kernel TCP buffer'a yazar (async)
+- `writer.flush()` → TLS buffer'ı flush eder ama TCP ACK'sı gelmeden döner
+- `reader.take(1)` → Sunucudan byte bekler → kapalı soket → ECONNRESET/EOF
+
+**LiteSpeed Keep-Alive varsayılanları:**
+- `keepalive_timeout`: 5 saniye
+- `maxKeepAliveRequests`: 10000
+- Idle connection 5s sonra sessizce kapatılır (RST gönderilmez, sadece TCP FIN)
+
+**Düzeltme (3 katmanlı savunma):**
+1. **`HttpClient.last_activity_ns`** — Her send/recv sonrası timestamp güncellenir
+2. **`HttpClient.isStale(max_idle_ms)`** — Idle süresi threshold'u aşmışsa true döner
+3. **`DigistalloneClient.ensureConnected()`** — Poll öncesi staleness kontrolü:
+   - Idle > 3s ise http.deinit() + HttpClient.init() ile TAM YENİ bağlantı
+   - GET /mailbox ile CSRF yenile + Livewire state parse
+4. **`pollInboxForGitHubCode` retry logic** — TcpRecvFailed olursa ensureConnected + retry
+
+NOT: İlk `reconnect()` implementasyonu çalışmadı — partial reconnect sırasında TLS handshake sonrası bağlantı stabil olmadı. Çözüm: `deinit()` + `init()` ile sıfırdan bağlantı.
+
+**Kaynak:**
+- LiteSpeed docs — `keepalive_timeout` default 5s
+- man 2 clock_gettime — CLOCK_MONOTONIC for elapsed time measurement
+- RFC 7230, Section 6.3 — HTTP/1.1 persistent connections and idle timeout
+
+**Tekrar olmaması için:**
+- Her HTTP client connection için idle timeout tracking zorunlu
+- 5 saniyeden uzun operasyonlar öncesi connection health check yapılmalı
+- TcpRecvFailed aldığında otomatik reconnect + retry mekanizması olmalı
+
+---
+
+## [2026-04-09] — Digistallone `pollInbox` Yanlış Livewire Component Index'ine Request Gönderiyordu
+
+**Hata:** `LivewireClient.pollInbox()` çağrısı `component_idx = 1` ile `frontend.nav` component'ine `fetchMessages` dispatch ediyordu. `fetchMessages` metodu `frontend.nav`'da yok → server 500 Internal Server Error döndürüyordu.
+
+**Kök sebep:** Sayfada 3 Livewire component var (HTML'deki sırayla):
+1. `[0] frontend.actions` — email oluşturma, `syncEmail` listener
+2. `[1] frontend.nav` — navigasyon menüsü, **hiçbir listener yok**
+3. `[2] frontend.app` — inbox/mesajlar, `syncEmail` + `fetchMessages` listeners
+
+`pollInbox` yanlışlıkla index 1 (`frontend.nav`) kullanıyordu. Doğru index 2 (`frontend.app`).
+
+**Wire-Truth Kaynak (Chrome DevTools MCP + curl doğrulaması, 2026-04-09):**
+```
+Sayfa yapısı (3 component):
+  [0] frontend.actions | email=None | listeners: [syncEmail, checkReCaptcha3]
+  [1] frontend.nav     | email=N/A  | listeners: []
+  [2] frontend.app     | email=None | listeners: [syncEmail, fetchMessages]
+
+Browser refresh request (sadece frontend.app):
+  POST /livewire/update
+  Component: frontend.app (index 2)
+  Calls: [{method: "__dispatch", params: ["fetchMessages", {}]}]
+  Response: HTTP 200 OK → JSON with effects.html
+```
+
+**Düzeltme:**
+1. `findComponentByName()` helper metodu eklendi — component'ı isme göre bulur
+2. `pollInbox` artık `findComponentByName("frontend.app") orelse 2` kullanır
+3. `updateStateFromResponse` daha önce düzeltilmişti — tüm component'ları name-based matching ile güncelliyor
+4. `unescapeJsonString` helper — `effects.html` JSON-escaped HTML'ini decode eder
+
+**Ek bulgular (curl ile doğrulandı):**
+- HTTP/1.1 protocol digistallone.com'da sorunsuz çalışıyor (server LiteSpeed, h2 + h1 destekliyor)
+- `Origin`/`Referer` header'ları CSRF validation için gerekli DEĞİL (cookie + _token yeterli)
+- `x-livewire:` header boş değerle bile gönderilmeli (browser bunu yapıyor)
+- `Accept-Encoding: identity` çalışıyor — server uncompressed JSON döndürüyor
+- **KRITIK**: `#HttpOnly_` prefix'li cookie'ler curl cookie jar'da comment gibi görünür ama gerçek cookie'dir. Python testinde bu yüzden `tmail_session` cookie'si gönderilmiyordu.
+
+**Tekrar olmaması için:**
+- Her Livewire request öncesi Chrome DevTools ile component order doğrulanacak
+- Component index'leri hardcode yerine name-based lookup ile bulunacak
+- Cookie parsing'te `#HttpOnly_` prefix handling yapılacak
+
+---
+
+## [2026-04-09] — Digistallone `TcpRecvFailed`: Eksik CSRF Header'ları ve Stale Snapshot
+
+**Hata:** `DigistalloneClient.pollInboxForGitHubCode()` çağrısı `error.TcpRecvFailed` ile başarısız oluyordu. Server bağlantayı erken kapatıyordu.
+
+**Kök sebep:** Üç ayrı sorun aynı anda etkiliyordu:
+
+1. **Eksik `Referer` ve `Origin` header'ları** — Laravel'in `VerifyCsrfToken` middleware'i bu header'ları doğruluyor. Zig kodu bunları göndermiyordu, server 419 CSRF mismatch dönüyordu.
+2. **Eksik `x-livewire:` header** — Browser boş değerle bile gönderiyor (`x-livewire: `). Livewire v3 server-side bu header'ı bekliyor.
+3. **Stale snapshot** — `updateStateFromResponse` sadece `components[0]` (frontend.actions) güncelliyordu. `pollInbox` ise `components[1]` (frontend.app) kullanıyor. Bu component'in snapshot'u hiç yenilenmiyordu — server eski snapshot ile gelen request'i reddediyor veya stale data döndürüyordu.
+
+**Wire-Truth Kaynak (Chrome DevTools MCP, 2026-04-09):**
+```
+Browser POST /livewire/update headers:
+  origin:https://digistallone.com
+  referer:https://digistallone.com/mailbox
+  x-livewire:
+  content-type:application/json
+  cookie:XSRF-TOKEN=...; tmail_session=...
+
+Browser snapshot (frontend.app):
+  {"data":{"messages":[[],{"s":"arr"}],...,"initial":true,...},
+   "memo":{"id":"dGjCh8D4wpXL2aJ6NgdX","name":"frontend.app",...},
+   "checksum":"b1fa3fd54475e7fe08e4693d68122122263d1d677b5231cd4c561f58d2b0d018"}
+```
+
+**Düzeltme:**
+1. `postJson` fonksiyonuna 3 header eklendi:
+   - `Origin: https://digistallone.com`
+   - `Referer: https://digistallone.com/mailbox`
+   - `x-livewire: ` (boş değer)
+2. `updateStateFromResponse` tamamen yeniden yazıldı:
+   - Response'daki TÜM snapshot'ları parse ediyor
+   - Her snapshot'ı component name'e göre eşleştiriyor
+   - Hem JSON string (`"snapshot":"{...}"`) hem raw object (`"snapshot":{...}`) formatını destekliyor
+3. `pollInboxForGitHubCode` her poll sonrası `updateStateFromResponse` çağırıyor
+4. `unescapeJsonString` helper eklendi — `effects.html` JSON-escaped HTML'ini decode ediyor
+5. User-Agent versiyonu `Chrome/146` → `Chrome/147` (wire-truth ile eşleşmesi için)
+
+**Tekrar olmaması için:**
+- Her Livewire request öncesi Chrome DevTools ile wire-truth capture edilecek
+- Header eksiklikleri against browser comparison ile doğrulanacak
+- Snapshot freshness her component için ayrı ayrı doğrulanacak
+
+---
+
+## [2026-04-09] — Module 3.2: Vendored stdlib API Drift File I/O ve Sleep Fonksiyonlarını Bozdu
+
+**Hata:** `main.zig`'de `std.fs.cwd().createFile()` ve `digistallone.zig`'de `posix.nanosleep()` kullanıldı. İkisi de vendored Zig 0.16.0 stdlib'de mevcut değildi — derleme hatası verdi.
+
+**Kök sebep:** Standart Zig 0.16.0 ile projenin `vendor/zig-std` kopyası arasında API farklılıkları var. `std.fs` modülü bu vendored kopyada `std.Io` olarak yeniden adlandırılmış. `posix.nanosleep` da aynı şekilde taşınmış — `io.sleep(Duration, .awake)` kullanılması gerekiyor.
+
+**Kaynak:** `vendor/zig-std/std/Io/Dir.zig` — `createFile`, `openFile`, `OpenFileOptions.Mode`
+**Kaynak:** `vendor/zig-std/std/Io/File.zig` — `writePositionalAll`, `length`
+**Kaynak:** `vendor/zig-std/std/Io.zig` — `Duration.fromMilliseconds`, `io.sleep`
+
+**Düzeltme:**
+1. `std.fs.cwd().createFile()` → `std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false })`
+2. `error.PathAlreadyExists` durumunda `openFile(io, path, .{ .mode = .write_only })` fallback
+3. Append işlemi: `file.length(io)` → `file.writePositionalAll(io, data, len)`
+4. `posix.nanosleep(&ts, null)` → `io.sleep(std.Io.Duration.fromMilliseconds(ms), .awake)`
+
+**Tekrar olmaması için:**
+- Zig API kullanırken önce `vendor/zig-std/std` dizininde arama yapılacak
+- `std.fs.*` yerine `std.Io.*` namespace'i varsayılan
+- `posix.*` zaman fonksiyonları yerine `io.sleep()` kullanılacak
+
+---
+
+## [2026-04-09] — Module 3.2: GitHub Email Verification Endpoint Eksikti
+
+**Hata:** Signup sonrası email verification akışı için `verifyEmail` fonksiyonu ve `buildGitHubVerifyHeaders` HPACK encoder'ı yoktu.
+
+**Kök sebep:** Sadece signup POST (`/signup`) implement edilmişti. Verification (`/signup/verify_email`) ayrıca ele alınmamıştı.
+
+**Kaynak:** GitHub signup flow — POST `/signup/verify_email` with `verification_code` body
+**Kaynak:** RFC 9113, Section 6.2 — HEADERS Frame for HTTP/2 POST
+
+**Düzeltme:**
+1. `GitHubHttpClient.verifyEmail()` — `network_core.zig`'e eklendi
+   - Code validation: exactly 6 digits
+   - HTTP/2 POST via new stream ID
+   - Response parsing: 302 = success, 422 = wrong code
+2. `buildGitHubVerifyHeaders()` — `http2_core.zig`'e eklendi
+   - Same structure as signup headers
+   - Referer: `https://github.com/signup/verify_email`
+3. `main.zig` — Module 3.2 orchestration:
+   - Credentials saved to `accounts.txt`
+   - Livewire mailbox polling
+   - Code extraction and submission
+   - Success/failure reporting
+
+**Tekrar olmaması için:**
+- Her signup sonrası verification adımı zorunlu
+- Verification endpoint ayrıca HPACK header set'i gerektirir
+
+---
+
 ## [2026-04-09] — GitHub Signup POST HTTP 422: Eksik Header'lar ve _octo Cookie CSRF Doğrulama Hatası
 
 **Hata:** `performSignup` fonksiyonu geçerli bir `authenticity_token` ve doğru kullanıcı bilgileriyle POST request gönderiyordu ama GitHub Rails backend'i HTTP 422 (Unprocessable Entity) döndürüyordu. Token extraction ve URL encoding doğruydu; sorun request formatındaydı.

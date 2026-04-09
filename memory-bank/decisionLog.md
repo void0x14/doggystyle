@@ -33,3 +33,14 @@ All decisions prioritize fingerprint alignment over standard library convenience
 - **Problem**: Sending raw Handshake payloads without a Record Header caused servers to drop packets.
 - **Decision**: Explicitly wrap Client Hello in a 5-byte TLS Record Layer (0x16 0x03 0x01).
 - **Impact**: Successful JA4S communication and handshake completion.
+
+### 7. Module 3.2 — Email Verification via Livewire
+- **Problem**: GitHub signup requires email verification before account activation. No REST API exists for digistallone.com mailbox.
+- **Decision**: Use existing Laravel Livewire v3 state synchronization (`/livewire/update` POST) to poll mailbox, extract 6-digit code, and submit to GitHub `/signup/verify_email`.
+- **Impact**: Fully automated account creation pipeline — signup → verification → activation without manual intervention.
+- **Credential Persistence**: `accounts.txt` with `username:password:email` format, appended after signup success.
+
+### 8. Vendored stdlib API Compliance
+- **Problem**: Zig 0.16.0 vendored stdlib uses different API (`std.Io.*` vs `std.fs.*`, `io.sleep` vs `posix.nanosleep`).
+- **Decision**: All file I/O uses `std.Io.Dir.cwd().createFile/openFile/writePositionalAll`. Sleep uses `io.sleep(Duration, .awake)`.
+- **Impact**: Clean builds with zero compile errors, compatible with project's vendored toolchain.

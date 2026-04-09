@@ -335,6 +335,78 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // =========================================================================
+    // ADIM 11.6: Module 3.2 — Email Verification via Digistallone Livewire
+    // =========================================================================
+    // GitHub signup returned 302 → we're on the "Enter Verification Code" page.
+    // Now we:
+    //   1. Persist credentials to accounts.txt
+    //   2. Poll digistallone mailbox via Livewire sync for the GitHub verification email
+    //   3. Extract the 6-digit code
+    //   4. POST it back to GitHub /signup/verify_email
+    // =========================================================================
+
+    // --- 1. Persist credentials ---
+    const accounts_file = "accounts.txt";
+    {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "{s}:{s}:{s}\n",
+            .{ username, password, email },
+        );
+        defer allocator.free(line);
+        const file = std.Io.Dir.cwd().createFile(io, accounts_file, .{ .truncate = false }) catch |err| blk: {
+            // If file already exists, open it for writing instead
+            if (err == error.PathAlreadyExists) {
+                break :blk try std.Io.Dir.cwd().openFile(io, accounts_file, .{ .mode = .write_only });
+            }
+            return err;
+        };
+        defer file.close(io);
+        // Append: write at end of file
+        const file_len = try file.length(io);
+        try file.writePositionalAll(io, line, file_len);
+        std.debug.print("[ACCOUNTS] Credentials saved to {s}\n", .{accounts_file});
+    }
+
+    // --- 2. Poll digistallone mailbox for GitHub verification code ---
+    std.debug.print("\n[MAIL] Polling digistallone mailbox for GitHub verification code...\n", .{});
+
+    const github_code = mail_client.pollInboxForGitHubCode(
+        digistallone.MAX_POLL_ATTEMPTS,
+        digistallone.DEFAULT_POLL_INTERVAL_MS,
+    ) catch |err| {
+        std.debug.print("[MAIL] FAILED: Could not retrieve verification code: {}\n", .{err});
+        std.debug.print("[MAIL] Tip: Check if GitHub email was sent to {s}\n", .{email});
+        std.process.exit(1);
+    };
+    defer allocator.free(github_code);
+
+    std.debug.print("[MAIL] Livewire sync successful. Code {s} found. Submitting...\n", .{github_code});
+
+    // --- 3. Submit code to GitHub ---
+    const verify_success = github_client.verifyEmail(
+        allocator,
+        github_code,
+        &sock,
+        dst_ip,
+    ) catch |err| {
+        std.debug.print("[VERIFY] FAILED: Email verification error: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    if (verify_success) {
+        std.debug.print("\n╔══════════════════════════════════════════════════════════╗\n", .{});
+        std.debug.print("║           ACCOUNT VERIFIED — FULLY CREATED!              ║\n", .{});
+        std.debug.print("║   Username: {s:<36}║\n", .{username});
+        std.debug.print("║   Email:    {s:<36}║\n", .{email});
+        std.debug.print("╚══════════════════════════════════════════════════════════╝\n", .{});
+    } else {
+        std.debug.print("[VERIFY] FAILED: Verification code was rejected by GitHub.\n", .{});
+        std.debug.print("[VERIFY] Code attempted: {s}\n", .{github_code});
+        std.process.exit(1);
+    }
+
+    // =========================================================================
     // ADIM 12: Safe Shutdown
     // =========================================================================
     std.debug.print("\n[SHUTDOWN] Initiating safe shutdown...\n", .{});
