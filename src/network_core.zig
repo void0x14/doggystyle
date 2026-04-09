@@ -7862,6 +7862,170 @@ pub const GitHubHttpClient = struct {
 
         return error.ReadTimeout;
     }
+
+    /// Submit email verification code to GitHub after signup
+    /// SOURCE: GitHub signup flow — POST /signup/verify_email with verification_code
+    /// SOURCE: RFC 9113, Section 6.2 — HEADERS Frame for HTTP/2 POST
+    /// SOURCE: RFC 9113, Section 6.1 — DATA Frame for request body
+    ///
+    /// NETWORK STACK ANALYSIS:
+    /// [1] Existing TCP/TLS session from signup is reused — no new handshake
+    /// [2] HTTP/2 stream: new odd-numbered stream ID (nextClientStreamId)
+    /// [3] Cookies: user_session + _gh_sess + _octo carried over from signup
+    /// [4] No firewall changes needed — same OUTPUT chain as signup
+    pub fn verifyEmail(
+        self: *GitHubHttpClient,
+        allocator: std.mem.Allocator,
+        verification_code: []const u8,
+        sock: anytype,
+        dst_ip: u32,
+    ) !bool {
+        std.debug.print("[VERIFY] Starting email verification with code: {s}\n", .{verification_code});
+
+        // Validate code format: must be 6-10 digits (observed range from real emails)
+        // WIRE-TRUTH: Real codes observed: 6-digit classic, 8-digit (90818627)
+        if (verification_code.len < 6 or verification_code.len > 10)
+            return error.InvalidVerificationCode;
+        for (verification_code) |c| {
+            if (!std.ascii.isDigit(c)) return error.InvalidVerificationCode;
+        }
+
+        // Ensure TLS session and HTTP/2 connection
+        _ = self.tls_session orelse return error.NoTlsSession;
+        if (self.hpack_decoder == null) {
+            self.hpack_decoder = http2_core.HpackDecoder.init(allocator);
+        }
+        try self.ensureHttp2ConnectionReady(allocator, sock, dst_ip);
+
+        // Build request body: verification_code=XXXXXX (6-10 digits)
+        var body_buf: [128]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "verification_code={s}", .{verification_code});
+
+        // Build cookie header
+        var cookie_buf: [4096]u8 = undefined;
+        const cookie_str = self.cookie_jar.cookieHeader(&cookie_buf) catch "";
+
+        // Build HPACK headers for POST /signup/verify_email
+        const hpack_block = try http2_core.buildGitHubVerifyHeaders(
+            allocator,
+            "/signup/verify_email",
+            self.host,
+            body.len,
+            cookie_str,
+        );
+        defer allocator.free(hpack_block);
+
+        const stream_id = try self.nextClientStreamId();
+
+        // Send HEADERS frame
+        const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, stream_id, false);
+        defer allocator.free(headers_frame);
+
+        try self.sendTlsApplicationData(
+            allocator,
+            sock,
+            dst_ip,
+            headers_frame,
+            "HTTP/2 VERIFY HEADERS",
+        );
+
+        // Send DATA frame with body
+        const data_frame = try packInDataFrame(allocator, body, stream_id, true);
+        defer allocator.free(data_frame);
+
+        try self.sendTlsApplicationData(
+            allocator,
+            sock,
+            dst_ip,
+            data_frame,
+            "HTTP/2 VERIFY DATA",
+        );
+
+        // Parse response
+        var response_parser = http2_core.Http2ResponseParser.init(
+            allocator,
+            &(self.hpack_decoder.?),
+            stream_id,
+        );
+        defer response_parser.deinit();
+
+        const timeout_start = currentTimestampMs();
+        while (currentTimestampMs() - timeout_start < 10000) {
+            const remaining_timeout = 10000 - (currentTimestampMs() - timeout_start);
+            const plaintext = try receiveTlsApplicationData(self, allocator, sock, remaining_timeout);
+            defer allocator.free(plaintext);
+
+            try response_parser.processApplicationData(plaintext);
+            const window_increment = response_parser.takeWindowUpdateIncrement();
+            if (window_increment > 0) {
+                const connection_window_update = http2_core.buildWindowUpdateFrame(0, window_increment);
+                try self.sendTlsApplicationData(
+                    allocator,
+                    sock,
+                    dst_ip,
+                    &connection_window_update,
+                    "HTTP/2 connection WINDOW_UPDATE",
+                );
+                const stream_window_update = http2_core.buildWindowUpdateFrame(stream_id, window_increment);
+                try self.sendTlsApplicationData(
+                    allocator,
+                    sock,
+                    dst_ip,
+                    &stream_window_update,
+                    "HTTP/2 stream WINDOW_UPDATE",
+                );
+            }
+            if (response_parser.isComplete()) {
+                var response = try response_parser.finish();
+                defer response.deinit(allocator);
+
+                // Update cookies from response
+                try extractCookiesFromHttp2Response(&response, &self.cookie_jar);
+
+                std.debug.print("[VERIFY] Response Status: {d}\n", .{response.status_code});
+
+                // 302 redirect → verification succeeded, redirecting to dashboard
+                if (response.status_code == 302) {
+                    std.debug.print("[VERIFY] SUCCESS: 302 redirect (email verified)\n", .{});
+                    return true;
+                }
+
+                // 200 OK with onboarding/guidance → succeeded
+                if (response.status_code == 200 and
+                    (mem.indexOf(u8, response.body, "onboarding") != null or
+                    mem.indexOf(u8, response.body, "dashboard") != null or
+                    mem.indexOf(u8, response.body, "logout") != null))
+                {
+                    std.debug.print("[VERIFY] SUCCESS: 200 OK with logged-in indicators\n", .{});
+                    return true;
+                }
+
+                // 200 OK but back to verification page → code was wrong
+                if (response.status_code == 200 and
+                    mem.indexOf(u8, response.body, "verification_code") != null)
+                {
+                    std.debug.print("[VERIFY] FAILED: Still on verification page (wrong code)\n", .{});
+                    return false;
+                }
+
+                // 422 → validation error
+                if (response.status_code == 422) {
+                    std.debug.print("[VERIFY] FAILED: HTTP 422 (invalid code or CSRF failure)\n", .{});
+                    const dump_len = @min(response.body.len, 2000);
+                    std.debug.print("[VERIFY] 422 Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
+                    return false;
+                }
+
+                // Unexpected status
+                std.debug.print("[VERIFY] UNEXPECTED: HTTP Status {d}\n", .{response.status_code});
+                const dump_len = @min(response.body.len, 2000);
+                std.debug.print("[VERIFY] Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
+                return false;
+            }
+        }
+
+        return error.ReadTimeout;
+    }
 };
 
 fn urlEncode(list: *std.array_list.Managed(u8), input: []const u8) !void {

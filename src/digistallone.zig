@@ -259,6 +259,14 @@ fn extractBootstrapEmail(html: []const u8) ?[]const u8 {
     return after[0..end];
 }
 
+/// Get current monotonic timestamp in nanoseconds.
+/// SOURCE: man 2 clock_gettime — CLOCK_MONOTONIC for measuring elapsed time
+fn currentTimestampNs() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+}
+
 // ---------------------------------------------------------------------------
 // HTTP/1.1 Client over TLS
 // ---------------------------------------------------------------------------
@@ -279,6 +287,15 @@ pub const HttpClient = struct {
     read_buf: []u8,
     write_buf: []u8,
     cookie_jar: CookieJar = .{},
+    /// Last activity timestamp (nanoseconds since epoch).
+    /// Used to detect stale connections (server Keep-Alive timeout).
+    last_activity_ns: i64 = 0,
+    /// Stored connection parameters for reconnection
+    target: [256]u8 = [_]u8{0} ** 256,
+    target_len: usize = 0,
+    port: u16 = 0,
+    sni: [256]u8 = [_]u8{0} ** 256,
+    sni_len: usize = 0,
 
     // SOURCE: vendor/zig-std/std/Io/net.zig — std.Io.net.IpAddress.parse/connect
     // SOURCE: vendor/zig-std/std/Io/net/HostName.zig — std.Io.net.HostName.init/connect
@@ -372,6 +389,15 @@ pub const HttpClient = struct {
             return DigistalloneError.TlsHandshakeFailed;
         };
 
+        // Store connection parameters for reconnection
+        var stored_target: [256]u8 = [_]u8{0} ** 256;
+        const target_copy = @min(target.len, stored_target.len);
+        @memcpy(stored_target[0..target_copy], target[0..target_copy]);
+        var stored_sni: [256]u8 = [_]u8{0} ** 256;
+        const sni_copy = @min(sni.len, stored_sni.len);
+        @memcpy(stored_sni[0..sni_copy], sni[0..sni_copy]);
+        const now_ns = currentTimestampNs();
+
         return .{
             .allocator = allocator,
             .io_impl = io_impl,
@@ -382,6 +408,13 @@ pub const HttpClient = struct {
             .writer_ptr = writer_ptr,
             .read_buf = read_buf,
             .write_buf = write_buf,
+            .cookie_jar = .{},
+            .last_activity_ns = now_ns,
+            .target = stored_target,
+            .target_len = target_copy,
+            .port = port,
+            .sni = stored_sni,
+            .sni_len = sni_copy,
         };
     }
 
@@ -394,6 +427,21 @@ pub const HttpClient = struct {
         self.allocator.free(self.read_buf);
         self.io_impl.deinit();
         self.allocator.destroy(self.io_impl);
+    }
+
+    /// Check if the connection has been idle too long (server likely closed it).
+    /// LiteSpeed Keep-Alive timeout is typically 5 seconds.
+    /// We use a conservative 3-second threshold.
+    /// SOURCE: LiteSpeed documentation — default keepalive_timeout = 5s
+    pub fn isStale(self: *const HttpClient, max_idle_ms: u64) bool {
+        const now_ns = currentTimestampNs();
+        const elapsed_ms: i64 = @divTrunc(now_ns - self.last_activity_ns, std.time.ns_per_ms);
+        return elapsed_ms > max_idle_ms;
+    }
+
+    /// Record activity — call after every send/recv operation
+    pub fn recordActivity(self: *HttpClient) void {
+        self.last_activity_ns = currentTimestampNs();
     }
 
     // --- HTTP Request Building ---
@@ -505,7 +553,7 @@ pub const HttpClient = struct {
         }
         // Headers
         {
-            const ua = "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36\r\n";
+            const ua = "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36\r\n";
             @memcpy(buf[pos .. pos + ua.len], ua);
             pos += ua.len;
             const accept = "Accept: application/json, text/plain, */*\r\n";
@@ -514,6 +562,17 @@ pub const HttpClient = struct {
             const ct = "Content-Type: application/json\r\n";
             @memcpy(buf[pos .. pos + ct.len], ct);
             pos += ct.len;
+            // SOURCE: Wire-truth capture 2026-04-09 — browser sends these for Laravel CSRF validation
+            const origin_hdr = "Origin: https://" ++ DIGISTALLONE_HOST ++ "\r\n";
+            @memcpy(buf[pos .. pos + origin_hdr.len], origin_hdr);
+            pos += origin_hdr.len;
+            const referer_hdr = "Referer: https://" ++ DIGISTALLONE_HOST ++ "/mailbox\r\n";
+            @memcpy(buf[pos .. pos + referer_hdr.len], referer_hdr);
+            pos += referer_hdr.len;
+            // SOURCE: Wire-truth — browser sends empty x-livewire header (Livewire v3 signature)
+            const livewire_hdr = "x-livewire: \r\n";
+            @memcpy(buf[pos .. pos + livewire_hdr.len], livewire_hdr);
+            pos += livewire_hdr.len;
             const enc = "Accept-Encoding: identity\r\n";
             @memcpy(buf[pos .. pos + enc.len], enc);
             pos += enc.len;
@@ -565,11 +624,13 @@ pub const HttpClient = struct {
         writer.writeAll(data) catch return DigistalloneError.TcpSendFailed;
         writer.flush() catch return DigistalloneError.TcpSendFailed;
         self.writer_ptr.interface.flush() catch return DigistalloneError.TcpSendFailed;
+        self.recordActivity();
     }
 
     /// Receive full HTTP response: parse status, headers, body
     /// SOURCE: RFC 7230, Section 3 — Message Format
     fn recvFullResponse(self: *HttpClient, allocator: mem.Allocator) DigistalloneError![]u8 {
+        defer self.recordActivity();
         const reader = &self.tls.reader;
 
         // Read status line: "HTTP/1.1 200 OK\r\n"
@@ -826,7 +887,9 @@ pub const LivewireClient = struct {
         return response;
     }
 
-    /// Update component state from response
+    /// Update component states from response
+    /// SOURCE: Wire-truth capture 2026-04-09 — response contains multiple components
+    /// each with its own snapshot. Must update ALL components, not just [0].
     pub fn updateStateFromResponse(
         self: *LivewireClient,
         allocator: mem.Allocator,
@@ -834,13 +897,56 @@ pub const LivewireClient = struct {
     ) DigistalloneError!void {
         _ = allocator;
 
-        // Parse response JSON and extract new snapshots
-        // Format: {"components":[{"snapshot":"{...}","effects":{...}}]}
-        if (mem.indexOf(u8, response_json, "\"snapshot\":")) |snap_start| {
-            // Find the snapshot JSON value
-            const after_key = response_json[snap_start + "\"snapshot\":".len ..];
-            // Snapshot might be a JSON string (escaped) or a raw object
-            if (after_key[0] == '{') {
+        // Response format: {"components":[{"snapshot":"{...}","effects":{...}}, ...]}
+        // Multiple components may be updated in a single response.
+        // We walk through all snapshot occurrences and match them by component name.
+        var search_start: usize = 0;
+        while (mem.indexOf(u8, response_json[search_start..], "\"snapshot\":")) |snap_rel| {
+            const snap_start = search_start + snap_rel + "\"snapshot\":".len;
+            const after_key = response_json[snap_start..];
+
+            // Snapshot is a JSON string (starts with '"') or object (starts with '{')
+            if (after_key.len < 2) break;
+
+            if (after_key[0] == '"') {
+                // JSON-encoded string — find the closing unescaped quote
+                var end: usize = 1;
+                while (end < after_key.len) : (end += 1) {
+                    if (after_key[end] == '"' and after_key[end - 1] != '\\') break;
+                }
+                if (end >= after_key.len) break;
+                const snap_escaped = after_key[1..end]; // strip surrounding quotes
+
+                // Extract component name from snapshot to find matching local component
+                // The snapshot contains "memo":{"name":"frontend.app",...}
+                var comp_name_buf: [64]u8 = undefined;
+                var comp_name_len: usize = 0;
+                if (mem.indexOf(u8, snap_escaped, "\"name\":\"")) |name_pos| {
+                    const after_name_key = snap_escaped[name_pos + "\"name\":\"".len ..];
+                    if (mem.indexOfScalar(u8, after_name_key, '"')) |name_end| {
+                        const extracted = after_name_key[0..name_end];
+                        comp_name_len = @min(extracted.len, comp_name_buf.len);
+                        @memcpy(comp_name_buf[0..comp_name_len], extracted[0..comp_name_len]);
+                    }
+                }
+
+                // Find matching component by name
+                if (comp_name_len > 0) {
+                    var ci: usize = 0;
+                    while (ci < self.components_count) : (ci += 1) {
+                        if (self.components[ci].name_len == comp_name_len and
+                            mem.eql(u8, self.components[ci].name[0..comp_name_len], comp_name_buf[0..comp_name_len]))
+                        {
+                            const snap_copy = @min(snap_escaped.len, self.components[ci].snapshot.len - 1);
+                            @memcpy(self.components[ci].snapshot[0..snap_copy], snap_escaped[0..snap_copy]);
+                            self.components[ci].snapshot_len = snap_copy;
+                            break;
+                        }
+                    }
+                }
+
+                search_start = snap_start + end + 1;
+            } else if (after_key[0] == '{') {
                 // Raw JSON object — find matching braces
                 var depth: usize = 1;
                 var end: usize = 1;
@@ -849,13 +955,36 @@ pub const LivewireClient = struct {
                     if (after_key[end] == '}') depth -= 1;
                 }
                 if (depth == 0 and end > 0) {
-                    // Extract snapshot (end is one past the closing brace)
                     const snap_json = after_key[0..end];
-                    const snap_copy = @min(snap_json.len, self.components[0].snapshot.len - 1);
-                    @memcpy(self.components[0].snapshot[0..snap_copy], snap_json[0..snap_copy]);
-                    self.components[0].snapshot_len = snap_copy;
-                }
-            }
+                    // Try to extract component name
+                    var comp_name_buf: [64]u8 = undefined;
+                    var comp_name_len: usize = 0;
+                    if (mem.indexOf(u8, snap_json, "\"name\":\"")) |name_pos| {
+                        const after_name_key = snap_json[name_pos + "\"name\":\"".len ..];
+                        if (mem.indexOfScalar(u8, after_name_key, '"')) |name_end| {
+                            const extracted = after_name_key[0..name_end];
+                            comp_name_len = @min(extracted.len, comp_name_buf.len);
+                            @memcpy(comp_name_buf[0..comp_name_len], extracted[0..comp_name_len]);
+                        }
+                    }
+
+                    if (comp_name_len > 0) {
+                        var ci: usize = 0;
+                        while (ci < self.components_count) : (ci += 1) {
+                            if (self.components[ci].name_len == comp_name_len and
+                                mem.eql(u8, self.components[ci].name[0..comp_name_len], comp_name_buf[0..comp_name_len]))
+                            {
+                                const snap_copy = @min(snap_json.len, self.components[ci].snapshot.len - 1);
+                                @memcpy(self.components[ci].snapshot[0..snap_copy], snap_json[0..snap_copy]);
+                                self.components[ci].snapshot_len = snap_copy;
+                                break;
+                            }
+                        }
+                    }
+
+                    search_start = snap_start + end;
+                } else break;
+            } else break;
         }
     }
 
@@ -905,19 +1034,37 @@ pub const LivewireClient = struct {
         return allocator.dupe(u8, self.current_email[0..self.current_email_len]) catch return DigistalloneError.EmailCreationFailed;
     }
 
+    /// Find component index by name
+    /// SOURCE: Wire-truth capture 2026-04-09 — 3 components in order:
+    ///   [0] frontend.actions, [1] frontend.nav, [2] frontend.app
+    fn findComponentByName(self: *const LivewireClient, name: []const u8) ?usize {
+        var i: usize = 0;
+        while (i < self.components_count) : (i += 1) {
+            if (mem.eql(u8, self.components[i].name[0..self.components[i].name_len], name)) {
+                return i;
+            }
+        }
+        return null;
+    }
+
     /// Poll inbox for messages
     /// SOURCE: __dispatch("fetchMessages", {}) call in Livewire update request
+    /// SOURCE: Wire-truth capture 2026-04-09 — fetchMessages is on frontend.app (index 2)
+    /// Component order: [0] frontend.actions, [1] frontend.nav, [2] frontend.app
     pub fn pollInbox(
         self: *LivewireClient,
         http: *HttpClient,
         allocator: mem.Allocator,
     ) DigistalloneError![]u8 {
+        // Use frontend.app component (index 2, NOT 1 which is frontend.nav)
+        const comp_idx = self.findComponentByName("frontend.app") orelse 2;
+
         // Build fetchMessages request
         const request = try self.buildUpdateRequest(
             allocator,
             "__dispatch",
             "[\"fetchMessages\",{}]",
-            1, // frontend.app component
+            comp_idx,
             null,
         );
         defer allocator.free(request);
@@ -931,40 +1078,31 @@ pub const LivewireClient = struct {
 // Email Body Parser — Extract GitHub verification code
 // ---------------------------------------------------------------------------
 
-/// Extract 6-digit GitHub verification code from email body
-/// SOURCE: GitHub verification email format — 6 consecutive digits
-/// Pattern: Look for \b\d{6}\b in plaintext/HTML body
+/// Extract GitHub verification code from email body (6-10 consecutive digits)
+/// SOURCE: GitHub verification email format — codes are 6-10 digit sequences
+/// Pattern: First sequence of 6-10 consecutive digits bounded by non-digit chars
+/// WIRE-TRUTH: Real email contained <span class="...">90818627</span> — 8 digits
 pub fn extractGitHubCode(allocator: mem.Allocator, body: []const u8) DigistalloneError![]u8 {
-    // GitHub sends a 6-digit code in the email body
-    // Look for patterns like "Your verification code is: 123456"
-    // or just a standalone 6-digit number
+    // GitHub sends variable-length numeric codes (observed: 6-10 digits)
+    // Strategy: Find all maximal sequences of consecutive digits, accept 6-10 length
 
-    // Strategy: Find all sequences of exactly 6 digits that are
-    // surrounded by non-digit characters (word boundary simulation)
     var i: usize = 0;
-    while (i < body.len) : (i += 1) {
-        if (ascii.isDigit(body[i])) {
-            // Check if we have exactly 6 consecutive digits
-            if (i + 6 <= body.len) {
-                var all_digits = true;
-                var j: usize = 0;
-                while (j < 6) : (j += 1) {
-                    if (!ascii.isDigit(body[i + j])) {
-                        all_digits = false;
-                        break;
-                    }
-                }
-                if (!all_digits) continue;
+    while (i < body.len) {
+        // Skip non-digits
+        if (!ascii.isDigit(body[i])) {
+            i += 1;
+            continue;
+        }
 
-                // Check word boundary before
-                if (i > 0 and ascii.isDigit(body[i - 1])) continue;
+        // Found a digit — measure the full consecutive digit run
+        const run_start = i;
+        while (i < body.len and ascii.isDigit(body[i])) : (i += 1) {}
+        const run_len = i - run_start;
 
-                // Check word boundary after
-                if (i + 6 < body.len and ascii.isDigit(body[i + 6])) continue;
-
-                // Found a 6-digit code
-                return allocator.dupe(u8, body[i .. i + 6]) catch return DigistalloneError.BufferTooSmall;
-            }
+        // Accept if the run is between 6 and 10 digits inclusive
+        if (run_len >= 6 and run_len <= 10) {
+            return allocator.dupe(u8, body[run_start .. run_start + run_len]) catch
+                return DigistalloneError.BufferTooSmall;
         }
     }
 
@@ -976,6 +1114,49 @@ pub fn isFromGitHub(body: []const u8) bool {
     return mem.indexOf(u8, body, "noreply@github.com") != null or
         mem.indexOf(u8, body, "github.com") != null or
         mem.indexOf(u8, body, "GitHub") != null;
+}
+
+// ---------------------------------------------------------------------------
+// Main API — DigistalloneClient
+// ---------------------------------------------------------------------------
+
+/// Unescape a JSON-encoded string into raw bytes.
+/// Handles: \n, \r, \t, \", \\, \/, \uXXXX (for ASCII range)
+/// SOURCE: RFC 8259, Section 7 — JSON string escaping rules
+fn unescapeJsonString(dst: []u8, src: []const u8) DigistalloneError!usize {
+    var si: usize = 0;
+    var di: usize = 0;
+    while (si < src.len) {
+        if (di >= dst.len) return DigistalloneError.BufferTooSmall;
+        if (src[si] == '\\' and si + 1 < src.len) {
+            switch (src[si + 1]) {
+                'n' => { dst[di] = '\n'; si += 2; },
+                'r' => { dst[di] = '\r'; si += 2; },
+                't' => { dst[di] = '\t'; si += 2; },
+                '"' => { dst[di] = '"'; si += 2; },
+                '\\' => { dst[di] = '\\'; si += 2; },
+                '/' => { dst[di] = '/'; si += 2; },
+                'u' => {
+                    // \uXXXX — only handle ASCII range (U+0000..U+007F)
+                    if (si + 5 > src.len) return DigistalloneError.BufferTooSmall;
+                    const hex = src[si + 2 .. si + 6];
+                    const codepoint = std.fmt.parseInt(u16, hex, 16) catch return DigistalloneError.JsonParseFailed;
+                    if (codepoint < 0x80) {
+                        dst[di] = @as(u8, @intCast(codepoint));
+                    } else {
+                        dst[di] = @as(u8, @intCast(codepoint & 0xFF));
+                    }
+                    si += 6;
+                },
+                else => { dst[di] = src[si]; si += 1; },
+            }
+        } else {
+            dst[di] = src[si];
+            si += 1;
+        }
+        di += 1;
+    }
+    return di;
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,6 +1199,51 @@ pub const DigistalloneClient = struct {
 
     pub fn deinit(self: *DigistalloneClient) void {
         self.http.deinit();
+    }
+
+    /// Refresh the HTTP connection if it has been idle too long.
+    /// This prevents TcpRecvFailed from stale Keep-Alive connections.
+    /// Also re-fetches /mailbox to get fresh CSRF tokens if needed.
+    ///
+    /// ROOT CAUSE FIX (2026-04-09):
+    /// LiteSpeed Keep-Alive timeout is ~5 seconds. If the DigistalloneClient
+    /// sits idle for longer (e.g., during GitHub signup which takes ~11s),
+    /// the server silently closes the TCP connection. Next send/recv fails
+    /// with TcpRecvFailed.
+    ///
+    /// SOURCE: LiteSpeed docs — default keepalive_timeout = 5s
+    /// SOURCE: man 2 clock_gettime — CLOCK_MONOTONIC for idle detection
+    pub fn ensureConnected(self: *DigistalloneClient) DigistalloneError!void {
+        // LiteSpeed default Keep-Alive timeout: ~5 seconds
+        // We use 3 seconds as a conservative threshold
+        const KEEPALIVE_THRESHOLD_MS: u64 = 3000;
+
+        if (self.http.isStale(KEEPALIVE_THRESHOLD_MS)) {
+            std.debug.print("[DIGISTALLONE] Connection stale (>{d}ms idle), reconnecting...\n", .{KEEPALIVE_THRESHOLD_MS});
+
+            // Close old connection completely
+            self.http.deinit();
+
+            // Re-create from scratch
+            var new_http = try HttpClient.init(
+                self.allocator,
+                DIGISTALLONE_HOST,
+                DIGISTALLONE_PORT,
+                DIGISTALLONE_SNI,
+            );
+
+            // Re-fetch /mailbox to get fresh CSRF tokens
+            const html = try new_http.get(self.allocator, "/mailbox", "");
+            defer self.allocator.free(html);
+
+            // Re-parse Livewire state with fresh tokens
+            try self.livewire.parseInitialState(self.allocator, html);
+
+            // Replace old http with new one
+            self.http = new_http;
+
+            std.debug.print("[DIGISTALLONE] Reconnected and refreshed CSRF tokens.\n", .{});
+        }
     }
 
     /// Generate a new email address with a random domain
@@ -1070,6 +1296,10 @@ pub const DigistalloneClient = struct {
     /// Poll inbox for GitHub verification code
     /// Returns the 6-digit code when found
     /// SOURCE: __dispatch("fetchMessages", {}) — POST /livewire/update
+    /// SOURCE: Wire-truth capture 2026-04-09 — response effects.html contains rendered message HTML
+    ///
+    /// KEEP-ALIVE FIX: Calls ensureConnected() before polling to prevent
+    /// TcpRecvFailed from stale connections (LiteSpeed 5s Keep-Alive timeout).
     pub fn pollInboxForGitHubCode(
         self: *DigistalloneClient,
         max_attempts: usize,
@@ -1077,38 +1307,70 @@ pub const DigistalloneClient = struct {
     ) DigistalloneError![]const u8 {
         const allocator = self.allocator;
 
+        // ROOT CAUSE FIX: Reconnect if the connection has been idle too long
+        // (e.g., during GitHub signup which takes ~11s).
+        try self.ensureConnected();
+
         var attempt: usize = 0;
         while (attempt < max_attempts) : (attempt += 1) {
-            // Poll inbox
-            const response = try self.livewire.pollInbox(&self.http, allocator);
+            // Poll inbox using frontend.app component
+            const response = self.livewire.pollInbox(&self.http, allocator) catch |err| {
+                if (err == DigistalloneError.TcpRecvFailed) {
+                    // Connection was silently closed by server — full reconnect + retry
+                    std.debug.print("[MAIL] TcpRecvFailed on poll, full reconnect...\n", .{});
+                    try self.ensureConnected();
+                    // Don't count this as a failed attempt — retry immediately
+                    continue;
+                }
+                return err;
+            };
             defer allocator.free(response);
 
-            // Check if there are messages
-            if (mem.indexOf(u8, response, "\"messages\":")) |msg_start| {
-                const after = response[msg_start + "\"messages\":".len ..];
-                // Check if messages array is non-empty: [[...],{"s":"arr"}]
-                if (mem.indexOf(u8, after, "[[]") == null or mem.indexOf(u8, after, "\"content\":") != null) {
-                    // There might be messages — parse the response HTML for code
-                    if (mem.indexOf(u8, response, "\"html\":\"")) |html_start| {
-                        const html_part = response[html_start + "\"html\":\"".len ..];
-                        // Find the email body — look for the rendered HTML
-                        // The response contains escaped HTML with messages
-                        if (isFromGitHub(html_part)) {
-                            // Try to extract code from the HTML
-                            // We need to unescape the HTML first
-                            // For now, search for 6-digit pattern in raw response
-                            if (extractGitHubCode(allocator, html_part)) |code| {
-                                return code;
-                            } else |_| {}
-                        }
+            // Update all component snapshots from response (fresh snapshots for next poll)
+            self.livewire.updateStateFromResponse(allocator, response) catch {};
+
+            // Extract effects.html from the response
+            // Wire-truth response structure:
+            // {"components":[{"snapshot":"...","effects":{"html":"<rendered>","dispatches":[]}}]}
+            // The "html" field contains JSON-escaped HTML (newlines as \n, quotes as \")
+            if (mem.indexOf(u8, response, "\"html\":\"")) |html_start| {
+                const after_html_key = response[html_start + "\"html\":\"".len ..];
+                // Find the end of the JSON string value
+                // Walk through escaped characters until unescaped closing quote
+                var end: usize = 0;
+                while (end < after_html_key.len) : (end += 1) {
+                    if (after_html_key[end] == '"' and
+                        (end == 0 or after_html_key[end - 1] != '\\'))
+                    {
+                        break;
                     }
+                }
+                if (end > 0 and end < after_html_key.len) {
+                    const html_escaped = after_html_key[0..end];
+
+                    // Unescape JSON string into a buffer
+                    var html_buf: [65536]u8 = undefined;
+                    const html_len = unescapeJsonString(&html_buf, html_escaped) catch html_escaped.len;
+                    const html = html_buf[0..html_len];
+
+                    // Check if this looks like a GitHub email
+                    if (isFromGitHub(html)) {
+                        // Extract 6-digit verification code
+                        if (extractGitHubCode(allocator, html)) |code| {
+                            return code;
+                        } else |_| {}
+                    }
+
+                    // Also try searching the raw escaped string as fallback (digits aren't escaped)
+                    if (extractGitHubCode(allocator, html_escaped)) |code| {
+                        return code;
+                    } else |_| {}
                 }
             }
 
             // Wait before next poll
             if (attempt < max_attempts - 1) {
-                const ts = posix.timespec{ .sec = @intCast(poll_interval_ms / 1000), .nsec = @intCast((poll_interval_ms % 1000) * 1_000_000) };
-                _ = posix.nanosleep(&ts, null);
+                _ = self.http.io.sleep(std.Io.Duration.fromMilliseconds(@as(i64, @intCast(poll_interval_ms))), .awake) catch {};
             }
         }
 
@@ -1160,25 +1422,33 @@ test "CookieJar: set and retrieve cookies" {
     _ = allocator;
 }
 
-test "extractGitHubCode: find 6-digit code in body" {
+test "extractGitHubCode: find 6-10 digit codes in body" {
     const allocator = std.testing.allocator;
 
+    // 6-digit code (classic format)
     const body1 = "Your GitHub verification code is: 482916. Please enter this code";
     const code1 = try extractGitHubCode(allocator, body1);
     defer allocator.free(code1);
     try std.testing.expectEqualStrings("482916", code1);
 
-    const body2 = "Code: 000123 — expires in 10 minutes";
+    // 8-digit code (WIRE-TRUTH: real email had 90818627)
+    const body2 = "Your verification code is: 90818627. Enter it below";
     const code2 = try extractGitHubCode(allocator, body2);
     defer allocator.free(code2);
-    try std.testing.expectEqualStrings("000123", code2);
+    try std.testing.expectEqualStrings("90818627", code2);
 
-    // 7 digits should NOT match
-    const body3 = "Not a code: 1234567 digits";
+    // 10-digit code (upper bound)
+    const body2b = "Code: 1234567890 — expires in 10 minutes";
+    const code2b = try extractGitHubCode(allocator, body2b);
+    defer allocator.free(code2b);
+    try std.testing.expectEqualStrings("1234567890", code2b);
+
+    // 5 digits should NOT match (too short)
+    const body3 = "Not a code: 12345 digits";
     try std.testing.expectError(DigistalloneError.GitHubCodeNotFound, extractGitHubCode(allocator, body3));
 
-    // 5 digits should NOT match
-    const body4 = "Not a code: 12345 digits";
+    // 11 digits should NOT match (too long)
+    const body4 = "Not a code: 12345678901 digits";
     try std.testing.expectError(DigistalloneError.GitHubCodeNotFound, extractGitHubCode(allocator, body4));
 }
 
@@ -1203,6 +1473,12 @@ test "extractGitHubCode: code at start and end of string" {
     const code2 = try extractGitHubCode(allocator, body2);
     defer allocator.free(code2);
     try std.testing.expectEqualStrings("789012", code2);
+
+    // 8-digit code at end of string
+    const body3 = "your code is 90818627";
+    const code3 = try extractGitHubCode(allocator, body3);
+    defer allocator.free(code3);
+    try std.testing.expectEqualStrings("90818627", code3);
 }
 
 test "DEFAULT_DOMAINS: count matches declared constant" {
