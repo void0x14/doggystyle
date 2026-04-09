@@ -7798,11 +7798,12 @@ pub const GitHubHttpClient = struct {
                     return true;
                 }
 
-                // 200 OK with onboarding redirect → succeeded
+                // 200/302 leading to /account_verifications → signup succeeded
+                // SOURCE: GitHub 2026 signup flow — new accounts redirect to verification page
                 if (response.status_code == 200 and
-                    mem.indexOf(u8, response.body, "onboarding/guidance") != null)
+                    mem.indexOf(u8, response.body, "/account_verifications") != null)
                 {
-                    std.debug.print("[SIGNUP] SUCCESS: 200 OK with onboarding redirect\n", .{});
+                    std.debug.print("[SUCCESS] Account Created - Redirected to Verification Page\n", .{});
                     return true;
                 }
 
@@ -7990,9 +7991,10 @@ pub const GitHubHttpClient = struct {
                     return true;
                 }
 
-                // 200 OK with onboarding/guidance → succeeded
+                // 200 OK with /account_verifications or logged-in indicators → succeeded
+                // SOURCE: GitHub 2026 flow — verified accounts land on /account_verifications
                 if (response.status_code == 200 and
-                    (mem.indexOf(u8, response.body, "onboarding") != null or
+                    (mem.indexOf(u8, response.body, "/account_verifications") != null or
                     mem.indexOf(u8, response.body, "dashboard") != null or
                     mem.indexOf(u8, response.body, "logout") != null))
                 {
@@ -8350,14 +8352,14 @@ test "HttpResponse: parse 200 OK response" {
 
 test "HttpResponse: parse 302 redirect" {
     const raw_response = "HTTP/1.1 302 Found\r\n" ++
-        "Location: https://github.com/onboarding/guidance\r\n" ++
+        "Location: https://github.com/account_verifications\r\n" ++
         "Set-Cookie: user_session=redirect_test; Path=/\r\n" ++
         "\r\n";
 
     const response = try HttpResponse.parse(raw_response);
 
     try std.testing.expectEqual(@as(u16, 302), response.status_code);
-    try std.testing.expectEqualStrings("https://github.com/onboarding/guidance", response.locationHeader().?);
+    try std.testing.expectEqualStrings("https://github.com/account_verifications", response.locationHeader().?);
 
     // Extract cookies
     var jar: GitHubCookieJar = .{};

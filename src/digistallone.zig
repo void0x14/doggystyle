@@ -1312,6 +1312,7 @@ pub const DigistalloneClient = struct {
         try self.ensureConnected();
 
         var attempt: usize = 0;
+        var last_html_snapshot: ?[]const u8 = null;
         while (attempt < max_attempts) : (attempt += 1) {
             // Poll inbox using frontend.app component
             const response = self.livewire.pollInbox(&self.http, allocator) catch |err| {
@@ -1353,9 +1354,12 @@ pub const DigistalloneClient = struct {
                     const html_len = unescapeJsonString(&html_buf, html_escaped) catch html_escaped.len;
                     const html = html_buf[0..html_len];
 
+                    // Save snapshot for failure dump
+                    last_html_snapshot = html;
+
                     // Check if this looks like a GitHub email
                     if (isFromGitHub(html)) {
-                        // Extract 6-digit verification code
+                        // Extract 6-10 digit verification code
                         if (extractGitHubCode(allocator, html)) |code| {
                             return code;
                         } else |_| {}
@@ -1372,6 +1376,13 @@ pub const DigistalloneClient = struct {
             if (attempt < max_attempts - 1) {
                 _ = self.http.io.sleep(std.Io.Duration.fromMilliseconds(@as(i64, @intCast(poll_interval_ms))), .awake) catch {};
             }
+        }
+
+        // NO SILENT FAILURE: Dump the last seen HTML snapshot for debugging
+        if (last_html_snapshot) |snap| {
+            std.debug.print("[MAIL] FAILED: No GitHub code found after {d} attempts. Last HTML snapshot:\n{s}\n", .{ max_attempts, snap });
+        } else {
+            std.debug.print("[MAIL] FAILED: No GitHub code found after {d} attempts. No HTML snapshot available (no messages?).\n", .{max_attempts});
         }
 
         return DigistalloneError.NoMessagesInInbox;
