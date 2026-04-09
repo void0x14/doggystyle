@@ -884,8 +884,10 @@ pub fn buildGitHubHeaders(
     authority: []const u8,
     use_get: bool,
 ) ![]u8 {
-    const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
-    const accept_value = "*/*";
+    const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+    const accept_value = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
+    const accept_language = "en-US,en;q=0.9";
+    const upgrade_insecure_requests = "1";
 
     // 1. :method: GET (Indexed, Index 2) veya POST (Indexed, Index 3)
     // SOURCE: RFC 7541, Appendix A, Index 2 (GET) / Index 3 (POST)
@@ -941,10 +943,29 @@ pub fn buildGitHubHeaders(
     const encoded_accept = try literal_accept.encode(allocator);
     defer allocator.free(encoded_accept);
 
+    const literal_accept_language = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "accept-language",
+        .value = accept_language,
+    };
+    const encoded_accept_language = try literal_accept_language.encode(allocator);
+    defer allocator.free(encoded_accept_language);
+
+    const encoded_upgrade = if (use_get) blk: {
+        const literal_upgrade = LiteralHeaderFieldIncrementalIndexing{
+            .name_index = 0,
+            .name = "upgrade-insecure-requests",
+            .value = upgrade_insecure_requests,
+        };
+        break :blk try literal_upgrade.encode(allocator);
+    } else &[_]u8{};
+    defer if (use_get) allocator.free(encoded_upgrade);
+
     // Tüm parçaları birleştir
     const total_len = encoded_method.len + encoded_scheme.len +
         encoded_path.len + encoded_authority.len +
-        encoded_ua.len + encoded_accept.len;
+        encoded_ua.len + encoded_accept.len +
+        encoded_accept_language.len + encoded_upgrade.len;
 
     const result = try allocator.alloc(u8, total_len);
     var offset: usize = 0;
@@ -966,6 +987,14 @@ pub fn buildGitHubHeaders(
 
     @memcpy(result[offset .. offset + encoded_accept.len], encoded_accept);
     offset += encoded_accept.len;
+
+    @memcpy(result[offset .. offset + encoded_accept_language.len], encoded_accept_language);
+    offset += encoded_accept_language.len;
+
+    if (encoded_upgrade.len > 0) {
+        @memcpy(result[offset .. offset + encoded_upgrade.len], encoded_upgrade);
+        offset += encoded_upgrade.len;
+    }
 
     std.debug.assert(offset == total_len);
     return result;
@@ -2078,6 +2107,270 @@ test "buildGitHubPostHeaders: round-trip" {
 }
 
 // SOURCE: RFC 7541, Appendix A — Static Table Definitions
+// SOURCE: Live GitHub signup browser observation (2026-04-09) — multipart
+// validation POSTs use:
+//   - accept: */*
+//   - content-type: multipart/form-data; boundary=...
+//   - origin: https://github.com
+//   - referer: https://github.com/signup
+//   - cookie: browser session cookies
+pub fn buildGitHubMultipartFormHeaders(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    authority: []const u8,
+    content_length: usize,
+    boundary: []const u8,
+    cookie_string: []const u8,
+) ![]u8 {
+    const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+    const accept_value = "*/*";
+    const accept_language = "en-US,en;q=0.9";
+    const origin = "https://github.com";
+    const referer = "https://github.com/signup";
+    const content_type = try std.fmt.allocPrint(allocator, "multipart/form-data; boundary={s}", .{boundary});
+    defer allocator.free(content_type);
+
+    const indexed_method = IndexedHeaderField{ .index = 3 };
+    const encoded_method = try indexed_method.encode(allocator);
+    defer allocator.free(encoded_method);
+
+    const indexed_scheme = IndexedHeaderField{ .index = 7 };
+    const encoded_scheme = try indexed_scheme.encode(allocator);
+    defer allocator.free(encoded_scheme);
+
+    const literal_path = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 4,
+        .name = null,
+        .value = path,
+    };
+    const encoded_path = try literal_path.encode(allocator);
+    defer allocator.free(encoded_path);
+
+    const literal_authority = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 1,
+        .name = null,
+        .value = authority,
+    };
+    const encoded_authority = try literal_authority.encode(allocator);
+    defer allocator.free(encoded_authority);
+
+    const literal_ua = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 58,
+        .name = null,
+        .value = user_agent,
+    };
+    const encoded_ua = try literal_ua.encode(allocator);
+    defer allocator.free(encoded_ua);
+
+    const literal_accept = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 19,
+        .name = null,
+        .value = accept_value,
+    };
+    const encoded_accept = try literal_accept.encode(allocator);
+    defer allocator.free(encoded_accept);
+
+    const literal_accept_language = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "accept-language",
+        .value = accept_language,
+    };
+    const encoded_accept_language = try literal_accept_language.encode(allocator);
+    defer allocator.free(encoded_accept_language);
+
+    const literal_ct = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 31,
+        .name = null,
+        .value = content_type,
+    };
+    const encoded_ct = try literal_ct.encode(allocator);
+    defer allocator.free(encoded_ct);
+
+    var cl_buf: [32]u8 = undefined;
+    const cl_str = try std.fmt.bufPrint(&cl_buf, "{d}", .{content_length});
+    const literal_cl = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 28,
+        .name = null,
+        .value = cl_str,
+    };
+    const encoded_cl = try literal_cl.encode(allocator);
+    defer allocator.free(encoded_cl);
+
+    const literal_origin = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "origin",
+        .value = origin,
+    };
+    const encoded_origin = try literal_origin.encode(allocator);
+    defer allocator.free(encoded_origin);
+
+    const literal_referer = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "referer",
+        .value = referer,
+    };
+    const encoded_referer = try literal_referer.encode(allocator);
+    defer allocator.free(encoded_referer);
+
+    const literal_cookie = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 32,
+        .name = null,
+        .value = cookie_string,
+    };
+    const encoded_cookie = try literal_cookie.encode(allocator);
+    defer allocator.free(encoded_cookie);
+
+    const total_len = encoded_method.len + encoded_scheme.len +
+        encoded_path.len + encoded_authority.len +
+        encoded_ua.len + encoded_accept.len + encoded_accept_language.len +
+        encoded_ct.len + encoded_cl.len + encoded_origin.len +
+        encoded_referer.len + encoded_cookie.len;
+
+    const result = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+
+    @memcpy(result[offset .. offset + encoded_method.len], encoded_method);
+    offset += encoded_method.len;
+    @memcpy(result[offset .. offset + encoded_scheme.len], encoded_scheme);
+    offset += encoded_scheme.len;
+    @memcpy(result[offset .. offset + encoded_path.len], encoded_path);
+    offset += encoded_path.len;
+    @memcpy(result[offset .. offset + encoded_authority.len], encoded_authority);
+    offset += encoded_authority.len;
+    @memcpy(result[offset .. offset + encoded_ua.len], encoded_ua);
+    offset += encoded_ua.len;
+    @memcpy(result[offset .. offset + encoded_accept.len], encoded_accept);
+    offset += encoded_accept.len;
+    @memcpy(result[offset .. offset + encoded_accept_language.len], encoded_accept_language);
+    offset += encoded_accept_language.len;
+    @memcpy(result[offset .. offset + encoded_ct.len], encoded_ct);
+    offset += encoded_ct.len;
+    @memcpy(result[offset .. offset + encoded_cl.len], encoded_cl);
+    offset += encoded_cl.len;
+    @memcpy(result[offset .. offset + encoded_origin.len], encoded_origin);
+    offset += encoded_origin.len;
+    @memcpy(result[offset .. offset + encoded_referer.len], encoded_referer);
+    offset += encoded_referer.len;
+    @memcpy(result[offset .. offset + encoded_cookie.len], encoded_cookie);
+    offset += encoded_cookie.len;
+
+    std.debug.assert(offset == total_len);
+    return result;
+}
+
+// SOURCE: RFC 7541, Appendix A — Static Table Definitions
+// SOURCE: Live GitHub signup browser observation (2026-04-09) — username
+// availability check is a same-origin GET carrying:
+//   - accept: */*
+//   - referer: https://github.com/signup
+//   - cookie: browser session cookies
+pub fn buildGitHubValidationGetHeaders(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    authority: []const u8,
+    cookie_string: []const u8,
+) ![]u8 {
+    const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+    const accept_value = "*/*";
+    const accept_language = "en-US,en;q=0.9";
+    const referer = "https://github.com/signup";
+
+    const indexed_method = IndexedHeaderField{ .index = 2 };
+    const encoded_method = try indexed_method.encode(allocator);
+    defer allocator.free(encoded_method);
+
+    const indexed_scheme = IndexedHeaderField{ .index = 7 };
+    const encoded_scheme = try indexed_scheme.encode(allocator);
+    defer allocator.free(encoded_scheme);
+
+    const literal_path = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 4,
+        .name = null,
+        .value = path,
+    };
+    const encoded_path = try literal_path.encode(allocator);
+    defer allocator.free(encoded_path);
+
+    const literal_authority = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 1,
+        .name = null,
+        .value = authority,
+    };
+    const encoded_authority = try literal_authority.encode(allocator);
+    defer allocator.free(encoded_authority);
+
+    const literal_ua = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 58,
+        .name = null,
+        .value = user_agent,
+    };
+    const encoded_ua = try literal_ua.encode(allocator);
+    defer allocator.free(encoded_ua);
+
+    const literal_accept = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 19,
+        .name = null,
+        .value = accept_value,
+    };
+    const encoded_accept = try literal_accept.encode(allocator);
+    defer allocator.free(encoded_accept);
+
+    const literal_accept_language = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "accept-language",
+        .value = accept_language,
+    };
+    const encoded_accept_language = try literal_accept_language.encode(allocator);
+    defer allocator.free(encoded_accept_language);
+
+    const literal_referer = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "referer",
+        .value = referer,
+    };
+    const encoded_referer = try literal_referer.encode(allocator);
+    defer allocator.free(encoded_referer);
+
+    const literal_cookie = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 32,
+        .name = null,
+        .value = cookie_string,
+    };
+    const encoded_cookie = try literal_cookie.encode(allocator);
+    defer allocator.free(encoded_cookie);
+
+    const total_len = encoded_method.len + encoded_scheme.len +
+        encoded_path.len + encoded_authority.len + encoded_ua.len +
+        encoded_accept.len + encoded_accept_language.len +
+        encoded_referer.len + encoded_cookie.len;
+
+    const result = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+
+    @memcpy(result[offset .. offset + encoded_method.len], encoded_method);
+    offset += encoded_method.len;
+    @memcpy(result[offset .. offset + encoded_scheme.len], encoded_scheme);
+    offset += encoded_scheme.len;
+    @memcpy(result[offset .. offset + encoded_path.len], encoded_path);
+    offset += encoded_path.len;
+    @memcpy(result[offset .. offset + encoded_authority.len], encoded_authority);
+    offset += encoded_authority.len;
+    @memcpy(result[offset .. offset + encoded_ua.len], encoded_ua);
+    offset += encoded_ua.len;
+    @memcpy(result[offset .. offset + encoded_accept.len], encoded_accept);
+    offset += encoded_accept.len;
+    @memcpy(result[offset .. offset + encoded_accept_language.len], encoded_accept_language);
+    offset += encoded_accept_language.len;
+    @memcpy(result[offset .. offset + encoded_referer.len], encoded_referer);
+    offset += encoded_referer.len;
+    @memcpy(result[offset .. offset + encoded_cookie.len], encoded_cookie);
+    offset += encoded_cookie.len;
+
+    std.debug.assert(offset == total_len);
+    return result;
+}
+
+// SOURCE: RFC 7541, Appendix A — Static Table Definitions
 // SOURCE: Live observation of GitHub signup POST (2026-04-09)
 pub fn buildGitHubSignupHeaders(
     allocator: std.mem.Allocator,
@@ -2086,8 +2379,9 @@ pub fn buildGitHubSignupHeaders(
     content_length: usize,
     cookie_string: []const u8,
 ) ![]u8 {
-    const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+    const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
     const accept_value = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
+    const accept_language = "en-US,en;q=0.9";
     const content_type = "application/x-www-form-urlencoded";
     const origin = "https://github.com";
     const referer = "https://github.com/signup";
@@ -2138,6 +2432,14 @@ pub fn buildGitHubSignupHeaders(
     const encoded_accept = try literal_accept.encode(allocator);
     defer allocator.free(encoded_accept);
 
+    const literal_accept_language = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "accept-language",
+        .value = accept_language,
+    };
+    const encoded_accept_language = try literal_accept_language.encode(allocator);
+    defer allocator.free(encoded_accept_language);
+
     // 7. content-type
     const literal_ct = LiteralHeaderFieldIncrementalIndexing{
         .name_index = 31,
@@ -2187,7 +2489,7 @@ pub fn buildGitHubSignupHeaders(
 
     const total_len = encoded_method.len + encoded_scheme.len +
         encoded_path.len + encoded_authority.len +
-        encoded_ua.len + encoded_accept.len + encoded_ct.len + encoded_cl.len +
+        encoded_ua.len + encoded_accept.len + encoded_accept_language.len + encoded_ct.len + encoded_cl.len +
         encoded_origin.len + encoded_referer.len + encoded_cookie.len;
 
     const result = try allocator.alloc(u8, total_len);
@@ -2210,6 +2512,9 @@ pub fn buildGitHubSignupHeaders(
 
     @memcpy(result[offset .. offset + encoded_accept.len], encoded_accept);
     offset += encoded_accept.len;
+
+    @memcpy(result[offset .. offset + encoded_accept_language.len], encoded_accept_language);
+    offset += encoded_accept_language.len;
 
     @memcpy(result[offset .. offset + encoded_ct.len], encoded_ct);
     offset += encoded_ct.len;
@@ -2239,8 +2544,9 @@ pub fn buildGitHubVerifyHeaders(
     content_length: usize,
     cookie_string: []const u8,
 ) ![]u8 {
-    const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+    const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
     const accept_value = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
+    const accept_language = "en-US,en;q=0.9";
     const content_type = "application/x-www-form-urlencoded";
     const origin = "https://github.com";
     const referer = "https://github.com/signup/verify_email";
@@ -2291,6 +2597,14 @@ pub fn buildGitHubVerifyHeaders(
     const encoded_accept = try literal_accept.encode(allocator);
     defer allocator.free(encoded_accept);
 
+    const literal_accept_language = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "accept-language",
+        .value = accept_language,
+    };
+    const encoded_accept_language = try literal_accept_language.encode(allocator);
+    defer allocator.free(encoded_accept_language);
+
     // 7. content-type
     const literal_ct = LiteralHeaderFieldIncrementalIndexing{
         .name_index = 31,
@@ -2340,7 +2654,7 @@ pub fn buildGitHubVerifyHeaders(
 
     const total_len = encoded_method.len + encoded_scheme.len +
         encoded_path.len + encoded_authority.len +
-        encoded_ua.len + encoded_accept.len + encoded_ct.len + encoded_cl.len +
+        encoded_ua.len + encoded_accept.len + encoded_accept_language.len + encoded_ct.len + encoded_cl.len +
         encoded_origin.len + encoded_referer.len + encoded_cookie.len;
 
     const result = try allocator.alloc(u8, total_len);
@@ -2363,6 +2677,9 @@ pub fn buildGitHubVerifyHeaders(
 
     @memcpy(result[offset .. offset + encoded_accept.len], encoded_accept);
     offset += encoded_accept.len;
+
+    @memcpy(result[offset .. offset + encoded_accept_language.len], encoded_accept_language);
+    offset += encoded_accept_language.len;
 
     @memcpy(result[offset .. offset + encoded_ct.len], encoded_ct);
     offset += encoded_ct.len;
@@ -2396,15 +2713,88 @@ test "buildGitHubSignupHeaders: round-trip" {
         allocator.free(headers);
     }
 
-    // 11 headers: :method, :scheme, :path, :authority, user-agent, accept,
-    //             content-type, content-length, origin, referer, cookie
-    try std.testing.expectEqual(@as(usize, 11), headers.len);
+    // 12 headers: :method, :scheme, :path, :authority, user-agent, accept,
+    //             accept-language, content-type, content-length, origin,
+    //             referer, cookie
+    try std.testing.expectEqual(@as(usize, 12), headers.len);
     try std.testing.expectEqualStrings(":method", headers[0].name);
     try std.testing.expectEqualStrings("POST", headers[0].value);
-    try std.testing.expectEqualStrings("origin", headers[8].name);
-    try std.testing.expectEqualStrings("https://github.com", headers[8].value);
-    try std.testing.expectEqualStrings("referer", headers[9].name);
-    try std.testing.expectEqualStrings("https://github.com/signup", headers[9].value);
-    try std.testing.expectEqualStrings("cookie", headers[10].name);
-    try std.testing.expectEqualStrings("test_cookie=value", headers[10].value);
+    try std.testing.expectEqualStrings("accept-language", headers[6].name);
+    try std.testing.expectEqualStrings("en-US,en;q=0.9", headers[6].value);
+    try std.testing.expectEqualStrings("origin", headers[9].name);
+    try std.testing.expectEqualStrings("https://github.com", headers[9].value);
+    try std.testing.expectEqualStrings("referer", headers[10].name);
+    try std.testing.expectEqualStrings("https://github.com/signup", headers[10].value);
+    try std.testing.expectEqualStrings("cookie", headers[11].name);
+    try std.testing.expectEqualStrings("test_cookie=value", headers[11].value);
+}
+
+test "buildGitHubMultipartFormHeaders: round-trip" {
+    const allocator = std.testing.allocator;
+    const block = try buildGitHubMultipartFormHeaders(
+        allocator,
+        "/email_validity_checks",
+        "github.com",
+        362,
+        "boundary123",
+        "_gh_sess=test; _octo=octo; logged_in=no; tz=Europe%2FIstanbul",
+    );
+    defer allocator.free(block);
+
+    var decoder = HpackDecoder.init(allocator);
+    defer decoder.deinit();
+
+    const headers = try decoder.decodeHeaderBlock(allocator, block);
+    defer {
+        for (headers) |*header| header.deinit(allocator);
+        allocator.free(headers);
+    }
+
+    try std.testing.expectEqual(@as(usize, 12), headers.len);
+    try std.testing.expectEqualStrings(":method", headers[0].name);
+    try std.testing.expectEqualStrings("POST", headers[0].value);
+    try std.testing.expectEqualStrings(":path", headers[2].name);
+    try std.testing.expectEqualStrings("/email_validity_checks", headers[2].value);
+    try std.testing.expectEqualStrings("accept", headers[5].name);
+    try std.testing.expectEqualStrings("*/*", headers[5].value);
+    try std.testing.expectEqualStrings("content-type", headers[7].name);
+    try std.testing.expectEqualStrings("multipart/form-data; boundary=boundary123", headers[7].value);
+    try std.testing.expectEqualStrings("origin", headers[9].name);
+    try std.testing.expectEqualStrings("https://github.com", headers[9].value);
+    try std.testing.expectEqualStrings("referer", headers[10].name);
+    try std.testing.expectEqualStrings("https://github.com/signup", headers[10].value);
+    try std.testing.expectEqualStrings("cookie", headers[11].name);
+    try std.testing.expectEqualStrings("_gh_sess=test; _octo=octo; logged_in=no; tz=Europe%2FIstanbul", headers[11].value);
+}
+
+test "buildGitHubValidationGetHeaders: round-trip" {
+    const allocator = std.testing.allocator;
+    const block = try buildGitHubValidationGetHeaders(
+        allocator,
+        "/signup_check_new/username?value=wiretruth177575",
+        "github.com",
+        "_gh_sess=test; _octo=octo; logged_in=no; tz=Europe%2FIstanbul",
+    );
+    defer allocator.free(block);
+
+    var decoder = HpackDecoder.init(allocator);
+    defer decoder.deinit();
+
+    const headers = try decoder.decodeHeaderBlock(allocator, block);
+    defer {
+        for (headers) |*header| header.deinit(allocator);
+        allocator.free(headers);
+    }
+
+    try std.testing.expectEqual(@as(usize, 9), headers.len);
+    try std.testing.expectEqualStrings(":method", headers[0].name);
+    try std.testing.expectEqualStrings("GET", headers[0].value);
+    try std.testing.expectEqualStrings(":path", headers[2].name);
+    try std.testing.expectEqualStrings("/signup_check_new/username?value=wiretruth177575", headers[2].value);
+    try std.testing.expectEqualStrings("accept", headers[5].name);
+    try std.testing.expectEqualStrings("*/*", headers[5].value);
+    try std.testing.expectEqualStrings("referer", headers[7].name);
+    try std.testing.expectEqualStrings("https://github.com/signup", headers[7].value);
+    try std.testing.expectEqualStrings("cookie", headers[8].name);
+    try std.testing.expectEqualStrings("_gh_sess=test; _octo=octo; logged_in=no; tz=Europe%2FIstanbul", headers[8].value);
 }

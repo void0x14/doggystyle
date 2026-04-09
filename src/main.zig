@@ -4,6 +4,35 @@ const http2 = @import("http2_core.zig");
 const jitter = @import("jitter_core.zig");
 const digistallone = @import("digistallone.zig");
 
+fn resolveIpv4Host(host: [:0]const u8) !u32 {
+    var hints: std.c.addrinfo = .{
+        .flags = .{},
+        .family = std.posix.AF.INET,
+        .socktype = std.posix.SOCK.STREAM,
+        .protocol = 0,
+        .addrlen = 0,
+        .canonname = null,
+        .addr = null,
+        .next = null,
+    };
+
+    var result: ?*std.c.addrinfo = null;
+    const gai_rc = std.c.getaddrinfo(host.ptr, null, &hints, &result);
+    if (@intFromEnum(gai_rc) != 0) return error.TcpConnectFailed;
+    defer if (result) |res| std.c.freeaddrinfo(res);
+
+    var current = result;
+    while (current) |entry| : (current = entry.next) {
+        const addr = entry.addr orelse continue;
+        if (addr.family != std.posix.AF.INET) continue;
+
+        const ipv4: *const std.os.linux.sockaddr.in = @ptrCast(@alignCast(addr));
+        return @byteSwap(ipv4.addr);
+    }
+
+    return error.TcpConnectFailed;
+}
+
 /// Ghost Engine — Master Orchestrator (PRODUCTION)
 ///
 /// Bu dosya tüm modülleri kronolojik sırada birleştirir:
@@ -46,14 +75,7 @@ pub fn main(init: std.process.Init) !void {
     const target_port: u16 = 443;
     const request_path = "/signup";
 
-    // GitHub.com IP: 140.82.121.4
-    const dst_ip: u32 = blk: {
-        const octets = [_]u8{ 140, 82, 121, 4 };
-        break :blk (@as(u32, octets[0]) << 24) |
-            (@as(u32, octets[1]) << 16) |
-            (@as(u32, octets[2]) << 8) |
-            @as(u32, octets[3]);
-    };
+    const dst_ip: u32 = try resolveIpv4Host(target_host);
 
     // =========================================================================
     // ADIM 1: Jitter Engine Initialization
@@ -331,7 +353,8 @@ pub fn main(init: std.process.Init) !void {
     if (signup_success) {
         std.debug.print("[SUCCESS] Signup Form Submitted. Waiting for Redirect...\n", .{});
     } else {
-        std.debug.print("[WARN] Signup did not redirect as expected.\n", .{});
+        std.debug.print("[FATAL] Signup did not reach the verification step. Polling mailbox would stall because no verification mail is guaranteed.\n", .{});
+        std.process.exit(1);
     }
 
     // =========================================================================

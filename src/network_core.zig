@@ -7513,78 +7513,359 @@ pub const GitHubHttpClient = struct {
         return error.ReadTimeout;
     }
 
-    // SOURCE: Live DOM analysis of https://github.com/signup (2026-04-09)
-    // HONEYPOT AVOIDANCE: Skip fields that trap bots
-    //   - "required_field_NNNN": hidden text input, honeypot (hidden="hidden")
-    //   - "filter": country dropdown panel search field, NOT signup payload
-    //   - Empty-name hidden inputs (no name attribute): client-side CSRF tokens,
-    //     browser does NOT submit these. Safe to skip.
-    pub fn extractSignupHiddenFields(allocator: std.mem.Allocator, html_buffer: []const u8, payload_list: *std.array_list.Managed(u8)) !void {
-        _ = allocator;
+    const SignupFormFields = struct {
+        country: []const u8,
+        required_field_name: ?[]const u8,
+    };
+
+    // SOURCE: Live GitHub signup form DOM capture (2026-04-09) — browser FormData
+    // includes:
+    //   - user_signup[country]=TR (hidden)
+    //   - filter=           (search input, empty but still submitted)
+    //   - required_field_xxxx= (dynamic hidden text field, empty but still submitted)
+    // Empty-name hidden inputs are not submitted.
+    pub fn extractSignupFormFields(html_buffer: []const u8) !SignupFormFields {
+        const explicit_country = extractInputValueByName(html_buffer, "user_signup[country]");
+        const actor_country = extractAttributeValue(html_buffer, "data-actor-country-code=");
+        const country = if (explicit_country) |value|
+            if (value.len > 0) value else actor_country orelse return error.TokenNotFound
+        else
+            actor_country orelse return error.TokenNotFound;
+        const required_field_name = extractInputNameByPrefix(html_buffer, "required_field_");
+
+        return .{
+            .country = country,
+            .required_field_name = required_field_name,
+        };
+    }
+
+    fn extractInputNameByPrefix(html_buffer: []const u8, prefix: []const u8) ?[]const u8 {
         var search_start: usize = 0;
-
-        // Find the signup form
-        const form_start_str = "action=\"/signup\"";
-        const form_start = mem.indexOf(u8, html_buffer, form_start_str) orelse 0;
-        search_start = form_start;
-
-        while (mem.indexOfPos(u8, html_buffer, search_start, "<input")) |input_start| {
-            const input_end = mem.indexOfScalarPos(u8, html_buffer, input_start, '>') orelse html_buffer.len;
-            search_start = input_end;
-
-            const input_tag = html_buffer[input_start..input_end];
-
-            // Ensure type="hidden"
-            if (mem.indexOf(u8, input_tag, "type=\"hidden\"") == null and mem.indexOf(u8, input_tag, "type='hidden'") == null) {
-                continue;
-            }
-
-            // HONEYPOT CHECK 1: Skip hidden inputs that are actually honeypots
-            // These have hidden="hidden" attribute (text type disguised as hidden)
-            if (mem.indexOf(u8, input_tag, "hidden=\"hidden\"") != null) {
-                std.debug.print("[HONEYPOT SKIP] Skipping input with hidden=\"hidden\" attribute\n", .{});
-                continue;
-            }
-
-            // Extract name — skip inputs with NO name attribute (empty-name CSRF tokens)
-            const name_attr = "name=\"";
-            const name_idx = mem.indexOf(u8, input_tag, name_attr) orelse {
-                // No name attribute — this is a client-side-only CSRF token, skip
-                std.debug.print("[CSRF SKIP] Skipping hidden input with no name attribute\n", .{});
-                continue;
-            };
-            const name_start = name_idx + name_attr.len;
-            const name_end = mem.indexOfScalarPos(u8, input_tag, name_start, '"') orelse continue;
-            const name = input_tag[name_start..name_end];
-
-            // HONEYPOT CHECK 2: Skip required_field_* (dynamic honeypot name)
-            if (mem.startsWith(u8, name, "required_field_")) {
-                std.debug.print("[HONEYPOT SKIP] Skipping honeypot field: {s}\n", .{name});
-                continue;
-            }
-
-            // HONEYPOT CHECK 3: Skip "filter" — country dropdown panel search, not signup data
-            if (mem.eql(u8, name, "filter")) {
-                std.debug.print("[HONEYPOT SKIP] Skipping country dropdown filter field\n", .{});
-                continue;
-            }
-
-            // Extract value
-            const value_attr = "value=\"";
-            const value_idx = mem.indexOf(u8, input_tag, value_attr) orelse {
-                continue;
-            };
-            const value_start = value_idx + value_attr.len;
-            const value_end = mem.indexOfScalarPos(u8, input_tag, value_start, '"') orelse continue;
-            const value = input_tag[value_start..value_end];
-
-            if (payload_list.items.len > 0) {
-                try payload_list.appendSlice("&");
-            }
-            try urlEncode(payload_list, name);
-            try payload_list.appendSlice("=");
-            try urlEncode(payload_list, value);
+        while (mem.indexOfPos(u8, html_buffer, search_start, "name=\"")) |name_idx| {
+            const start = name_idx + "name=\"".len;
+            const end = mem.indexOfScalarPos(u8, html_buffer, start, '"') orelse return null;
+            const name = html_buffer[start..end];
+            if (mem.startsWith(u8, name, prefix)) return name;
+            search_start = end;
         }
+        return null;
+    }
+
+    fn extractInputValueByName(html_buffer: []const u8, field_name: []const u8) ?[]const u8 {
+        var search_start: usize = 0;
+        while (mem.indexOfPos(u8, html_buffer, search_start, "name=\"")) |name_idx| {
+            const name_start = name_idx + "name=\"".len;
+            const name_end = mem.indexOfScalarPos(u8, html_buffer, name_start, '"') orelse return null;
+            const name = html_buffer[name_start..name_end];
+            search_start = name_end;
+
+            if (!mem.eql(u8, name, field_name)) continue;
+
+            const value_idx = mem.indexOfPos(u8, html_buffer, name_end, "value=\"") orelse return "";
+            const value_start = value_idx + "value=\"".len;
+            const value_end = mem.indexOfScalarPos(u8, html_buffer, value_start, '"') orelse return "";
+            return html_buffer[value_start..value_end];
+        }
+        return null;
+    }
+
+    fn extractAttributeValue(html_buffer: []const u8, attr_name: []const u8) ?[]const u8 {
+        var marker_buf: [128]u8 = undefined;
+        if (attr_name.len + 1 > marker_buf.len) return null;
+        @memcpy(marker_buf[0..attr_name.len], attr_name);
+        marker_buf[attr_name.len] = '"';
+        const marker = marker_buf[0 .. attr_name.len + 1];
+
+        const attr_idx = mem.indexOf(u8, html_buffer, marker) orelse return null;
+        const value_start = attr_idx + marker.len;
+        const value_end = mem.indexOfScalarPos(u8, html_buffer, value_start, '"') orelse return null;
+        return html_buffer[value_start..value_end];
+    }
+
+    fn extractAutoCheckCsrfToken(html_buffer: []const u8, src_fragment: []const u8) ?[]const u8 {
+        const auto_check_idx = mem.indexOf(u8, html_buffer, src_fragment) orelse return null;
+        const auto_check_end_rel = mem.indexOf(u8, html_buffer[auto_check_idx..], "</auto-check>") orelse return null;
+        const auto_check = html_buffer[auto_check_idx .. auto_check_idx + auto_check_end_rel];
+        const marker = "data-csrf=\"true\" value=\"";
+        const value_idx = mem.indexOf(u8, auto_check, marker) orelse return null;
+        const value_start = auto_check_idx + value_idx + marker.len;
+        const value_end = mem.indexOfScalarPos(u8, html_buffer, value_start, '"') orelse return null;
+        return html_buffer[value_start..value_end];
+    }
+
+    // SOURCE: RFC 7578, Section 4.1 — multipart/form-data uses boundary-delimited parts
+    // SOURCE: Live GitHub signup browser observation (2026-04-09) — validation POSTs
+    // send exactly `authenticity_token` then `value` as multipart parts.
+    pub fn buildValidationMultipartBody(
+        allocator: std.mem.Allocator,
+        boundary: []const u8,
+        authenticity_token: []const u8,
+        value: []const u8,
+    ) !std.array_list.Managed(u8) {
+        var body = std.array_list.Managed(u8).init(allocator);
+        errdefer body.deinit();
+
+        try body.appendSlice("--");
+        try body.appendSlice(boundary);
+        try body.appendSlice("\r\n");
+        try body.appendSlice("Content-Disposition: form-data; name=\"authenticity_token\"\r\n");
+        try body.appendSlice("\r\n");
+        try body.appendSlice(authenticity_token);
+        try body.appendSlice("\r\n");
+
+        try body.appendSlice("--");
+        try body.appendSlice(boundary);
+        try body.appendSlice("\r\n");
+        try body.appendSlice("Content-Disposition: form-data; name=\"value\"\r\n");
+        try body.appendSlice("\r\n");
+        try body.appendSlice(value);
+        try body.appendSlice("\r\n");
+
+        try body.appendSlice("--");
+        try body.appendSlice(boundary);
+        try body.appendSlice("--\r\n");
+
+        return body;
+    }
+
+    fn buildValidationBoundary(
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        value: []const u8,
+    ) ![]u8 {
+        const now_ms: u64 = @intCast(currentTimestampMs());
+        const seed = std.hash.Wyhash.hash(0, path) ^ std.hash.Wyhash.hash(0, value) ^ now_ms;
+        return std.fmt.allocPrint(allocator, "----WebKitFormBoundary{x}", .{seed});
+    }
+
+    // SOURCE: RFC 9113, Section 8.1 — one request is carried on a single HEADERS
+    // frame followed by zero or more DATA frames on the same stream.
+    fn sendHttp2Request(
+        self: *GitHubHttpClient,
+        allocator: std.mem.Allocator,
+        hpack_block: []const u8,
+        body: ?[]const u8,
+        sock: anytype,
+        dst_ip: u32,
+        timeout_ms: i64,
+        headers_trace: []const u8,
+        data_trace: []const u8,
+    ) !http2_core.Http2Response {
+        _ = self.tls_session orelse return error.NoTlsSession;
+        if (self.hpack_decoder == null) {
+            self.hpack_decoder = http2_core.HpackDecoder.init(allocator);
+        }
+        try self.ensureHttp2ConnectionReady(allocator, sock, dst_ip);
+
+        const payload = body orelse &.{};
+        const stream_id = try self.nextClientStreamId();
+        const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, stream_id, payload.len == 0);
+        defer allocator.free(headers_frame);
+
+        try self.sendTlsApplicationData(allocator, sock, dst_ip, headers_frame, headers_trace);
+
+        if (payload.len > 0) {
+            const max_data_payload = 1400;
+            var offset: usize = 0;
+            while (offset < payload.len) {
+                const end = @min(offset + max_data_payload, payload.len);
+                const chunk = payload[offset..end];
+                const is_last = end == payload.len;
+
+                const data_frame = try packInDataFrame(allocator, chunk, stream_id, is_last);
+                defer allocator.free(data_frame);
+                try self.sendTlsApplicationData(allocator, sock, dst_ip, data_frame, data_trace);
+                offset = end;
+            }
+        }
+
+        var response_parser = http2_core.Http2ResponseParser.init(
+            allocator,
+            &(self.hpack_decoder.?),
+            stream_id,
+        );
+        defer response_parser.deinit();
+
+        const timeout_start = currentTimestampMs();
+        while (currentTimestampMs() - timeout_start < timeout_ms) {
+            const elapsed_ms: i64 = currentTimestampMs() - timeout_start;
+            const remaining_timeout = timeout_ms - elapsed_ms;
+            const plaintext = try receiveTlsApplicationData(self, allocator, sock, remaining_timeout);
+            defer allocator.free(plaintext);
+
+            try response_parser.processApplicationData(plaintext);
+            const window_increment = response_parser.takeWindowUpdateIncrement();
+            if (window_increment > 0) {
+                const connection_window_update = http2_core.buildWindowUpdateFrame(0, window_increment);
+                try self.sendTlsApplicationData(
+                    allocator,
+                    sock,
+                    dst_ip,
+                    &connection_window_update,
+                    "HTTP/2 connection WINDOW_UPDATE",
+                );
+                const stream_window_update = http2_core.buildWindowUpdateFrame(stream_id, window_increment);
+                try self.sendTlsApplicationData(
+                    allocator,
+                    sock,
+                    dst_ip,
+                    &stream_window_update,
+                    "HTTP/2 stream WINDOW_UPDATE",
+                );
+            }
+
+            if (response_parser.isComplete()) {
+                return try response_parser.finish();
+            }
+        }
+
+        return error.ReadTimeout;
+    }
+
+    fn performMultipartValidationCheck(
+        self: *GitHubHttpClient,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        authenticity_token: []const u8,
+        value: []const u8,
+        success_marker: []const u8,
+        sock: anytype,
+        dst_ip: u32,
+    ) !void {
+        const boundary = try buildValidationBoundary(allocator, path, value);
+        defer allocator.free(boundary);
+
+        var body = try buildValidationMultipartBody(allocator, boundary, authenticity_token, value);
+        defer body.deinit();
+
+        var cookie_buf: [4096]u8 = undefined;
+        const cookie_str = try self.cookie_jar.cookieHeader(&cookie_buf);
+        const hpack_block = try http2_core.buildGitHubMultipartFormHeaders(
+            allocator,
+            path,
+            self.host,
+            body.items.len,
+            boundary,
+            cookie_str,
+        );
+        defer allocator.free(hpack_block);
+
+        var response = try self.sendHttp2Request(
+            allocator,
+            hpack_block,
+            body.items,
+            sock,
+            dst_ip,
+            10000,
+            "HTTP/2 validation POST HEADERS",
+            "HTTP/2 validation POST DATA CHUNK",
+        );
+        defer response.deinit(allocator);
+
+        try extractCookiesFromHttp2Response(&response, &self.cookie_jar);
+
+        std.debug.print("[SIGNUP PREFLIGHT] {s} -> HTTP {d}, body {d} bytes\n", .{
+            path,
+            response.status_code,
+            response.body.len,
+        });
+
+        if (response.status_code != 200 or mem.indexOf(u8, response.body, success_marker) == null) {
+            const dump_len = @min(response.body.len, 1200);
+            std.debug.print("[SIGNUP PREFLIGHT] Expected marker: {s}\n", .{success_marker});
+            std.debug.print("[SIGNUP PREFLIGHT] Body (first {d} bytes):\n{s}\n", .{
+                dump_len,
+                response.body[0..dump_len],
+            });
+            return error.UnexpectedStatusCode;
+        }
+    }
+
+    fn performUsernameAvailabilityCheck(
+        self: *GitHubHttpClient,
+        allocator: std.mem.Allocator,
+        username: []const u8,
+        sock: anytype,
+        dst_ip: u32,
+    ) !void {
+        var path_list = std.array_list.Managed(u8).init(allocator);
+        defer path_list.deinit();
+        try path_list.appendSlice("/signup_check_new/username?value=");
+        try urlEncode(&path_list, username);
+
+        var cookie_buf: [4096]u8 = undefined;
+        const cookie_str = try self.cookie_jar.cookieHeader(&cookie_buf);
+        const hpack_block = try http2_core.buildGitHubValidationGetHeaders(
+            allocator,
+            path_list.items,
+            self.host,
+            cookie_str,
+        );
+        defer allocator.free(hpack_block);
+
+        var response = try self.sendHttp2Request(
+            allocator,
+            hpack_block,
+            null,
+            sock,
+            dst_ip,
+            10000,
+            "HTTP/2 validation GET HEADERS",
+            "HTTP/2 validation GET DATA CHUNK",
+        );
+        defer response.deinit(allocator);
+
+        try extractCookiesFromHttp2Response(&response, &self.cookie_jar);
+
+        std.debug.print("[SIGNUP PREFLIGHT] {s} -> HTTP {d}, body {d} bytes\n", .{
+            path_list.items,
+            response.status_code,
+            response.body.len,
+        });
+
+        if (response.status_code != 200 or mem.indexOf(u8, response.body, "is available.") == null) {
+            const dump_len = @min(response.body.len, 1200);
+            std.debug.print("[SIGNUP PREFLIGHT] Body (first {d} bytes):\n{s}\n", .{
+                dump_len,
+                response.body[0..dump_len],
+            });
+            return error.UnexpectedStatusCode;
+        }
+    }
+
+    // SOURCE: Live GitHub signup browser observation (2026-04-09) — before the
+    // final signup POST, the page performs email, password, and username
+    // validation requests. The POST validations rotate `_gh_sess` via Set-Cookie.
+    fn runSignupPreflightChecks(
+        self: *GitHubHttpClient,
+        allocator: std.mem.Allocator,
+        email_authenticity_token: []const u8,
+        password_authenticity_token: []const u8,
+        username: []const u8,
+        email: []const u8,
+        password: []const u8,
+        sock: anytype,
+        dst_ip: u32,
+    ) !void {
+        try self.performMultipartValidationCheck(
+            allocator,
+            "/email_validity_checks",
+            email_authenticity_token,
+            email,
+            "Email is available",
+            sock,
+            dst_ip,
+        );
+        try self.performMultipartValidationCheck(
+            allocator,
+            "/password_validity_checks?hide_password_validity_pills=true&hide_strength_sentence=true",
+            password_authenticity_token,
+            password,
+            "Password is strong",
+            sock,
+            dst_ip,
+        );
+        try self.performUsernameAvailabilityCheck(allocator, username, sock, dst_ip);
     }
 
     // SOURCE: RFC 9113, Section 8.1 — HTTP/2 POST with x-www-form-urlencoded body
@@ -7594,6 +7875,7 @@ pub const GitHubHttpClient = struct {
     pub fn buildSignupPayload(
         allocator: std.mem.Allocator,
         tokens: SignupTokens,
+        form_fields: SignupFormFields,
         username: []const u8,
         email: []const u8,
         password: []const u8,
@@ -7636,7 +7918,10 @@ pub const GitHubHttpClient = struct {
         try buf.appendSlice("&");
         try urlEncode(&buf, "user_signup[country]");
         try buf.appendSlice("=");
-        try buf.appendSlice("TR"); // detected country from page load
+        try urlEncode(&buf, form_fields.country);
+
+        // --- Field 10: filter (empty string, browser submits it) ---
+        try buf.appendSlice("&filter=");
 
         // --- Field 11/12: user_signup[marketing_consent]=0 ---
         // Browser submits hidden input (value=0), NOT checkbox (unchecked)
@@ -7644,6 +7929,13 @@ pub const GitHubHttpClient = struct {
 
         // --- Field 13: octocaptcha-token (empty when captcha not solved) ---
         try buf.appendSlice("&octocaptcha-token=");
+
+        // --- Field 14: required_field_xxxx (empty string, browser submits it) ---
+        if (form_fields.required_field_name) |required_name| {
+            try buf.appendSlice("&");
+            try urlEncode(&buf, required_name);
+            try buf.appendSlice("=");
+        }
 
         // --- Field 15: timestamp ---
         try buf.appendSlice("&timestamp=");
@@ -7654,6 +7946,46 @@ pub const GitHubHttpClient = struct {
         try urlEncode(&buf, tokens.timestamp_secret);
 
         return buf;
+    }
+
+    // SOURCE: Live GitHub signup observation (2026-04-09) — successful signup moves
+    // into the email-verification flow, which exposes verification-specific paths/fields.
+    fn isSignupVerificationState(status_code: u16, body: []const u8) bool {
+        if (status_code == 302) return true;
+        if (status_code != 200) return false;
+
+        const verification_markers = [_][]const u8{
+            "/account_verifications",
+            "/signup/verify_email",
+            "verification_code",
+            "verify your email",
+            "Verify your email",
+            "enter the code",
+            "Enter the code",
+        };
+
+        for (verification_markers) |marker| {
+            if (mem.indexOf(u8, body, marker) != null) return true;
+        }
+
+        return false;
+    }
+
+    fn dumpSignupFailureBody(body: []const u8) !void {
+        const fd = try posix.openat(posix.AT.FDCWD, "/tmp/github-signup-failure.html", .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        }, 0o644);
+        defer _ = std.c.close(fd);
+
+        var written: usize = 0;
+        while (written < body.len) {
+            const rc = std.c.write(fd, body.ptr + written, body.len - written);
+            if (rc <= 0) return error.WriteFailed;
+            written += @as(usize, @intCast(rc));
+        }
     }
 
     pub fn performSignup(
@@ -7682,27 +8014,39 @@ pub const GitHubHttpClient = struct {
             tokens.timestamp_secret.len,
         });
 
+        const form_fields = try extractSignupFormFields(html_buffer);
+        if (form_fields.required_field_name) |required_name| {
+            std.debug.print("[SIGNUP] Detected dynamic required field: {s}\n", .{required_name});
+        }
+        const email_check_token = extractAutoCheckCsrfToken(html_buffer, "/email_validity_checks") orelse return error.TokenNotFound;
+        const password_check_token = extractAutoCheckCsrfToken(html_buffer, "password_validity_checks") orelse return error.TokenNotFound;
+
+        try self.runSignupPreflightChecks(
+            allocator,
+            email_check_token,
+            password_check_token,
+            username,
+            email,
+            password,
+            sock,
+            dst_ip,
+        );
+
         // STEP 2: Build byte-perfect x-www-form-urlencoded payload
-        var payload_list = try buildSignupPayload(allocator, tokens, username, email, password);
+        var payload_list = try buildSignupPayload(allocator, tokens, form_fields, username, email, password);
         defer payload_list.deinit();
         const payload = payload_list.items;
 
         std.debug.print("[SIGNUP] Payload length: {d} bytes\n", .{payload.len});
         std.debug.print("[SIGNUP] Payload preview: {s:.100}\n", .{payload});
 
-        // STEP 3: Ensure TLS session and HTTP/2 connection
-        _ = self.tls_session orelse return error.NoTlsSession;
-        if (self.hpack_decoder == null) {
-            self.hpack_decoder = http2_core.HpackDecoder.init(allocator);
-        }
-        try self.ensureHttp2ConnectionReady(allocator, sock, dst_ip);
-
-        // STEP 4: Build cookie header — MUST include _gh_sess + _octo
+        // STEP 3: Build cookie header — preflight validations have already rotated
+        // _gh_sess on the browser-equivalent session path.
         var cookie_buf: [4096]u8 = undefined;
-        const cookie_str = self.cookie_jar.cookieHeader(&cookie_buf) catch "";
+        const cookie_str = try self.cookie_jar.cookieHeader(&cookie_buf);
         std.debug.print("[SIGNUP] Cookie header length: {d} bytes\n", .{cookie_str.len});
 
-        // STEP 5: Build HPACK headers — includes origin, referer, content-type
+        // STEP 4: Build HPACK headers — includes origin, referer, content-type
         const hpack_block = try http2_core.buildGitHubSignupHeaders(
             allocator,
             path,
@@ -7712,156 +8056,78 @@ pub const GitHubHttpClient = struct {
         );
         defer allocator.free(hpack_block);
 
-        const stream_id = try self.nextClientStreamId();
-
-        // STEP 6: Send HEADERS frame
-        const headers_frame = try http2_core.packInHeadersFrame(allocator, hpack_block, stream_id, false);
-        defer allocator.free(headers_frame);
-
-        try self.sendTlsApplicationData(
+        var response = try self.sendHttp2Request(
             allocator,
+            hpack_block,
+            payload,
             sock,
             dst_ip,
-            headers_frame,
+            10000,
             "HTTP/2 POST HEADERS",
+            "HTTP/2 POST DATA CHUNK",
         );
+        defer response.deinit(allocator);
 
-        // STEP 7: Send body in chunks
-        const MAX_DATA_PAYLOAD = 1400;
-        var offset: usize = 0;
-        while (offset < payload.len) {
-            const end = @min(offset + MAX_DATA_PAYLOAD, payload.len);
-            const chunk = payload[offset..end];
-            const is_last = (end == payload.len);
+        // Update cookies from response
+        try extractCookiesFromHttp2Response(&response, &self.cookie_jar);
 
-            const data_frame = try packInDataFrame(allocator, chunk, stream_id, is_last);
-            defer allocator.free(data_frame);
+        std.debug.print("[SIGNUP RESPONSE] HTTP Status: {d}\n", .{response.status_code});
+        std.debug.print("[SIGNUP RESPONSE] Body length: {d} bytes\n", .{response.body.len});
 
-            try self.sendTlsApplicationData(
-                allocator,
-                sock,
-                dst_ip,
-                data_frame,
-                "HTTP/2 POST DATA CHUNK",
-            );
-            offset = end;
+        // === SUCCESS CRITERIA ===
+        // SOURCE: Live GitHub signup observation — after account creation the flow
+        // must land on an email-verification page or redirect, not merely contain
+        // generic logged-in/navigation words like "dashboard" or "logout".
+        if (isSignupVerificationState(response.status_code, response.body)) {
+            std.debug.print("[SIGNUP] SUCCESS: verification step reached\n", .{});
+            return true;
         }
 
-        // STEP 8: Parse response
-        var response_parser = http2_core.Http2ResponseParser.init(
-            allocator,
-            &(self.hpack_decoder.?),
-            stream_id,
-        );
-        defer response_parser.deinit();
+        // === FAILURE: 422 Unprocessable Entity ===
+        if (response.status_code == 422) {
+            std.debug.print("[SIGNUP] FAILED: HTTP 422 Unprocessable Entity\n", .{});
+            std.debug.print("[SIGNUP] Likely cause: CSRF failure, missing token, or wrong header\n", .{});
+            dumpSignupFailureBody(response.body) catch {};
+            const dump_len = @min(response.body.len, 2000);
+            std.debug.print("[SIGNUP] 422 Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
+            return false;
+        }
 
-        const timeout_start = currentTimestampMs();
-        while (currentTimestampMs() - timeout_start < 10000) {
-            const remaining_timeout = 10000 - (currentTimestampMs() - timeout_start);
-            const plaintext = try receiveTlsApplicationData(self, allocator, sock, remaining_timeout);
-            defer allocator.free(plaintext);
-
-            try response_parser.processApplicationData(plaintext);
-            const window_increment = response_parser.takeWindowUpdateIncrement();
-            if (window_increment > 0) {
-                const connection_window_update = http2_core.buildWindowUpdateFrame(0, window_increment);
-                try self.sendTlsApplicationData(
-                    allocator,
-                    sock,
-                    dst_ip,
-                    &connection_window_update,
-                    "HTTP/2 connection WINDOW_UPDATE",
-                );
-                const stream_window_update = http2_core.buildWindowUpdateFrame(stream_id, window_increment);
-                try self.sendTlsApplicationData(
-                    allocator,
-                    sock,
-                    dst_ip,
-                    &stream_window_update,
-                    "HTTP/2 stream WINDOW_UPDATE",
-                );
-            }
-            if (response_parser.isComplete()) {
-                var response = try response_parser.finish();
-                defer response.deinit(allocator);
-
-                // Update cookies from response
-                try extractCookiesFromHttp2Response(&response, &self.cookie_jar);
-
-                std.debug.print("[SIGNUP RESPONSE] HTTP Status: {d}\n", .{response.status_code});
-                std.debug.print("[SIGNUP RESPONSE] Body length: {d} bytes\n", .{response.body.len});
-
-                // === SUCCESS CRITERIA ===
-                // 302 redirect → signup succeeded
-                if (response.status_code == 302) {
-                    std.debug.print("[SIGNUP] SUCCESS: 302 redirect (account created)\n", .{});
-                    return true;
-                }
-
-                // 200/302 leading to /account_verifications → signup succeeded
-                // SOURCE: GitHub 2026 signup flow — new accounts redirect to verification page
-                if (response.status_code == 200 and
-                    mem.indexOf(u8, response.body, "/account_verifications") != null)
-                {
-                    std.debug.print("[SUCCESS] Account Created - Redirected to Verification Page\n", .{});
-                    return true;
-                }
-
-                // 200 OK with logged-in indicators → succeeded
-                if (response.status_code == 200 and
-                    (mem.indexOf(u8, response.body, "logout") != null or
-                    mem.indexOf(u8, response.body, "dashboard") != null))
-                {
-                    std.debug.print("[SIGNUP] SUCCESS: 200 OK with logged-in indicators\n", .{});
-                    return true;
-                }
-
-                // === FAILURE: 422 Unprocessable Entity ===
-                if (response.status_code == 422) {
-                    std.debug.print("[SIGNUP] FAILED: HTTP 422 Unprocessable Entity\n", .{});
-                    std.debug.print("[SIGNUP] Likely cause: CSRF failure, missing token, or wrong header\n", .{});
-                    const dump_len = @min(response.body.len, 2000);
-                    std.debug.print("[SIGNUP] 422 Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
-                    return false;
-                }
-
-                // === FAILURE: error indicators in 200 response ===
-                if (response.status_code == 200) {
-                    const error_indicators = [_][]const u8{
-                        "signup_errors",
-                        "error-messages",
-                        "form-disabled",
-                        "already registered",
-                        "password is too short",
-                        "password must contain",
-                        "username is already taken",
-                        "email is invalid",
-                    };
-                    for (error_indicators) |indicator| {
-                        if (mem.indexOf(u8, response.body, indicator) != null) {
-                            std.debug.print("[SIGNUP] FAILED: Error indicator found: \"{s}\"\n", .{indicator});
-                            const dump_len = @min(response.body.len, 2000);
-                            std.debug.print("[SIGNUP] Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
-                            return false;
-                        }
-                    }
-
-                    // 200 OK but no success indicators — form re-rendered
-                    std.debug.print("[SIGNUP] FAILED: 200 OK but no success indicators (form re-rendered)\n", .{});
+        // === FAILURE: error indicators in 200 response ===
+        if (response.status_code == 200) {
+            const error_indicators = [_][]const u8{
+                "signup_errors",
+                "error-messages",
+                "form-disabled",
+                "already registered",
+                "password is too short",
+                "password must contain",
+                "username is already taken",
+                "email is invalid",
+            };
+            for (error_indicators) |indicator| {
+                if (mem.indexOf(u8, response.body, indicator) != null) {
+                    std.debug.print("[SIGNUP] FAILED: Error indicator found: \"{s}\"\n", .{indicator});
+                    dumpSignupFailureBody(response.body) catch {};
                     const dump_len = @min(response.body.len, 2000);
                     std.debug.print("[SIGNUP] Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
                     return false;
                 }
-
-                // === UNEXPECTED STATUS ===
-                std.debug.print("[SIGNUP] UNEXPECTED: HTTP Status {d}\n", .{response.status_code});
-                const dump_len = @min(response.body.len, 2000);
-                std.debug.print("[SIGNUP] Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
-                return false;
             }
+
+            // 200 OK but no success indicators — form re-rendered
+            std.debug.print("[SIGNUP] FAILED: 200 OK but no success indicators (form re-rendered)\n", .{});
+            dumpSignupFailureBody(response.body) catch {};
+            const dump_len = @min(response.body.len, 2000);
+            std.debug.print("[SIGNUP] Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
+            return false;
         }
 
-        return error.ReadTimeout;
+        // === UNEXPECTED STATUS ===
+        std.debug.print("[SIGNUP] UNEXPECTED: HTTP Status {d}\n", .{response.status_code});
+        const dump_len = @min(response.body.len, 2000);
+        std.debug.print("[SIGNUP] Body (first {d} bytes):\n{s}\n", .{ dump_len, response.body[0..dump_len] });
+        return false;
     }
 
     /// Submit email verification code to GitHub after signup
@@ -8306,6 +8572,83 @@ test "extractSignupTokens: extracts all three tokens from HTML" {
     try std.testing.expectEqualStrings("7c14a5e0590045005da84c8fe192921f", tokens.timestamp_secret);
 }
 
+test "extractAutoCheckCsrfToken: extracts endpoint-specific validation tokens" {
+    const html =
+        \\<auto-check src="/email_validity_checks" required>
+        \\  <input type="hidden" data-csrf="true" value="email-token-123">
+        \\</auto-check>
+        \\<auto-check src="https://github.com/password_validity_checks?hide_password_validity_pills=true&amp;hide_strength_sentence=true" required>
+        \\  <input type="hidden" data-csrf="true" value="password-token-456">
+        \\</auto-check>
+    ;
+
+    try std.testing.expectEqualStrings(
+        "email-token-123",
+        GitHubHttpClient.extractAutoCheckCsrfToken(html, "/email_validity_checks").?,
+    );
+    try std.testing.expectEqualStrings(
+        "password-token-456",
+        GitHubHttpClient.extractAutoCheckCsrfToken(html, "password_validity_checks").?,
+    );
+}
+
+test "extractSignupFormFields: captures country and dynamic required field name" {
+    const html =
+        \\<form action="/signup?social=false" method="post">
+        \\<input type="hidden" name="user_signup[country]" value="TR">
+        \\<input type="search" name="filter" value="">
+        \\<input type="text" name="required_field_463b" hidden="hidden">
+        \\</form>
+    ;
+
+    const fields = try GitHubHttpClient.extractSignupFormFields(html);
+    try std.testing.expectEqualStrings("TR", fields.country);
+    try std.testing.expectEqualStrings("required_field_463b", fields.required_field_name.?);
+}
+
+test "extractSignupFormFields: falls back to actor-country-code when hidden country is empty" {
+    const html =
+        \\<signups-marketing-consent-fields data-actor-country-code="TR" data-view-component="true">
+        \\  <select-panel>
+        \\    <span data-select-panel-inputs="true">
+        \\      <input autocomplete="off" type="hidden" name="user_signup[country]" />
+        \\    </span>
+        \\  </select-panel>
+        \\  <input type="text" name="required_field_463b" hidden="hidden">
+        \\</signups-marketing-consent-fields>
+    ;
+
+    const fields = try GitHubHttpClient.extractSignupFormFields(html);
+    try std.testing.expectEqualStrings("TR", fields.country);
+    try std.testing.expectEqualStrings("required_field_463b", fields.required_field_name.?);
+}
+
+test "buildValidationMultipartBody: matches browser multipart field order" {
+    const allocator = std.testing.allocator;
+    const boundary = "----WebKitFormBoundarywiretruth";
+
+    var body = try GitHubHttpClient.buildValidationMultipartBody(
+        allocator,
+        boundary,
+        "auth-token-value",
+        "wiretruth@example.com",
+    );
+    defer body.deinit();
+
+    const expected =
+        "------WebKitFormBoundarywiretruth\r\n" ++
+        "Content-Disposition: form-data; name=\"authenticity_token\"\r\n" ++
+        "\r\n" ++
+        "auth-token-value\r\n" ++
+        "------WebKitFormBoundarywiretruth\r\n" ++
+        "Content-Disposition: form-data; name=\"value\"\r\n" ++
+        "\r\n" ++
+        "wiretruth@example.com\r\n" ++
+        "------WebKitFormBoundarywiretruth--\r\n";
+
+    try std.testing.expectEqualStrings(expected, body.items);
+}
+
 test "buildSignupPayload: URL-encodes base64 token correctly" {
     const allocator = std.testing.allocator;
 
@@ -8314,8 +8657,12 @@ test "buildSignupPayload: URL-encodes base64 token correctly" {
         .timestamp = "1775694569904",
         .timestamp_secret = "7c14a5e0590045005da8",
     };
+    const form_fields = GitHubHttpClient.SignupFormFields{
+        .country = "TR",
+        .required_field_name = "required_field_463b",
+    };
 
-    var payload = try GitHubHttpClient.buildSignupPayload(allocator, tokens, "testuser", "test@example.com", "Pass+word/123=");
+    var payload = try GitHubHttpClient.buildSignupPayload(allocator, tokens, form_fields, "testuser", "test@example.com", "Pass+word/123=");
     defer payload.deinit();
 
     // FIRST FIELD MUST INCLUDE KEY: authenticity_token=...
@@ -8332,8 +8679,28 @@ test "buildSignupPayload: URL-encodes base64 token correctly" {
     try std.testing.expect(mem.indexOf(u8, payload.items, "timestamp_secret=7c14a5e0590045005da8") != null);
     // marketing_consent=0 must appear
     try std.testing.expect(mem.indexOf(u8, payload.items, "user_signup%5Bmarketing_consent%5D=0") != null);
+    // Browser also submits filter= and required_field_xxxx=
+    try std.testing.expect(mem.indexOf(u8, payload.items, "&filter=") != null);
+    try std.testing.expect(mem.indexOf(u8, payload.items, "&required_field_463b=") != null);
     // Content-length = payload length (exact byte match for HPACK)
     try std.testing.expect(payload.items.len > 300); // sanity: payload is substantial
+}
+
+test "GitHubHttpClient: signup success detection requires verification markers" {
+    try std.testing.expect(GitHubHttpClient.isSignupVerificationState(
+        302,
+        "",
+    ));
+
+    try std.testing.expect(GitHubHttpClient.isSignupVerificationState(
+        200,
+        "<form action=\"/signup/verify_email\"><input name=\"verification_code\"></form>",
+    ));
+
+    try std.testing.expect(!GitHubHttpClient.isSignupVerificationState(
+        200,
+        "<html><body>dashboard logout notifications</body></html>",
+    ));
 }
 
 test "HttpResponse: parse 200 OK response" {

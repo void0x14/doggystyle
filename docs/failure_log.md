@@ -6,6 +6,197 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-09] — Digistallone Livewire Create Flow Was Modeled Incorrectly
+
+## [2026-04-09] — GitHub Signup Preflight Used The Wrong CSRF Token
+
+**Hata:** `performSignup()` browser’daki preflight zincirini ekledikten sonra bile ilk `POST /email_validity_checks` isteği `HTTP 422` dönüyordu ve generic `Oh no · GitHub` hata sayfasına düşüyordu.
+
+**Kök sebep:** Preflight validation endpoint’leri formun ana `name="authenticity_token"` alanını kullanmıyor. Her `auto-check` bileşeni kendi `data-csrf="true"` hidden input değerini kullanıyor:
+- `/email_validity_checks` için email auto-check token’ı
+- `/password_validity_checks?...` için password auto-check token’ı
+
+Motor form token’ını preflight POST’lara koyduğu için GitHub request’i CSRF/validation açısından geçersiz sayıyordu.
+
+**Kaynak:**
+- GitHub signup raw HTML, 2026-04-09:
+  - `<auto-check src="/email_validity_checks"> ... <input type="hidden" data-csrf="true" value="...">`
+  - `<auto-check src="...password_validity_checks..."> ... <input type="hidden" data-csrf="true" value="...">`
+- GitHub canlı browser network trace, 2026-04-09:
+  - `POST /email_validity_checks` request body token’ı form token’ından farklı
+  - `POST /password_validity_checks?...` request body token’ı da endpoint-spesifik
+
+**Düzeltme:**
+1. `extractAutoCheckCsrfToken()` eklendi.
+2. `runSignupPreflightChecks()` artık email/password preflight’larında endpoint-spesifik `data-csrf` token’larını kullanıyor.
+3. Regression testi eklendi: `extractAutoCheckCsrfToken: extracts endpoint-specific validation tokens`.
+
+**Hata:** `getNewEmailAddress(null)` çoğu durumda mevcut mailbox adresini geri döndürüyordu; yeni adres üretemiyordu. `createEmail()` ayrıca browser’ın gerçek Livewire create akışını tek request’te taklit etmeye çalışıyordu.
+
+**Kök sebep:** İki ayrı hata üst üste biniyordu:
+1. `getNewEmailAddress()` mevcut email varsa `preferred_domain == null` durumunda create akışına girmeden erken dönüyordu.
+2. Gerçek Digistallone/browser akışı `user` ve `domain` için iki ayrı update request’i yollayıp yeni checksum’lı snapshot alıyor, ardından `create` çağrısını boş `updates` ile yapıyor. Bizim model ise `user` + `domain` değerlerini tek create request’ine gömüyordu. Üstelik `create` cevabı JSON state değil, `302 -> /mailbox` redirect idi.
+3. `updateStateFromResponse()` escaped snapshot string içinde component adını yanlış biçimde aradığı için (`\"name\"` yerine `"name"`) update cevaplarından yeni snapshot’ları belleğe alamıyordu.
+
+**Kaynak:**
+- Digistallone canlı browser network trace, 2026-04-09
+- Digistallone canlı HTTP/1.1 replay, 2026-04-09
+- Livewire JavaScript docs — `snapshotEncoded` / commit payload
+- Livewire source — `src/Mechanisms/HandleComponents/Checksum.php`
+
+**Düzeltme:**
+1. `getNewEmailAddress()` içindeki hatalı erken dönüş kaldırıldı.
+2. `createEmail()` browser wire-truth’a göre yeniden yazıldı:
+   - önce `user` update
+   - sonra `domain` update
+   - sonra boş `updates` ile `create`
+   - ardından `/mailbox` GET + `parseInitialState()`
+3. `buildUpdateRequest()` artık calls dizisini boş bırakabiliyor.
+4. `updateStateFromResponse()` escaped snapshot’ı önce unescape edip sonra component name/snapshot update yapıyor.
+5. `parseInitialState()` re-parse öncesi component/email state’ini resetliyor.
+
+---
+
+## [2026-04-09] — Poll Snapshot Unicode Escapes Were Corrupted
+
+**Hata:** Mailbox polling sırasında `frontend.app` snapshot’ı içindeki mesaj içerikleri ve sender alanları `\u0131`, `\u00e7` gibi Unicode escape’ler içeriyordu. `updateStateFromResponse()` bu snapshot’ı `unescapeJsonString()` ile decode ederken non-ASCII `\uXXXX` codepoint’leri alt byte’a kırpıyordu. Örneğin `\u0131` -> `0x31` (`'1'`) gibi bozulmalar oluşuyordu.
+
+**Kök sebep:** `unescapeJsonString()` yalnızca ASCII-range için tasarlanmıştı ama gerçek Digistallone poll response’ları UTF-16 JSON Unicode escape’leri taşıyordu. Bu bozuk decode sonucu, sonraki poll request’lerinde kullanılan snapshot string semantik olarak çürüyordu.
+
+**Kaynak:**
+- Digistallone canlı poll response, 2026-04-09 (`/tmp/digistallone-latest-poll-response.json` içinde `\\u0131`, `\\u00e7`)
+- RFC 8259, Section 7 — JSON string escaping
+
+**Düzeltme:**
+1. `unescapeJsonString()` UTF-8 encode edecek şekilde yeniden yazıldı.
+2. UTF-16 surrogate pair desteği eklendi.
+3. Regression testi eklendi: `unescapeJsonString: decodes unicode escapes as UTF-8`.
+
+---
+
+## [2026-04-09] — Engine Was Polling Mailbox After GitHub Signup Had Already Failed
+
+**Hata:** `ghost_engine` signup aşamasında GitHub formu yeniden render etmesine rağmen mailbox polling’e geçiyordu. Bu yüzden süreç dakikalarca/sonsuz gibi bekliyordu; çünkü verification mail henüz garanti edilmemişti.
+
+**Kök sebep:** İki seviye problem vardı:
+1. `network_core.performSignup()` `200 OK` gövdede sadece `logout` / `dashboard` geçmesine bakarak yanlış başarı kararı verebiliyordu.
+2. `main.zig` `signup_success == false` olsa bile polling aşamasına devam ediyordu.
+
+**Canlı kanıt (2026-04-09):**
+- `ghost_engine` log’u: `[SIGNUP] FAILED: 200 OK but no success indicators (form re-rendered)` hemen ardından `[MAIL] Polling...`
+- Dump edilen `/tmp/github-signup-failure.html` içinde:
+  - `We couldn't create your account`
+  - `GitHub requires JavaScript to proceed with the sign up process`
+  - `js-octocaptcha-load-captcha`
+  - `name="octocaptcha-token"`
+
+**Düzeltme:**
+1. `performSignup()` artık generic `logout` / `dashboard` stringlerini başarı saymıyor; yalnızca verification-step marker’larını kabul ediyor.
+2. GitHub signup payload’ı browser FormData’ya yaklaştırıldı: `filter=` ve dynamic `required_field_xxxx=` eklendi.
+3. `main.zig` signup başarısızsa mailbox polling’e GİRMEDEN fatal exit yapıyor.
+
+---
+
+## [2026-04-09] — Digistallone HTTP Framing / Cookie / Entity Decoder Rewrite
+
+**Hata:** `recvFullResponse()` sadece `Content-Length` kabul ediyor, `postJson()` boş `x-livewire:` ve sabit 8 KB request buffer kullanıyordu, `CookieJar.setCookie()` session cookie adını `tmail_session` varsayıyordu, `decodeHtmlAttributeInto()` ise sadece birkaç sabit HTML entity tanıyordu.
+
+**Kök sebep:** HTTP/1.1 response framing (chunked vs close-delimited), RFC 6265 cookie-pair parsing ve Blade/JSON escape kombinasyonu tek bir wire-level model yerine sabit varsayımlarla implement edilmişti.
+
+**Kaynak:**
+- RFC 9112, Section 6.3 — Message Body Length
+- RFC 9112, Section 7.1.3 — Decoding Chunked
+- RFC 6265, Section 5.2 — The Set-Cookie Header
+- RFC 6265, Section 4.2.1 / 4.2.2 — Cookie header syntax and semantics
+- RFC 8259, Section 7 — JSON string escapes
+
+**Düzeltme:**
+1. `recvFullResponse()` artık `readHttpResponseBodyFromReader()` helper’ı üzerinden `Transfer-Encoding: chunked`, `Content-Length`, ve close-delimited body modlarını ayırıyor.
+2. `postJson()` sabit `[8192]u8` yerine allocator-backed dynamic request builder kullanıyor ve `x-livewire: true` gönderiyor.
+3. `CookieJar` artık dinamik session cookie adını saklayıp `Cookie:` header’ına aynı adıyla geri yazıyor.
+4. `decodeHtmlAttributeInto()` numeric HTML entity’leri (`&#39;`, `&#x27;` vb.) ve güvenli JSON `\uXXXX` escape’lerini decode ediyor.
+5. Regression testleri eklendi: large payload request build, chunked response decode, dynamic session cookie header, robust entity decoding.
+
+---
+
+## [2026-04-09] — Stale Timer Paradox: 120-Attempt Dead Loop on Closed Socket
+
+**Hata:** `pollInboxForGitHubCode()` fonksiyonunda `TcpRecvFailed` catch bloğu `ensureConnected()` çağırıyordu. `ensureConnected()` ise `isStale(3000)` ile bağlantının idle olup olmadığını kontrol ediyordu. Ancak `recvFullResponse` fonksiyonundaki `defer self.recordActivity()` satırı, TcpRecvFailed hatası ALINDIKTAN SONRA bile `last_activity_ns` timestamp'ini güncelliyordu. Bu paradoks nedeniyle:
+
+1. `recvFullResponse` → TcpRecvFailed → `defer recordActivity()` timer'ı NOW'a günceller
+2. catch bloğu → `ensureConnected()` → `isStale(3000)` → timer 1ms önce güncellendi → **FALSE**
+3. `ensureConnected()` hiçbir şey yapmaz, ölü socket ile devam eder
+4. Loop 120 kez tekrarlanır, her seferinde aynı ölü socket denenir
+
+**Kök sebep:** `defer recordActivity()` hem başarılı hem başarısız recv operasyonlarında çalışıyordu. `ensureConnected()` sadece staleness'e bakıyordu, recv failure'ı doğrudan kanıt olarak kullanmıyordu.
+
+**Kaynak:** man 2 socket — kapalı soketten read EOF/timeout döner
+**Kaynak:** LiteSpeed docs — keepalive_timeout 5s, sonrasında socket sessizce kapatılır
+
+**Düzeltme (3 aşamalı):**
+
+1. **`defer recordActivity()` kaldırıldı**: `recvFullResponse` içindeki `defer self.recordActivity()` satırı silindi. `recordActivity()` artık sadece body başarıyla okunduktan SONRA çağrılıyor (line ~727).
+
+2. **`forceReconnect()` eklendi**: Yeni fonksiyon, staleness kontrolü YAPMADAN koşulsuz reconnect yapıyor:
+   ```zig
+   pub fn forceReconnect(self: *DigistalloneClient) DigistalloneError!void {
+       self.http.deinit();
+       var new_http = try HttpClient.init(...);
+       const html = try new_http.get(self.allocator, "/mailbox", "");
+       try self.livewire.parseInitialState(self.allocator, html);
+       self.http = new_http;
+   }
+   ```
+
+3. **`pollInboxForGitHubCode` catch bloğu güncellendi**:
+   ```zig
+   if (err == DigistalloneError.TcpRecvFailed) {
+       try self.forceReconnect();  // ensureConnected() DEĞİL
+       continue;
+   }
+   ```
+
+4. **`buildUpdateRequest` std.json.Stringify ile yeniden yazıldı**: `std.fmt.allocPrint` + string interpolation yerine `std.json.Stringify` stream API kullanılarak tüm string değerler otomatik escape ediliyor.
+
+5. **`Connection: keep-alive` header eklendi**: Hem `get()` hem `postJson()` fonksiyonlarına `Connection: keep-alive\r\n` header'ı eklendi (RFC 7230, Section 6.1).
+
+**Tekrar olmaması için:**
+- `recvFullResponse` gibi I/O fonksiyonlarında `defer recordActivity()` KULLANILMAZ
+- TcpRecvFailed gibi connection failure durumlarında `forceReconnect()` gibi koşulsuz reconnect kullanılır
+- `ensureConnected()` sadece proaktif/preventive kullanım içindir, reactive error handling için değil
+- JSON payload'ları string interpolation ile DEĞİL, `std.json.Stringify` veya eşdeğeri ile oluşturulur
+
+---
+
+## [2026-04-09] — Malformed JSON Payload in buildUpdateRequest: TcpRecvFailed
+
+**Hata:** `LivewireClient.buildUpdateRequest()` ile üretilen Livewire update request JSON'u malformed olabiliyordu. `comp.snapshot` ham JSON içeriyordu (örn. `{"data":...}`) ve `std.fmt.allocPrint` ile `{f}` placeholder'ı kullanılarak inject edildiğinde, snapshot içindeki çift tırnaklar doğru şekilde escape edilmeyebiliyordu. Sonuç: LiteSpeed server geçersiz JSON parse edemiyor ve bağlantıyı kesiyordu → `error.TcpRecvFailed`.
+
+**Kök sebep:** `std.fmt.allocPrint` format string'i ile kompleks JSON build etmek fragile. `std.json.fmt()` string escaping yapsa bile, format string içindeki `{f}` placeholder'ının davranışı ve raw JSON string'lerin (`{s}` ile embed edilen params/updates) karışımı tutarsız sonuçlar üretebiliyordu.
+
+**Kaynak:** RFC 8259, Section 7 — JSON string escaping rules
+**Kaynak:** Chrome DevTools wire-truth — browser `JSON.stringify()` ile properly escaped payload gönderiyor
+
+**Düzeltme:**
+1. `jsonEscape()` helper fonksiyonu eklendi — herhangi bir string'i RFC 8259 uyumlu şekilde JSON string olarak escape eder
+2. Two-pass approach:
+   - Pass 1: Exact escaped length hesaplanır (her karakter için escape boyutu bilinir)
+   - Pass 2: Tam doğru capacity ile `ArrayList` oluşturulur, `appendAssumeCapacity` ile güvenli yazım
+3. `buildUpdateRequest` artık her string değeri (`_token`, `snapshot`, `method`) `jsonEscape()` ile escape edip `{s}` ile embed ediyor
+4. `params_json` ve `updates_json` zaten valid JSON olduğu için doğrudan `{s}` ile embed ediliyor (double-escape yok)
+5. Vendor Zig 0.16 `ArrayList` API farklılıkları handle edildi:
+   - `init()` yerine `initCapacity(allocator, len)` (Aligned versiyonunda init yok)
+   - `deinit()` → `deinit(allocator)`
+   - `toOwnedSlice()` → `toOwnedSlice(allocator)`
+   - `appendSlice()` → `appendSliceAssumeCapacity()` (capacity önceden biliniyor)
+
+**Tekrar olmaması için:**
+- Kompleks JSON build edilirken `std.fmt.allocPrint` + string interpolation KULLANILMAZ
+- Ya `std.json.stringify` (struct-based) ya da explicit escaping helper kullanılır
+- Her escaping fonksiyonu two-pass (length calc + write) ile bounds safety garanti edilir
+
+---
+
 ## [2026-04-09] — Stale Keep-Alive Connection: TcpRecvFailed After 11-Second Idle
 
 **Hata:** `DigistalloneClient` GitHub signup süreci (~11 saniye) boyunca idle kaldıktan sonra `pollInboxForGitHubCode()` çağrıldığında `error.TcpRecvFailed` fırlatıyordu.
@@ -1512,3 +1703,15 @@ if (total_len > MTU_LIMIT) {
 *Son güncelleme: 2026-04-07*
 *Güncelleyen: Module 3.1 implementasyonu*
 *Tetikleyen: Zig 0.16.0-dev.3135 API uyumluluk testleri*
+
+## 2026-04-09 — Livewire `syncEmail` State Missing Error
+**Hata:** `DigistalloneClient.pollInboxForGitHubCode` 120 deneme boyunca HTML dönmeyerek başarısız oldu (No HTML snapshot available).
+**Kök sebep:** `fetchMessages` eventi `frontend.app` komponentine fırlatılırken, e-posta adresini belirten `syncEmail` olayı atlanmıştı. Backend hangi e-postayı aradığını bilmediği için boş liste dönüyor ve `"html":"..."` bloğunu POST yanıtında göndermiyordu.
+**Kaynak:** Chrome DevTools MCP ile gerçekleştirilen Wire-truth capture. (Browser'ın `frontend.actions` ve `frontend.app` komponentlerine aynı anda `syncEmail` yolladığı gözlemlendi)
+**Düzeltme:** `buildUpdateRequest` yerine birebir network trafiği (array içinde iki komponent objesi ve `__dispatch("syncEmail")`) çıkaran özelleştirilmiş `buildPollRequest` fonksiyonu yazıldı.
+
+## 2026-04-09 — Livewire Double-Escaping Snapshot Bug
+**Hata:** Digistallone mailbox polling sürecinde, sunucu `"html"` efekti dönmek yerine `CorruptComponentPayloadException` 500 hatası dönüyordu. Bu hata yüzünden süreç 13 dakika boyunca timeout'a kadar takılı kalıyordu.
+**Kök sebep:** `extractStateFromResponse` içerisinde component state'i `snap_escaped` değişkeni aracılığıyla "backslash" içeren escape formatında saklanıyordu. Daha sonra `buildPollRequest` veya `buildUpdateRequest` üzerinden JSON payload'ı inşa ederken `std.json.Stringify.write` çağrıldığında, halihazırda escape edilmiş string bir kez daha escape ediliyordu (örneğin; `{\"data\":...}` -> `"{\\\"data\\\":...}"`). Livewire v3 backend bu bozuk String'i parse edemediği için snapshot'ı onaylayamıyordu.
+**Kaynak:** RFC 8259, `json_decode`, ve Digistallone Livewire Exception behavior.
+**Düzeltme:** `extractStateFromResponse` fonksiyonu içerisine önceden var olan `unescapeJsonStringInto` logiciği entegre edildi. Backend'den dönen escaped JSON component state'i belleğe kaydedilmeden hemen önce _unescape_ edildi. Böylece `std.json.Stringify` paketi kullanıldığında data sadece bir kere, olması gerektiği gibi escape edilmiş oluyor ve backend hata üretmeden lifecycle'ı tamamlıyor. Ayrıca 500 `CorruptComponentPayloadException` gelirse sonsuz döngüden hemen çıkılması için `mem.indexOf` kontrolü eklendi.
