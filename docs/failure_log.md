@@ -6,6 +6,22 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-10] — SYN Serializer Was Coupled To Live `TCP_INFO` Socket Telemetry
+
+**Hata:** `buildTCPSynAlloc()`, `buildTCPAckAlloc()` ve `buildTCPDataAlloc()` packet serialize ederken `getLinuxTcpInfo()` ile yeni bir TCP socket aciyor, `getsockopt(TCP_INFO)` cevabindan `window` / `wscale` turetmeye calisiyordu. Sandbox veya yetki kisitli ortamlarda bu yol `EPERM` ile patliyor ve `zig build test` kirmaya basliyordu.
+
+**Kök sebep:** Yanlis soyutlama. Packet serializer canli kernel socket durumuna baglanmisti. Oysa Linux istemci SYN pencere secimi `tcp_select_initial_window()` ve ilgili sysctl degerleriyle belirlenir; rastgele, baglantisiz bir socket'in `tcp_info` snapshot'i bunun dogru kaynagi degildir.
+
+**Kaynak:**
+- `linux/net/ipv4/tcp_output.c` — `tcp_select_initial_window()`
+- `linux/net/ipv4/tcp_output.c` — SYN `th->window = min(tp->rcv_wnd, 65535U)`
+- `include/net/tcp.h` — `__tcp_win_from_space()`, `tcp_full_space()`, `MAX_TCP_WINDOW`, `TCP_MAX_WSCALE`, `TCP_DEFAULT_SCALING_RATIO`
+- `Documentation/networking/ip-sysctl.rst` — `tcp_rmem`, `tcp_window_scaling`
+
+**Düzeltme:** `TCP_INFO` telemetry hattı serializer'dan söküldü. Yerine `/proc/sys` degerlerini okuyan ve kernel formülunu uygulayan `TcpWindowProfile` resolver eklendi. SYN/ACK/DATA serializer'lari ayni profile hattini kullaniyor. Canli regression testi eklendi: SYN packet'in `window` ve `wscale` alanlari, o anki Linux kernel profile hesabiyla birebir eslesiyor.
+
+---
+
 ## [2026-04-09] — Digistallone Livewire Create Flow Was Modeled Incorrectly
 
 ## [2026-04-09] — GitHub Signup Preflight Used The Wrong CSRF Token

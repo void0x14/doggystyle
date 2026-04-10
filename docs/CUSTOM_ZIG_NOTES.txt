@@ -6,19 +6,21 @@ Bu dosya, projede standart Zig stdlib veya tipik Zig iskeleti disinda bizim elle
 - `tools/zig-dispatcher.c` ile repo icinde `zig` cagrisi local toolchain'e yonlendiriliyor.
 - Amac: sistem Zig'i degisse bile repo icinde sabit toolchain davranisi saglamak.
 
-2. Pure Zig Linux `tcp_info` portu
-- Zig stdlib snapshot'inda `struct tcp_info` dogrudan expose edilmedigi icin `src/network_core.zig` icine `LinuxTcpInfo` adli pure Zig `extern struct` elle eklendi.
-- Kaynak referans: vendored Linux UAPI `vendor/zig-std/libc/include/any-linux-any/linux/tcp.h`.
-- `tcpi_snd_wscale` ve `tcpi_rcv_wscale` normal field olarak degil, tek ham byte `tcpi_snd_rcv_wscale_raw` ile tutuluyor.
-- Accessor'lar:
-  - `sndWscale()` -> `raw & 0x0F`
-  - `rcvWscale()` -> `(raw >> 4) & 0x0F`
-- Amac: Linux little-endian bitfield ABI'sine guvenli sekilde uyum.
+2. Linux TCP SYN profile resolver
+- `src/network_core.zig` icinde Linux SYN `window` ve `wscale` alanlari artik canli `TCP_INFO` socket telemetry ile degil, kernelin `tcp_select_initial_window()` mantigina gore `/proc/sys` degerlerinden turetiliyor.
+- Kaynak referanslari:
+  - `linux/net/ipv4/tcp_output.c` — `tcp_select_initial_window`, SYN `th->window = min(tp->rcv_wnd, 65535U)`
+  - `include/net/tcp.h` — `__tcp_win_from_space`, `tcp_full_space`, `TCP_DEFAULT_SCALING_RATIO`, `MAX_TCP_WINDOW`, `TCP_MAX_WSCALE`
+  - `Documentation/networking/ip-sysctl.rst` — `tcp_rmem`, `tcp_window_scaling`
+- Amac: Paket serializer'i canli socket acma/yetki ihtiyacindan ayirmak ve gerçek kernel default'larina baglamak.
 
-3. TCP stack telemetry helper'lari
-- `getLinuxTcpInfo()` ile `getsockopt(TCP_INFO)` pure Zig syscall yolundan okunuyor.
-- `getActiveWindowScale()` ve `getWindowSize()` bu snapshot'tan turetiliyor.
-- Amac: JA4T tarafinda yerel TCP stack ile uyumlu window ve wscale bilgisi toplamak.
+3. TCP stack window profile helper'lari
+- `loadLinuxTcpSysctlProfile()` `/proc/sys/net/ipv4/tcp_rmem`, `/proc/sys/net/ipv4/tcp_window_scaling`, `/proc/sys/net/ipv4/tcp_workaround_signed_windows`, `/proc/sys/net/core/rmem_max` degerlerini okur.
+- `calculateLinuxTcpWindowProfile()` kernel formülunu uygular.
+- `loadTcpWindowProfile()` platform bazli resolver'dir:
+  - Linux: canli sysctl + kernel formulu
+  - Windows: ayri Windows resolver branch'i
+- `buildTCPSynAlloc()`, `buildTCPAckAlloc()`, `buildTCPDataAlloc()` ayni profile hattini kullanir.
 
 4. Ham entropy toplama
 - `std.crypto` kullanilmiyor.
@@ -54,7 +56,9 @@ Bu dosya, projede standart Zig stdlib veya tipik Zig iskeleti disinda bizim elle
 - Amac: `eth0` gibi hatali varsayimlari kaldirmak.
 
 10. Testlerde eklenen saf yapisal dogrulamalar
-- `tcp_info` ABI boyutu ve wscale accessor testleri
+- `tcp_rmem` parser testi
+- Linux live sysctl tabanli TCP window profile testi
+- SYN builder'in canli kernel TCP window profile ile eslestigi regression testi
 - GREASE pattern testi
 - Hybrid key share boyut testi
 - TLS ClientHello yapisal sayim testi

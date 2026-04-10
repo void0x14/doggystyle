@@ -3,6 +3,7 @@ const network = @import("network_core.zig");
 const http2 = @import("http2_core.zig");
 const jitter = @import("jitter_core.zig");
 const digistallone = @import("digistallone.zig");
+const browser_init = @import("browser_init.zig");
 
 fn resolveIpv4Host(host: [:0]const u8) !u32 {
     var hints: std.c.addrinfo = .{
@@ -296,6 +297,27 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("[SUCCESS] Arkose Bypassed via Low-Risk Signature\n", .{});
     } else {
         std.debug.print("[WARN] Challenge required! Risk score might be too high.\n", .{});
+    }
+
+    // =========================================================================
+    // ADIM 11.4: Stealth Browser Initialization
+    // =========================================================================
+    // SOURCE: src/browser_init.zig — StealthBrowser.init prepares an isolated
+    // Chrome profile and starts a live headless browser process for later
+    // captcha / JS-bound signup steps.
+    std.debug.print("\n[BROWSER] Launching stealth Chrome...\n", .{});
+    var stealth_browser = try browser_init.StealthBrowser.init(allocator, io);
+    defer stealth_browser.deinit();
+
+    if (stealth_browser.getPid()) |browser_pid| {
+        std.debug.print("[BROWSER] Stealth Chrome ready (pid={d}, profile={s})\n", .{
+            browser_pid,
+            stealth_browser.getProfileDir(),
+        });
+    } else {
+        std.debug.print("[BROWSER] Stealth Chrome spawned without PID handle (profile={s})\n", .{
+            stealth_browser.getProfileDir(),
+        });
     }
 
     // =========================================================================

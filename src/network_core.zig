@@ -26,8 +26,6 @@ const NetworkError = error{
     BufferTooSmall,
 };
 
-const linux_tcp_info_opt: u32 = 11;
-const linux_tcpi_opt_wscale: u8 = 0x04;
 const hybrid_keyshare_len: usize = 1216;
 const mlkem768_share_len: usize = 1184;
 const x25519_share_len: usize = 32;
@@ -170,100 +168,31 @@ comptime {
     }
 }
 
-const LinuxTcpInfo = extern struct {
-    tcpi_state: u8,
-    tcpi_ca_state: u8,
-    tcpi_retransmits: u8,
-    tcpi_probes: u8,
-    tcpi_backoff: u8,
-    tcpi_options: u8,
-    tcpi_snd_rcv_wscale_raw: u8,
-    tcpi_delivery_fastopen_raw: u8,
-    tcpi_rto: u32,
-    tcpi_ato: u32,
-    tcpi_snd_mss: u32,
-    tcpi_rcv_mss: u32,
-    tcpi_unacked: u32,
-    tcpi_sacked: u32,
-    tcpi_lost: u32,
-    tcpi_retrans: u32,
-    tcpi_fackets: u32,
-    tcpi_last_data_sent: u32,
-    tcpi_last_ack_sent: u32,
-    tcpi_last_data_recv: u32,
-    tcpi_last_ack_recv: u32,
-    tcpi_pmtu: u32,
-    tcpi_rcv_ssthresh: u32,
-    tcpi_rtt: u32,
-    tcpi_rttvar: u32,
-    tcpi_snd_ssthresh: u32,
-    tcpi_snd_cwnd: u32,
-    tcpi_advmss: u32,
-    tcpi_reordering: u32,
-    tcpi_rcv_rtt: u32,
-    tcpi_rcv_space: u32,
-    tcpi_total_retrans: u32,
-    tcpi_pacing_rate: u64,
-    tcpi_max_pacing_rate: u64,
-    tcpi_bytes_acked: u64,
-    tcpi_bytes_received: u64,
-    tcpi_segs_out: u32,
-    tcpi_segs_in: u32,
-    tcpi_notsent_bytes: u32,
-    tcpi_min_rtt: u32,
-    tcpi_data_segs_in: u32,
-    tcpi_data_segs_out: u32,
-    tcpi_delivery_rate: u64,
-    tcpi_busy_time: u64,
-    tcpi_rwnd_limited: u64,
-    tcpi_sndbuf_limited: u64,
-    tcpi_delivered: u32,
-    tcpi_delivered_ce: u32,
-    tcpi_bytes_sent: u64,
-    tcpi_bytes_retrans: u64,
-    tcpi_dsack_dups: u32,
-    tcpi_reord_seen: u32,
-    tcpi_rcv_ooopack: u32,
-    tcpi_snd_wnd: u32,
-    tcpi_rcv_wnd: u32,
-    tcpi_rehash: u32,
-    tcpi_total_rto: u16,
-    tcpi_total_rto_recoveries: u16,
-    tcpi_total_rto_time: u32,
-    tcpi_received_ce: u32,
-    tcpi_delivered_e1_bytes: u32,
-    tcpi_delivered_e0_bytes: u32,
-    tcpi_delivered_ce_bytes: u32,
-    tcpi_received_e1_bytes: u32,
-    tcpi_received_e0_bytes: u32,
-    tcpi_received_ce_bytes: u32,
-    tcpi_accecn_fail_mode: u16,
-    tcpi_accecn_opt_seen: u16,
+// SOURCE: /lib/modules/6.19.11-1-cachyos/build/include/net/tcp.h:81 — MAX_TCP_WINDOW
+const linux_max_tcp_window: u32 = 32767;
+// SOURCE: /lib/modules/6.19.11-1-cachyos/build/include/net/tcp.h:102 — TCP_MAX_WSCALE
+const linux_tcp_max_wscale: u8 = 14;
+// SOURCE: /lib/modules/6.19.11-1-cachyos/build/include/linux/tcp.h:198 — TCP_RMEM_TO_WIN_SCALE
+const linux_tcp_rmem_to_win_scale: u8 = 8;
+// SOURCE: /lib/modules/6.19.11-1-cachyos/build/include/net/tcp.h:1736 — TCP_DEFAULT_SCALING_RATIO
+const linux_tcp_default_scaling_ratio: u8 = 1 << (linux_tcp_rmem_to_win_scale - 1);
 
-    pub fn sndWscale(self: LinuxTcpInfo) u8 {
-        return self.tcpi_snd_rcv_wscale_raw & 0x0F;
-    }
-
-    pub fn rcvWscale(self: LinuxTcpInfo) u8 {
-        return (self.tcpi_snd_rcv_wscale_raw >> 4) & 0x0F;
-    }
-
-    pub fn hasWindowScale(self: LinuxTcpInfo) bool {
-        return (self.tcpi_options & linux_tcpi_opt_wscale) != 0;
-    }
-
-    pub fn advertisedWindowFrom(self: LinuxTcpInfo, scaled_window: u32) u16 {
-        const base_window = if (self.hasWindowScale()) blk: {
-            const shift: u5 = @intCast(self.rcvWscale());
-            break :blk scaled_window >> shift;
-        } else scaled_window;
-        return @intCast(@min(base_window, @as(u32, std.math.maxInt(u16))));
-    }
+const LinuxTcpBufferSizes = struct {
+    min: u32,
+    default_bytes: u32,
+    max: u32,
 };
 
-const LinuxTcpInfoSnapshot = struct {
-    info: LinuxTcpInfo,
-    len: posix.socklen_t,
+const LinuxTcpSysctlProfile = struct {
+    tcp_rmem: LinuxTcpBufferSizes,
+    rmem_max: u32,
+    tcp_window_scaling: bool,
+    tcp_workaround_signed_windows: bool,
+};
+
+const TcpWindowProfile = struct {
+    advertised_window: u16,
+    window_scale: u8,
 };
 
 // ------------------------------------------------------------
@@ -443,6 +372,138 @@ fn readFdAlloc(allocator: std.mem.Allocator, fd: posix.fd_t) ![]u8 {
     return buffer.toOwnedSlice();
 }
 
+fn readProcSysAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const fd = try posix.openat(posix.AT.FDCWD, path, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+    }, 0);
+    defer closeFd(fd);
+
+    return readFdAlloc(allocator, fd);
+}
+
+fn trimProcValue(bytes: []const u8) []const u8 {
+    return std.mem.trim(u8, bytes, " \t\r\n");
+}
+
+fn parseProcU32(bytes: []const u8) !u32 {
+    const trimmed = trimProcValue(bytes);
+    if (trimmed.len == 0) return error.InvalidSysctlFormat;
+    return std.fmt.parseInt(u32, trimmed, 10);
+}
+
+fn parseProcBool(bytes: []const u8) !bool {
+    return switch (try parseProcU32(bytes)) {
+        0 => false,
+        1 => true,
+        else => error.InvalidSysctlFormat,
+    };
+}
+
+fn parseLinuxTcpBufferSizes(bytes: []const u8) !LinuxTcpBufferSizes {
+    var tokens = std.mem.tokenizeAny(u8, trimProcValue(bytes), " \t");
+    const min_bytes = tokens.next() orelse return error.InvalidSysctlFormat;
+    const default_bytes = tokens.next() orelse return error.InvalidSysctlFormat;
+    const max_bytes = tokens.next() orelse return error.InvalidSysctlFormat;
+    if (tokens.next() != null) return error.InvalidSysctlFormat;
+
+    return .{
+        .min = try std.fmt.parseInt(u32, min_bytes, 10),
+        .default_bytes = try std.fmt.parseInt(u32, default_bytes, 10),
+        .max = try std.fmt.parseInt(u32, max_bytes, 10),
+    };
+}
+
+fn linuxTcpWinFromSpace(space: u32) u32 {
+    const scaled_space = @as(u64, space) * linux_tcp_default_scaling_ratio;
+    return @intCast(scaled_space >> linux_tcp_rmem_to_win_scale);
+}
+
+fn roundDownToMultiple(value: u32, multiple: u32) u32 {
+    if (multiple == 0) return value;
+    return value - (value % multiple);
+}
+
+fn ilog2U32(value: u32) u8 {
+    std.debug.assert(value != 0);
+    return @intCast((@bitSizeOf(u32) - 1) - @clz(value));
+}
+
+fn loadLinuxTcpSysctlProfile(allocator: std.mem.Allocator) !LinuxTcpSysctlProfile {
+    // SOURCE: docs.kernel.org/networking/ip-sysctl.html — tcp_rmem, tcp_window_scaling
+    const tcp_rmem_raw = try readProcSysAlloc(allocator, "/proc/sys/net/ipv4/tcp_rmem");
+    defer allocator.free(tcp_rmem_raw);
+
+    const rmem_max_raw = try readProcSysAlloc(allocator, "/proc/sys/net/core/rmem_max");
+    defer allocator.free(rmem_max_raw);
+
+    const tcp_window_scaling_raw = try readProcSysAlloc(allocator, "/proc/sys/net/ipv4/tcp_window_scaling");
+    defer allocator.free(tcp_window_scaling_raw);
+
+    const tcp_workaround_signed_windows_raw = try readProcSysAlloc(allocator, "/proc/sys/net/ipv4/tcp_workaround_signed_windows");
+    defer allocator.free(tcp_workaround_signed_windows_raw);
+
+    return .{
+        .tcp_rmem = try parseLinuxTcpBufferSizes(tcp_rmem_raw),
+        .rmem_max = try parseProcU32(rmem_max_raw),
+        .tcp_window_scaling = try parseProcBool(tcp_window_scaling_raw),
+        .tcp_workaround_signed_windows = try parseProcBool(tcp_workaround_signed_windows_raw),
+    };
+}
+
+fn calculateLinuxTcpWindowProfile(mss: u16, sysctl: LinuxTcpSysctlProfile) TcpWindowProfile {
+    // SOURCE: /lib/modules/6.19.11-1-cachyos/build/include/net/tcp.h:1707-1753 — __tcp_win_from_space and tcp_full_space
+    // SOURCE: linux/net/ipv4/tcp_output.c — tcp_select_initial_window and SYN th->window = min(tp->rcv_wnd, 65535U)
+    std.debug.assert(mss != 0);
+
+    const window_clamp: u32 = std.math.maxInt(u16) << linux_tcp_max_wscale;
+    var space = linuxTcpWinFromSpace(sysctl.tcp_rmem.default_bytes);
+    space = @min(space, window_clamp);
+    if (space > mss) space = roundDownToMultiple(space, mss);
+
+    const rcv_wnd = if (sysctl.tcp_workaround_signed_windows)
+        @min(space, linux_max_tcp_window)
+    else
+        space;
+
+    var rcv_wscale: u8 = 0;
+    if (sysctl.tcp_window_scaling) {
+        var scale_space = space;
+        scale_space = @max(scale_space, sysctl.tcp_rmem.max);
+        scale_space = @max(scale_space, sysctl.rmem_max);
+        scale_space = @min(scale_space, window_clamp);
+
+        const shift: i32 = @as(i32, ilog2U32(scale_space)) - 15;
+        if (shift > 0) {
+            rcv_wscale = @intCast(@min(shift, linux_tcp_max_wscale));
+        }
+    }
+
+    return .{
+        .advertised_window = @intCast(@min(rcv_wnd, @as(u32, std.math.maxInt(u16)))),
+        .window_scale = rcv_wscale,
+    };
+}
+
+fn loadWindowsTcpWindowProfile() TcpWindowProfile {
+    return .{
+        .advertised_window = 64240,
+        .window_scale = 8,
+    };
+}
+
+fn loadTcpWindowProfile(allocator: std.mem.Allocator, syn_mss: u16) !TcpWindowProfile {
+    if (is_linux) {
+        return calculateLinuxTcpWindowProfile(syn_mss, try loadLinuxTcpSysctlProfile(allocator));
+    }
+
+    if (is_windows) {
+        return loadWindowsTcpWindowProfile();
+    }
+
+    return error.UnsupportedPlatform;
+}
+
 fn detectLinuxDefaultInterface(allocator: std.mem.Allocator) ![]u8 {
     const fd = try posix.openat(posix.AT.FDCWD, "/proc/net/route", .{
         .ACCMODE = .RDONLY,
@@ -573,36 +634,12 @@ const WindowsRawSocket = struct {
 // ------------------------------------------------------------
 // Dynamic telemetry functions
 // ------------------------------------------------------------
-fn getLinuxTcpInfo() !LinuxTcpInfoSnapshot {
-    var info = std.mem.zeroes(LinuxTcpInfo);
-    var len: posix.socklen_t = @sizeOf(LinuxTcpInfo);
-    const fd = try openSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    defer closeSocket(fd);
-
-    while (true) {
-        switch (posix.errno(posix.system.getsockopt(fd, posix.IPPROTO.TCP, linux_tcp_info_opt, @ptrCast(&info), &len))) {
-            .SUCCESS => return .{ .info = info, .len = len },
-            .INTR => continue,
-            else => |err| return posix.unexpectedErrno(err),
-        }
-    }
+fn getSynWindowProfile(allocator: std.mem.Allocator) !TcpWindowProfile {
+    return loadTcpWindowProfile(allocator, 1460);
 }
 
-/// Fetches the current TCP window scaling factor from the OS.
-fn getActiveWindowScale() !u8 {
-    if (is_linux) {
-        const snapshot = try getLinuxTcpInfo();
-        const wscale_end = @offsetOf(LinuxTcpInfo, "tcpi_delivery_fastopen_raw");
-
-        if (snapshot.len >= wscale_end and snapshot.info.hasWindowScale()) {
-            const wscale = snapshot.info.rcvWscale();
-            if (wscale <= 14) return wscale;
-        }
-
-        return 7;
-    } else if (is_windows) {
-        return 7;
-    } else return 7;
+fn getAdvertisedWindow(allocator: std.mem.Allocator) !u16 {
+    return (try getSynWindowProfile(allocator)).advertised_window;
 }
 
 /// Generates incremental millisecond-based TSval (RFC 1323)
@@ -923,7 +960,8 @@ pub fn buildTCPSynAlloc(
     tsval: u32,
     tsecr: u32,
 ) ![]u8 {
-    const wscale_val = try getActiveWindowScale();
+    const window_profile = try getSynWindowProfile(allocator);
+    const wscale_val = window_profile.window_scale;
     const mss_data = [_]u8{ 0x05, 0xB4 }; // 1460 in network order
     const wscale_data = [_]u8{wscale_val};
     const sack_data = [_]u8{};
@@ -990,7 +1028,7 @@ pub fn buildTCPSynAlloc(
     pw.writeInt(u32, 0); // Ack
     pw.writeByte(tcp_data_offset);
     pw.writeByte(0x02); // SYN
-    pw.writeInt(u16, try getWindowSize());
+    pw.writeInt(u16, window_profile.advertised_window);
     pw.writeInt(u16, 0); // Checksum
     pw.writeInt(u16, 0); // URG
 
@@ -1026,27 +1064,6 @@ pub fn buildTCPSyn(
     seq_num: u32,
 ) ![]u8 {
     return buildTCPSynAlloc(std.heap.page_allocator, src_ip, dst_ip, src_port, dst_port, seq_num, 0, 0);
-}
-
-fn getWindowSize() !u16 {
-    if (is_linux) {
-        const snapshot = try getLinuxTcpInfo();
-        const info = snapshot.info;
-        const rcv_wnd_end = @offsetOf(LinuxTcpInfo, "tcpi_rehash") + @sizeOf(u32);
-        const rcv_space_end = @offsetOf(LinuxTcpInfo, "tcpi_total_retrans") + @sizeOf(u32);
-
-        if (snapshot.len >= rcv_wnd_end and info.tcpi_rcv_wnd != 0) {
-            return info.advertisedWindowFrom(info.tcpi_rcv_wnd);
-        }
-
-        if (snapshot.len >= rcv_space_end and info.tcpi_rcv_space != 0) {
-            return info.advertisedWindowFrom(info.tcpi_rcv_space);
-        }
-    } else if (is_windows) {
-        return 64240;
-    }
-
-    return 65535;
 }
 
 fn computeChecksum(data: []const u8) u16 {
@@ -1677,7 +1694,7 @@ pub fn buildTCPAckAlloc(
     pw.writeInt(u32, ack_num);
     pw.writeByte(tcp_data_offset);
     pw.writeByte(0x10); // ACK
-    pw.writeInt(u16, try getWindowSize());
+    pw.writeInt(u16, try getAdvertisedWindow(allocator));
     pw.writeInt(u16, 0); // Checksum
     pw.writeInt(u16, 0); // URG
 
@@ -1811,7 +1828,7 @@ pub fn buildTCPDataAlloc(
     pw.writeInt(u32, ack_num);
     pw.writeByte(tcp_data_offset);
     pw.writeByte(0x18); // PUSH, ACK
-    pw.writeInt(u16, try getWindowSize());
+    pw.writeInt(u16, try getAdvertisedWindow(allocator));
     pw.writeInt(u16, 0);
     pw.writeInt(u16, 0);
 
@@ -3601,20 +3618,19 @@ pub fn main(init: std.process.Init) !void {
 // ------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------
-test "linux tcp_info wscale accessors follow UAPI nibble layout" {
-    if (!is_linux) return error.SkipZigTest;
-
-    var info = std.mem.zeroes(LinuxTcpInfo);
-    info.tcpi_snd_rcv_wscale_raw = 0xA5;
-
-    try std.testing.expectEqual(@as(u8, 0x05), info.sndWscale());
-    try std.testing.expectEqual(@as(u8, 0x0A), info.rcvWscale());
+test "linux tcp_rmem parser reads proc triplet" {
+    const parsed = try parseLinuxTcpBufferSizes("4096\t131072\t33554432\n");
+    try std.testing.expectEqual(@as(u32, 4096), parsed.min);
+    try std.testing.expectEqual(@as(u32, 131072), parsed.default_bytes);
+    try std.testing.expectEqual(@as(u32, 33554432), parsed.max);
 }
 
-test "linux tcp_info ABI size matches vendored UAPI" {
+test "linux tcp window profile loads bounded live values" {
     if (!is_linux) return error.SkipZigTest;
 
-    try std.testing.expectEqual(@as(usize, 280), @sizeOf(LinuxTcpInfo));
+    const profile = try loadTcpWindowProfile(std.testing.allocator, 1460);
+    try std.testing.expect(profile.advertised_window > 0);
+    try std.testing.expect(profile.window_scale <= linux_tcp_max_wscale);
 }
 
 const TlsHelloSummary = struct {
@@ -4151,6 +4167,18 @@ test "buildTCPSyn wrapper stays aligned with alloc variant" {
     defer std.heap.page_allocator.free(packet);
 
     try std.testing.expectEqual(@as(usize, 60), packet.len);
+}
+
+test "linux SYN builder matches live kernel TCP window profile" {
+    if (!is_linux) return error.SkipZigTest;
+
+    const expected = try loadTcpWindowProfile(std.testing.allocator, 1460);
+    const packet = try buildTCPSynAlloc(std.testing.allocator, 0x7F000001, 0x01010101, 50000, 443, 1, 1000, 0);
+    defer std.testing.allocator.free(packet);
+
+    const tcp_header = packet[20..40];
+    try std.testing.expectEqual(expected.advertised_window, readBe16(tcp_header[14..16]));
+    try std.testing.expectEqual(expected.window_scale, parseTcpWindowScaleValue(packet[20..], 40).?);
 }
 
 test "parse default route interface from proc table" {
@@ -5216,6 +5244,33 @@ fn parseTcpTimestampValue(tcp_header: []const u8, header_len: usize) ?u32 {
 
         if (kind == 8 and option_len == 10) {
             return readBe32(tcp_header[option_offset + 2 .. option_offset + 6]);
+        }
+
+        option_offset += option_len;
+    }
+
+    return null;
+}
+
+// SOURCE: RFC 9293, Section 3.1 — TCP Header Format
+// SOURCE: RFC 7323, Section 2 — Window Scale Option format
+fn parseTcpWindowScaleValue(tcp_header: []const u8, header_len: usize) ?u8 {
+    if (header_len <= 20 or tcp_header.len < header_len) return null;
+
+    var option_offset: usize = 20;
+    while (option_offset + 1 < header_len) {
+        const kind = tcp_header[option_offset];
+        if (kind == 0) break;
+        if (kind == 1) {
+            option_offset += 1;
+            continue;
+        }
+
+        const option_len = tcp_header[option_offset + 1];
+        if (option_len < 2 or option_offset + option_len > header_len) break;
+
+        if (kind == 3 and option_len == 3) {
+            return tcp_header[option_offset + 2];
         }
 
         option_offset += option_len;
