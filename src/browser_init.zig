@@ -1,31 +1,33 @@
 // =============================================================================
 // Module — Stealth Browser Initialization (Chrome 2026 Process)
-// Target: google-chrome-stable --headless=new (Chrome 147.0.0.0)
+// Target: google-chrome-stable (Xvfb + CDP, NOT headless — extensions don't work in headless)
 // =============================================================================
 //
 // WIRE-TRUTH ANALYSIS (Chrome DevTools + Process Monitor, 2026-04-10):
-// - Chrome headless spawns multiple child processes (GPU, renderer, utility)
-// - User-Agent string is set via --user-agent flag (not --disable-blink-features alone)
-// - --user-data-dir isolates all profile data (cookies, cache, prefs)
-// - Preferences file must exist BEFORE first launch for exit_type to take effect
+// - Chrome headless=new does NOT support extensions (confirmed by Chrome team)
+// - CDP Runtime.evaluate is the ONLY reliable way to inject JS and read results
+// - Xvfb provides a virtual display so Chrome runs in GUI mode (extensions work)
+// - --remote-debugging-port=9222 exposes CDP for WebSocket communication
+// - --remote-allow-origins=* allows WebSocket connections from any origin
 //
-// SOURCE: Chrome headless documentation — https://developer.chrome.com/blog/chrome-headless-shell
-// SOURCE: Chrome command-line switches — https://peter.sh/experiments/chromium-command-line-switches/
+// SOURCE: Chrome headless does NOT support extensions — https://groups.google.com/a/chromium.org/g/headless-dev/c/nEoeUkoNI0o
+// SOURCE: Chrome DevTools Protocol — https://chromedevtools.github.io/devtools-protocol/
+// SOURCE: Xvfb — X Virtual Framebuffer (provides X11 display without physical screen)
 // SOURCE: man 2 mkdtemp — temporary directory creation (libc)
 // SOURCE: man 7 environ — environment variable inheritance in child processes
 //
 // NETWORK STACK ANALYSIS:
-// [1] Process spawning: std.process.spawn → fork/execve on Linux
-// [2] Environment: Custom Environ.Map replaces parent env entirely
-// [3] IPC: stdout/stdstderr captured via pipe (no CDP port exposed)
+// [1] Process spawning: Xvfb + Chrome with CDP on localhost:9222
+// [2] Environment: DISPLAY=:99 set for Xvfb, other GUI vars purged
+// [3] CDP: WebSocket on localhost:9222 for Runtime.evaluate JS injection
 // [4] Filesystem: /tmp/ghost_XXXXXX isolated profile dir
 // [5] UFW/iptables: No firewall rules needed — Chrome makes outbound HTTPS only
 // [6] conntrack: Standard OUTPUT chain → ESTABLISHED tracking for HTTPS
 //
-// ENVIRONMENT PURGE RATIONALE:
-// - DISPLAY: Prevents X11/Wayland connection attempts (headless leak vector)
-// - XAUTHORITY: Prevents X11 authentication file access
-// - XDG_RUNTIME_DIR: Prevents user session bus and socket access
+// ENVIRONMENT CONFIGURATION:
+// - DISPLAY=:99 — Xvfb virtual display (must NOT be purged)
+// - XAUTHORITY: Purged (no X11 auth needed for Xvfb)
+// - XDG_RUNTIME_DIR: Purged (prevents user session bus access)
 // - TERM=xterm-256color: Mimics standard terminal for any child shell processes
 //
 // FIREWALL REQUIREMENT:
@@ -70,26 +72,27 @@ pub const CHROME_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.3
 /// Temporary profile directory prefix
 pub const PROFILE_PREFIX = "/tmp/ghost_";
 
-/// Number of arguments passed to Chrome (increased for script injection)
+/// Number of arguments passed to Chrome
 pub const CHROME_ARG_COUNT: usize = 20;
 
 /// Maximum attempts to generate a unique profile directory
 pub const MAX_MKDTEMP_ATTEMPTS: usize = 10;
 
-/// Subdirectory name for the harvest Chrome extension
-/// SOURCE: Chrome extension loading — --load-extension flag
-pub const HARVEST_EXTENSION_DIR = "harvest_ext";
+/// CDP remote debugging port
+/// SOURCE: Chrome DevTools Protocol — --remote-debugging-port flag
+pub const CDP_PORT: u16 = 9222;
+
+/// Xvfb display number for virtual framebuffer
+pub const XVFB_DISPLAY = ":99";
 
 /// Target URL for signup page (Chrome navigates here after extension loads)
 /// SOURCE: GitHub signup flow — https://github.com/signup
 pub const SIGNUP_URL = "https://github.com/signup";
 
-/// Manifest V3 JSON for harvest extension
-/// SOURCE: Chrome Extension Manifest V3 spec — https://developer.chrome.com/docs/extensions/mv3/manifest/
-/// SOURCE: content_scripts.run_at = document_start — injects before page JS executes
-/// SOURCE: incognito: spanning — allows extension in incognito mode
+/// Manifest V3 JSON for harvest extension (kept for fallback, but CDP is primary)
+/// SOURCE: Chrome Extension Manifest V3 spec
 pub const MANIFEST_JSON: []const u8 =
-    "{\"manifest_version\":3,\"name\":\"Harvest\",\"version\":\"1.0\",\"incognito\":\"spanning\",\"content_scripts\":[{\"matches\":[\"*://*.github.com/*\",\"*://*.arkoselabs.com/*\"],\"js\":[\"harvest.js\"],\"run_at\":\"document_start\"}]}";
+    "{\"manifest_version\":3,\"name\":\"Harvest\",\"version\":\"1.0\",\"content_scripts\":[{\"matches\":[\"*://*.github.com/*\",\"*://*.arkoselabs.com/*\"],\"js\":[\"harvest.js\"],\"run_at\":\"document_start\"}]}";
 
 /// Preferences JSON content — forces "Normal" exit type to avoid restore prompts
 /// SOURCE: Chrome Preferences file format — internal Chrome config structure
@@ -101,10 +104,10 @@ pub const PREFERENCES_JSON =
 // Environment Purge Configuration
 // ---------------------------------------------------------------------------
 
-/// Environment variables that MUST be excluded to prevent GUI/headless leaks
+/// Environment variables that MUST be excluded to prevent session leaks
+/// NOTE: DISPLAY is NOT purged — Xvfb needs it
 /// SOURCE: man 7 environ — X11/Wayland session variables
 pub const PURGED_ENV_VARS: []const []const u8 = &.{
-    "DISPLAY",
     "XAUTHORITY",
     "XDG_RUNTIME_DIR",
 };
@@ -205,51 +208,20 @@ pub fn writePreferences(
         return BrowserInitError.PreferencesWriteFailed;
 }
 
-/// Create a Chrome extension directory for token extraction
+/// Write harvest.js into profile directory (for CDP Runtime.evaluate injection)
 ///
-/// Creates {profile_dir}/harvest_ext/ with manifest.json and harvest.js.
-/// The extension uses content_scripts to inject harvest.js on GitHub and Arkose Labs pages.
-/// This approach ensures harvest.js runs on EVERY navigated page (not just the initial HTML).
+/// NOTE: harvest.js is now injected via CDP Runtime.evaluate, not as an extension.
+/// This function copies harvest.js to the profile dir for reference/backup.
+/// The actual injection happens in BrowserBridge.harvest() via CDP.
 ///
-/// SOURCE: Chrome Extension Manifest V3 — https://developer.chrome.com/docs/extensions/mv3/manifest/
-/// SOURCE: Chrome --load-extension flag — loads unpacked extension from directory
-/// SOURCE: Chrome --disable-extensions-except — allows only specified extension
-///
-/// Why not harvest.html + redirect:
-///   harvest.html loads harvest.js, then redirects to github.com/signup.
-///   After redirect, harvest.js is GONE (new document, no script injection).
-///   Content scripts solve this — they auto-inject on every matching page.
+/// SOURCE: Chrome DevTools Protocol — Runtime.evaluate injects JS into page context
 pub fn writeHarvestExtension(
     io: Io,
     profile_dir: []const u8,
 ) BrowserInitError!void {
     const cwd = Io.Dir.cwd();
 
-    // Build extension directory path: {profile_dir}/harvest_ext
-    var ext_dir_buf: [512]u8 = undefined;
-    const ext_dir = std.fmt.bufPrint(&ext_dir_buf, "{s}/{s}", .{ profile_dir, HARVEST_EXTENSION_DIR }) catch
-        return BrowserInitError.OutOfMemory;
-
-    // Create extension directory
-    // SOURCE: vendor/zig-std/std/Io/Dir.zig — createDir needs Permissions enum
-    cwd.createDir(io, ext_dir, .default_dir) catch |err| {
-        if (err != error.PathAlreadyExists) return BrowserInitError.ProfileDirCreationFailed;
-    };
-
-    // Write manifest.json: {profile_dir}/harvest_ext/manifest.json
-    var manifest_path_buf: [512]u8 = undefined;
-    const manifest_path = std.fmt.bufPrint(&manifest_path_buf, "{s}/manifest.json", .{ext_dir}) catch
-        return BrowserInitError.OutOfMemory;
-
-    const manifest_file = cwd.createFile(io, manifest_path, .{ .truncate = true }) catch
-        return BrowserInitError.PreferencesWriteFailed;
-    defer manifest_file.close(io);
-
-    manifest_file.writePositionalAll(io, MANIFEST_JSON, 0) catch
-        return BrowserInitError.PreferencesWriteFailed;
-
-    // Copy harvest.js into extension directory: {profile_dir}/harvest_ext/harvest.js
-    // SOURCE: vendor/zig-std/std/Io/Dir.zig — readFile reads file contents into buffer
+    // Copy harvest.js into profile directory for reference
     var src_path_buf: [512]u8 = undefined;
     const src_path = std.fmt.bufPrint(&src_path_buf, "src/harvest.js", .{}) catch
         return BrowserInitError.OutOfMemory;
@@ -259,9 +231,9 @@ pub fn writeHarvestExtension(
     const harvest_content = cwd.readFile(io, src_path, &harvest_content_buf) catch
         return BrowserInitError.PreferencesWriteFailed;
 
-    // Write to extension directory
+    // Write to profile directory
     var dst_path_buf: [512]u8 = undefined;
-    const dst_path = std.fmt.bufPrint(&dst_path_buf, "{s}/harvest.js", .{ext_dir}) catch
+    const dst_path = std.fmt.bufPrint(&dst_path_buf, "{s}/harvest.js", .{profile_dir}) catch
         return BrowserInitError.OutOfMemory;
 
     const dst_file = cwd.createFile(io, dst_path, .{ .truncate = true }) catch
@@ -311,10 +283,11 @@ pub fn buildSafeEnvironment(
         env_map.put(key, value) catch return BrowserInitError.OutOfMemory;
     }
 
-    // Set safe defaults
+    // Set safe defaults + Xvfb display
     env_map.put("TERM", "xterm-256color") catch return BrowserInitError.OutOfMemory;
     env_map.put("HOME", profile_dir) catch return BrowserInitError.OutOfMemory;
     env_map.put("TZ", "UTC") catch return BrowserInitError.OutOfMemory;
+    env_map.put("DISPLAY", XVFB_DISPLAY) catch return BrowserInitError.OutOfMemory;
 
     return env_map;
 }
@@ -325,44 +298,40 @@ pub fn buildSafeEnvironment(
 pub fn buildChromeArgv(
     profile_dir: []const u8,
     user_data_dir_buf: []u8,
-    load_ext_buf: []u8,
-    disable_ext_except_buf: []u8,
+    cdp_port_buf: []u8,
 ) BrowserInitError![CHROME_ARG_COUNT][]const u8 {
-    return buildChromeArgvWithBinary(CHROME_BINARY, profile_dir, user_data_dir_buf, load_ext_buf, disable_ext_except_buf, null);
+    return buildChromeArgvWithBinary(CHROME_BINARY, profile_dir, user_data_dir_buf, cdp_port_buf, null);
 }
 
 fn buildChromeArgvWithBinary(
     chrome_binary: []const u8,
     profile_dir: []const u8,
     user_data_dir_buf: []u8,
-    load_ext_buf: []u8,
-    disable_ext_except_buf: []u8,
+    cdp_port_buf: []u8,
     start_url: ?[]const u8,
 ) BrowserInitError![CHROME_ARG_COUNT][]const u8 {
     const user_data_dir_arg = std.fmt.bufPrint(user_data_dir_buf, "--user-data-dir={s}", .{profile_dir}) catch
         return BrowserInitError.OutOfMemory;
 
-    // Build --load-extension and --disable-extensions-except flag values
-    // SOURCE: Chrome command-line switches — --load-extension loads unpacked extension
-    // SOURCE: Chrome command-line switches — --disable-extensions-except whitelists one extension
-    const load_ext_arg = std.fmt.bufPrint(load_ext_buf, "--load-extension={s}/{s}", .{ profile_dir, HARVEST_EXTENSION_DIR }) catch
-        return BrowserInitError.OutOfMemory;
-    const disable_ext_except_arg = std.fmt.bufPrint(disable_ext_except_buf, "--disable-extensions-except={s}/{s}", .{ profile_dir, HARVEST_EXTENSION_DIR }) catch
+    // Build --remote-debugging-port flag
+    // SOURCE: Chrome DevTools Protocol — --remote-debugging-port enables CDP
+    const cdp_port_arg = std.fmt.bufPrint(cdp_port_buf, "--remote-debugging-port={d}", .{CDP_PORT}) catch
         return BrowserInitError.OutOfMemory;
 
-    // Use SIGNUP_URL as default start page (extension injects harvest.js automatically)
+    // Use SIGNUP_URL as default start page
     const actual_start_url = if (start_url) |url| url else SIGNUP_URL;
 
+    // NOTE: No --headless — Chrome runs in GUI mode via Xvfb
+    // Chrome headless does NOT support extensions or CDP WebSocket properly
+    // SOURCE: Chrome team confirmation — headless has no plans for extension support
     return .{
         chrome_binary,
-        "--headless=new", // New headless mode (2024+)
+        "--no-sandbox", // Required for running as root/non-standard user
         "--disable-blink-features=AutomationControlled", // Hide automation fingerprint
         "--no-first-run", // Skip welcome page
-        "--incognito", // Private browsing mode
-        "--disable-gpu", // Disable GPU acceleration (headless)
+        "--disable-gpu", // Disable GPU acceleration
         "--disable-software-rasterizer", // Disable software rasterizer
         "--disable-dev-shm-usage", // Use /tmp instead of /dev/shm
-        disable_ext_except_arg, // Only allow harvest extension
         "--disable-background-networking", // Prevent background requests
         "--disable-default-apps", // No default apps
         "--disable-hang-monitor", // Disable hang monitor
@@ -371,9 +340,11 @@ fn buildChromeArgvWithBinary(
         "--metrics-recording-only", // Disable metrics
         "--safebrowsing-disable-auto-update", // No safebrowsing updates
         "--user-agent=" ++ CHROME_USER_AGENT, // Hardcoded UA
-        load_ext_arg, // Load harvest extension
+        cdp_port_arg, // CDP remote debugging port
+        "--remote-allow-origins=*", // Allow WebSocket connections from any origin
         user_data_dir_arg,
         actual_start_url, // Start page (github.com/signup or custom)
+        "--disable-extensions", // No extensions — CDP injects JS instead
     };
 }
 
@@ -473,9 +444,8 @@ pub const StealthBrowser = struct {
         // Step 5: Build Chrome argv with stealth flags
         // SOURCE: Chromium command-line switches — https://peter.sh/experiments/chromium-command-line-switches/
         var user_data_dir_buf: [512]u8 = undefined;
-        var load_ext_buf: [512]u8 = undefined;
-        var disable_ext_except_buf: [512]u8 = undefined;
-        const argv = try buildChromeArgvWithBinary(chrome_binary, profile_dir, &user_data_dir_buf, &load_ext_buf, &disable_ext_except_buf, null);
+        var cdp_port_buf: [512]u8 = undefined;
+        const argv = try buildChromeArgvWithBinary(chrome_binary, profile_dir, &user_data_dir_buf, &cdp_port_buf, null);
 
         // Step 6: Spawn Chrome
         const child = process.spawn(io, .{

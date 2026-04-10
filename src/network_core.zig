@@ -7586,23 +7586,92 @@ pub const GitHubHttpClient = struct {
 
     // SOURCE: Live GitHub signup form DOM capture (2026-04-09) — browser FormData
     // includes:
-    //   - user_signup[country]=TR (hidden)
+    //   - user_signup[country]=TR (hidden input or selected option)
     //   - filter=           (search input, empty but still submitted)
     //   - required_field_xxxx= (dynamic hidden text field, empty but still submitted)
     // Empty-name hidden inputs are not submitted.
+    //
+    // NOTE: GitHub renders country as a <select> with <option value="AF">...<option value="TR" selected>.
+    // The hidden input `name="user_signup[country]"` may have empty value="".
+    // We must find the <option> with "selected" attribute for the actual country.
+    // Fallback: "TR" (user's locale — this engine runs from Turkey).
     pub fn extractSignupFormFields(html_buffer: []const u8) !SignupFormFields {
-        const explicit_country = extractInputValueByName(html_buffer, "user_signup[country]");
-        const actor_country = extractAttributeValue(html_buffer, "data-actor-country-code=");
-        const country = if (explicit_country) |value|
-            if (value.len > 0) value else actor_country orelse return error.TokenNotFound
-        else
-            actor_country orelse return error.TokenNotFound;
+        // Strategy 1: Find <option value="XX" selected> inside user_signup[country] select
+        const country = extractSelectedCountryOption(html_buffer) orelse
+            // Strategy 2: data-actor-country-code attribute
+            extractAttributeValue(html_buffer, "data-actor-country-code=") orelse
+            // Strategy 3: Hidden input with non-empty value
+            extractHiddenInputValue(html_buffer, "user_signup[country]") orelse
+            // Strategy 4: Hardcoded fallback — engine runs from Turkey
+            "TR";
+
         const required_field_name = extractInputNameByPrefix(html_buffer, "required_field_");
 
         return .{
             .country = country,
             .required_field_name = required_field_name,
         };
+    }
+
+    /// Extract country from <option value="XX" selected> in the country select element.
+    /// SOURCE: GitHub signup HTML — <select name="user_signup[country]"> contains
+    /// <option value="AF">Afghanistan</option>...<option value="TR" selected>Türkiye</option>
+    fn extractSelectedCountryOption(html_buffer: []const u8) ?[]const u8 {
+        // Find the country select element
+        const select_idx = mem.indexOf(u8, html_buffer, "name=\"user_signup[country]\"") orelse return null;
+
+        // Search for "selected" attribute within the next 5000 bytes (country select is large)
+        const search_end = @min(select_idx + 5000, html_buffer.len);
+        const select_region = html_buffer[select_idx..search_end];
+
+        // Find <option value="XX" selected> or <option selected value="XX">
+        // Pattern 1: value="XX" selected
+        if (mem.indexOf(u8, select_region, "selected")) |sel_idx| {
+            // Look backwards for value="XX" within the same <option> tag
+            const option_start = if (mem.lastIndexOf(u8, select_region[0..sel_idx], "<option")) |idx| idx else return null;
+            const option_end = mem.indexOfPos(u8, select_region, sel_idx, ">") orelse return null;
+            const option_tag = select_region[option_start..option_end];
+
+            // Extract value from this option tag
+            if (mem.indexOf(u8, option_tag, "value=\"")) |v_idx| {
+                const v_start = v_idx + "value=\"".len;
+                const v_end = mem.indexOfScalarPos(u8, option_tag, v_start, '"') orelse return null;
+                const val = option_tag[v_start..v_end];
+                if (val.len == 2) return val; // Country codes are 2 letters
+            }
+        }
+        return null;
+    }
+
+    /// Extract value from a hidden input by name, ensuring value= is within the same tag.
+    /// This prevents matching value= from a sibling <option> inside a <select>.
+    /// Returns null if value is empty or not found, so caller can fall through to next strategy.
+    fn extractHiddenInputValue(html_buffer: []const u8, field_name: []const u8) ?[]const u8 {
+        var search_start: usize = 0;
+        while (mem.indexOfPos(u8, html_buffer, search_start, "name=\"")) |name_idx| {
+            const name_start = name_idx + "name=\"".len;
+            const name_end = mem.indexOfScalarPos(u8, html_buffer, name_start, '"') orelse return null;
+            const name = html_buffer[name_start..name_end];
+
+            // Find end of this HTML tag (closing >)
+            const tag_end = mem.indexOfPos(u8, html_buffer, name_end, ">") orelse {
+                search_start = name_end;
+                continue;
+            };
+            search_start = tag_end;
+
+            if (!mem.eql(u8, name, field_name)) continue;
+
+            // Only search for value= within the same tag
+            const tag_rest = html_buffer[name_end..tag_end];
+            const v_idx = mem.indexOf(u8, tag_rest, "value=\"") orelse return null;
+            const v_start = v_idx + "value=\"".len;
+            const v_end = mem.indexOfScalarPos(u8, tag_rest, v_start, '"') orelse return null;
+            const val = tag_rest[v_start..v_end];
+            if (val.len > 0) return val;
+            return null; // Empty value — treat as not found, let fallback chain continue
+        }
+        return null;
     }
 
     fn extractInputNameByPrefix(html_buffer: []const u8, prefix: []const u8) ?[]const u8 {
@@ -8696,6 +8765,35 @@ test "extractSignupFormFields: falls back to actor-country-code when hidden coun
         \\  </select-panel>
         \\  <input type="text" name="required_field_463b" hidden="hidden">
         \\</signups-marketing-consent-fields>
+    ;
+
+    const fields = try GitHubHttpClient.extractSignupFormFields(html);
+    try std.testing.expectEqualStrings("TR", fields.country);
+    try std.testing.expectEqualStrings("required_field_463b", fields.required_field_name.?);
+}
+
+test "extractSignupFormFields: extracts country from select option with selected attribute" {
+    // SOURCE: Live GitHub signup HTML — country is a <select> with <option value="TR" selected>
+    const html =
+        \\<select name="user_signup[country]">
+        \\<option value="AF">Afghanistan</option>
+        \\<option value="AX">Åland Islands</option>
+        \\<option value="TR" selected>Türkiye</option>
+        \\</select>
+        \\<input type="text" name="required_field_1ffc" hidden="hidden">
+    ;
+
+    const fields = try GitHubHttpClient.extractSignupFormFields(html);
+    try std.testing.expectEqualStrings("TR", fields.country);
+    try std.testing.expectEqualStrings("required_field_1ffc", fields.required_field_name.?);
+}
+
+test "extractSignupFormFields: falls back to TR when no country indicator found" {
+    const html =
+        \\<form action="/signup?social=false" method="post">
+        \\<input autocomplete="off" type="hidden" name="user_signup[country]" />
+        \\<input type="text" name="required_field_463b" hidden="hidden">
+        \\</form>
     ;
 
     const fields = try GitHubHttpClient.extractSignupFormFields(html);

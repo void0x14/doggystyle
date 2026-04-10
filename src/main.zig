@@ -5,6 +5,8 @@ const jitter = @import("jitter_core.zig");
 const digistallone = @import("digistallone.zig");
 const browser_init = @import("browser_init.zig");
 const browser_bridge = @import("browser_bridge.zig");
+const process = std.process;
+const Io = std.Io;
 
 fn resolveIpv4Host(host: [:0]const u8) !u32 {
     var hints: std.c.addrinfo = .{
@@ -301,15 +303,46 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // =========================================================================
-    // ADIM 11.4: Stealth Browser Initialization + Token Harvest
+    // ADIM 11.4: Xvfb + CDP Browser + Token Harvest
     // =========================================================================
-    // SOURCE: src/browser_init.zig — StealthBrowser.init spawns headless Chrome
-    // SOURCE: src/browser_bridge.zig — BrowserBridge intercepts Chrome stdout
-    // SOURCE: src/harvest.js — Chrome extension injects XHR/fetch monkey-patch
+    // SOURCE: src/browser_bridge.zig — CdpClient connects to Chrome CDP WebSocket
+    // SOURCE: src/browser_bridge.zig — BrowserBridge injects harvest.js via Runtime.evaluate
+    // SOURCE: src/harvest.js — Sets window.__ghost_token / window.__ghost_identity globals
     //
-    // Flow: Chrome spawns → harvest.js auto-injects on github.com → intercepts
-    // Arkose token → logs GHOST_TOKEN: to stdout → BrowserBridge reads it
-    std.debug.print("\n[BROWSER] Launching stealth Chrome with harvest extension...\n", .{});
+    // IMPORTANT: Chrome headless does NOT support extensions (confirmed by Chrome team).
+    // CDP Runtime.evaluate is the ONLY reliable way to inject JS and read results.
+    // Xvfb provides a virtual display so Chrome runs in GUI mode (not headless).
+    //
+    // Flow:
+    //   1. Start Xvfb on display :99
+    //   2. Spawn Chrome with --remote-debugging-port=9222 + DISPLAY=:99
+    //   3. BrowserBridge connects to CDP WebSocket for the signup tab
+    //   4. Inject harvest.js via Runtime.evaluate
+    //   5. Poll window.__ghost_token / window.__ghost_identity globals
+    //   6. Parse harvested data into HarvestResult
+    var harvested_octocaptcha: ?[]const u8 = null;
+
+    // Step 1: Start Xvfb BEFORE Chrome
+    // SOURCE: Xvfb — X Virtual Framebuffer provides X11 display without physical screen
+    std.debug.print("\n[XVFB] Starting Xvfb on display {s}...\n", .{browser_init.XVFB_DISPLAY});
+    const xvfb_argv = [_][]const u8{ "Xvfb", browser_init.XVFB_DISPLAY, "-screen", "0", "1280x720x24" };
+    const xvfb_child = process.spawn(io, .{
+        .argv = &xvfb_argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch |err| {
+        std.debug.print("[XVFB] Failed to start Xvfb: {}\n", .{err});
+        return err;
+    };
+    _ = xvfb_child;
+
+    // Give Xvfb time to start
+    const xvfb_sleep = std.os.linux.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_ms };
+    _ = std.os.linux.nanosleep(&xvfb_sleep, null);
+
+    // Step 2: Spawn Chrome with CDP on display :99
+    std.debug.print("[BROWSER] Launching stealth Chrome for token harvest (Xvfb + CDP)...\n", .{});
     var stealth_browser = try browser_init.StealthBrowser.init(allocator, io);
     defer stealth_browser.deinit();
 
@@ -324,35 +357,41 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
-    // --- Token Harvest via BrowserBridge ---
-    // BrowserBridge reads Chrome stdout for GHOST_TOKEN: and GHOST_IDENTITY: lines
-    // SOURCE: src/browser_bridge.zig — harvest() polls stdout with poll() timeout
-    std.debug.print("[BROWSER] Starting token harvest (timeout={d}ms)...\n", .{browser_bridge.EXTRACTION_TIMEOUT_MS});
-    var bridge = try browser_bridge.BrowserBridge.init(allocator, io, &stealth_browser.child);
-    defer bridge.deinit();
-
-    const harvest_result = bridge.harvest() catch |err| blk: {
-        std.debug.print("[BROWSER] Harvest failed: {} — continuing without harvested token\n", .{err});
-        break :blk browser_bridge.HarvestResult{};
+    // Step 3: Connect to Chrome CDP and inject harvest.js
+    // BrowserBridge.init() connects to CDP WebSocket for the signup tab
+    std.debug.print("[CDP] Connecting to Chrome CDP on localhost:{d}...\n", .{browser_bridge.CDP_PORT});
+    var bridge = browser_bridge.BrowserBridge.init(allocator, "https://github.com/signup") catch |err| blk: {
+        std.debug.print("[CDP] Failed to connect to CDP: {} — continuing without harvest\n", .{err});
+        break :blk null;
     };
+    defer if (bridge) |*b| b.deinit();
 
-    // Extract harvested octocaptcha token (if captured)
-    var harvested_octocaptcha: ?[]const u8 = null;
-    if (harvest_result.token_captured) {
-        harvested_octocaptcha = harvest_result.token.token[0..harvest_result.token.token_len];
-        std.debug.print("[BROWSER] Harvested octocaptcha token: {d} bytes\n", .{harvest_result.token.token_len});
-    } else {
-        std.debug.print("[BROWSER] No octocaptcha token harvested (challenge may not have been triggered)\n", .{});
-    }
-
-    // Inject harvested _octo cookie into cookie jar (if captured)
-    // SOURCE: RFC 6265, Section 4.2 — Cookie header includes _octo for session tracking
-    if (harvest_result.identity_captured and harvest_result.identity._octo_len > 0) {
-        const octo_value = harvest_result.identity._octo[0..harvest_result.identity._octo_len];
-        github_client.cookie_jar.setOctoCookie(octo_value) catch |err| {
-            std.debug.print("[BROWSER] Failed to set _octo cookie: {}\n", .{err});
+    // Step 4: Harvest tokens via CDP (inject harvest.js, poll globals)
+    var harvest_result = browser_bridge.HarvestResult{};
+    if (bridge) |*b| {
+        std.debug.print("[BROWSER] Starting token harvest (timeout={d}ms)...\n", .{browser_bridge.EXTRACTION_TIMEOUT_MS});
+        harvest_result = b.harvest() catch |err| blk: {
+            std.debug.print("[BROWSER] Harvest failed: {} — continuing without harvested token\n", .{err});
+            break :blk browser_bridge.HarvestResult{};
         };
-        std.debug.print("[BROWSER] Injected _octo cookie into jar ({d} bytes)\n", .{harvest_result.identity._octo_len});
+
+        // Extract harvested octocaptcha token (if captured)
+        if (harvest_result.token_captured) {
+            harvested_octocaptcha = harvest_result.token.token[0..harvest_result.token.token_len];
+            std.debug.print("[BROWSER] Harvested octocaptcha token: {d} bytes\n", .{harvest_result.token.token_len});
+        } else {
+            std.debug.print("[BROWSER] No octocaptcha token harvested (captcha may not have completed in time)\n", .{});
+        }
+
+        // Inject harvested _octo cookie into cookie jar (if captured)
+        // SOURCE: RFC 6265, Section 4.2 — Cookie header includes _octo for session tracking
+        if (harvest_result.identity_captured and harvest_result.identity._octo_len > 0) {
+            const octo_value = harvest_result.identity._octo[0..harvest_result.identity._octo_len];
+            github_client.cookie_jar.setOctoCookie(octo_value) catch |err| {
+                std.debug.print("[BROWSER] Failed to set _octo cookie: {}\n", .{err});
+            };
+            std.debug.print("[BROWSER] Injected _octo cookie into jar ({d} bytes)\n", .{harvest_result.identity._octo_len});
+        }
     }
 
     // =========================================================================

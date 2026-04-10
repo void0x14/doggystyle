@@ -4,9 +4,9 @@
 // =============================================================================
 //
 // STEALTH DESIGN:
-// - IIFE only (no global variables)
+// - IIFE wrapping, but sets window.__ghost_token / window.__ghost_identity for CDP reading
 // - Minimal footprint (no external dependencies)
-// - Silent interception (no console.log unless prefix matched)
+// - CDP Runtime.evaluate reads window.__ghost_* globals — no network needed
 // - Auto-cleanup after token extraction
 //
 // NETWORK STACK ANALYSIS:
@@ -15,22 +15,28 @@
 // [3] Response body inspection — searches for octocaptcha-token pattern
 // [4] MutationObserver — detects Arkose challenge completion via hidden inputs
 // [5] Cookie extraction — reads document.cookie for _octo and session identifiers
+// [6] CDP bridge — window.__ghost_token / window.__ghost_identity globals for Zig to read
 //
 // SOURCE: MDN Web Docs — XMLHttpRequest.prototype.open
 // SOURCE: MDN Web Docs — fetch API
 // SOURCE: MDN Web Docs — MutationObserver API
+// SOURCE: Chrome DevTools Protocol — Runtime.evaluate reads page globals
 
 (function() {
     'use strict';
 
     // Configuration
     const TARGET_DOMAINS = ['arkoselabs.com', 'github.com'];
-    const TOKEN_PREFIX = 'GHOST_TOKEN: ';
-    const IDENTITY_PREFIX = 'GHOST_IDENTITY: ';
     const TOKEN_PATTERNS = [
         'octocaptcha-token',
         /token=[a-zA-Z0-9_-]{200,}/
     ];
+
+    // CDP bridge globals — Zig reads these via Runtime.evaluate
+    // window.__ghost_token: JSON {token, url, method, timestamp}
+    // window.__ghost_identity: JSON {_octo, logged_in, timestamp}
+    window.__ghost_token = null;
+    window.__ghost_identity = null;
 
     // State tracking (IIFE-scoped, no globals)
     let tokenExtracted = false;
@@ -80,16 +86,19 @@
         return cookies;
     }
 
+    // Store token data in window.__ghost_token for CDP Runtime.evaluate to read
+    // Chrome headless does NOT support extensions — CDP is the only reliable bridge
     function logToken(tokenData) {
         if (tokenExtracted) return;
         tokenExtracted = true;
-        console.log(TOKEN_PREFIX + JSON.stringify(tokenData));
+        window.__ghost_token = tokenData;
     }
 
+    // Store identity data in window.__ghost_identity for CDP Runtime.evaluate to read
     function logIdentity(cookieData) {
         if (identityExtracted) return;
         identityExtracted = true;
-        console.log(IDENTITY_PREFIX + JSON.stringify(cookieData));
+        window.__ghost_identity = cookieData;
     }
 
     // ---------------------------------------------------------------------------

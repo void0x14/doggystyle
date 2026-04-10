@@ -12,3 +12,22 @@ logs/
 
 # Stakpak session files
 .stakpak/session*
+
+.kiro/specs/infinite-reconnection-loop-fix/.config.kiro
+.kiro/specs/infinite-reconnection-loop-fix/bugfix.md
+.kiro/specs/infinite-reconnection-loop-fix/design.md
+.kiro/specs/infinite-reconnection-loop-fix/tasks.md
+.playwright-mcp/page-2026-04-08T23-54-48-730Z.yml
+accounts.txt
+digistallone
+docs/kesin_kanitlar_analiz.md
+docs/superpowers/plans/2026-04-06-ghost-engine-raw-listener-recovery.md
+docs/superpowers/plans/2026-04-06-ghost-engine-mtu-enforcement.md
+docs/umarım_bu_son_olacak.md
+docs/yeter.md
+ghost_test_mail.js
+mailbox.html
+req6_body.json
+resp6_body.json
+test_esc.zig
+test_stringify.zig
