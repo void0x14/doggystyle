@@ -4,6 +4,7 @@ const http2 = @import("http2_core.zig");
 const jitter = @import("jitter_core.zig");
 const digistallone = @import("digistallone.zig");
 const browser_init = @import("browser_init.zig");
+const browser_bridge = @import("browser_bridge.zig");
 
 fn resolveIpv4Host(host: [:0]const u8) !u32 {
     var hints: std.c.addrinfo = .{
@@ -300,12 +301,15 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // =========================================================================
-    // ADIM 11.4: Stealth Browser Initialization
+    // ADIM 11.4: Stealth Browser Initialization + Token Harvest
     // =========================================================================
-    // SOURCE: src/browser_init.zig — StealthBrowser.init prepares an isolated
-    // Chrome profile and starts a live headless browser process for later
-    // captcha / JS-bound signup steps.
-    std.debug.print("\n[BROWSER] Launching stealth Chrome...\n", .{});
+    // SOURCE: src/browser_init.zig — StealthBrowser.init spawns headless Chrome
+    // SOURCE: src/browser_bridge.zig — BrowserBridge intercepts Chrome stdout
+    // SOURCE: src/harvest.js — Chrome extension injects XHR/fetch monkey-patch
+    //
+    // Flow: Chrome spawns → harvest.js auto-injects on github.com → intercepts
+    // Arkose token → logs GHOST_TOKEN: to stdout → BrowserBridge reads it
+    std.debug.print("\n[BROWSER] Launching stealth Chrome with harvest extension...\n", .{});
     var stealth_browser = try browser_init.StealthBrowser.init(allocator, io);
     defer stealth_browser.deinit();
 
@@ -318,6 +322,37 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("[BROWSER] Stealth Chrome spawned without PID handle (profile={s})\n", .{
             stealth_browser.getProfileDir(),
         });
+    }
+
+    // --- Token Harvest via BrowserBridge ---
+    // BrowserBridge reads Chrome stdout for GHOST_TOKEN: and GHOST_IDENTITY: lines
+    // SOURCE: src/browser_bridge.zig — harvest() polls stdout with poll() timeout
+    std.debug.print("[BROWSER] Starting token harvest (timeout={d}ms)...\n", .{browser_bridge.EXTRACTION_TIMEOUT_MS});
+    var bridge = try browser_bridge.BrowserBridge.init(allocator, io, &stealth_browser.child);
+    defer bridge.deinit();
+
+    const harvest_result = bridge.harvest() catch |err| blk: {
+        std.debug.print("[BROWSER] Harvest failed: {} — continuing without harvested token\n", .{err});
+        break :blk browser_bridge.HarvestResult{};
+    };
+
+    // Extract harvested octocaptcha token (if captured)
+    var harvested_octocaptcha: ?[]const u8 = null;
+    if (harvest_result.token_captured) {
+        harvested_octocaptcha = harvest_result.token.token[0..harvest_result.token.token_len];
+        std.debug.print("[BROWSER] Harvested octocaptcha token: {d} bytes\n", .{harvest_result.token.token_len});
+    } else {
+        std.debug.print("[BROWSER] No octocaptcha token harvested (challenge may not have been triggered)\n", .{});
+    }
+
+    // Inject harvested _octo cookie into cookie jar (if captured)
+    // SOURCE: RFC 6265, Section 4.2 — Cookie header includes _octo for session tracking
+    if (harvest_result.identity_captured and harvest_result.identity._octo_len > 0) {
+        const octo_value = harvest_result.identity._octo[0..harvest_result.identity._octo_len];
+        github_client.cookie_jar.setOctoCookie(octo_value) catch |err| {
+            std.debug.print("[BROWSER] Failed to set _octo cookie: {}\n", .{err});
+        };
+        std.debug.print("[BROWSER] Injected _octo cookie into jar ({d} bytes)\n", .{harvest_result.identity._octo_len});
     }
 
     // =========================================================================
@@ -364,6 +399,7 @@ pub fn main(init: std.process.Init) !void {
         password,
         &sock,
         dst_ip,
+        harvested_octocaptcha,
     ) catch |err| {
         if (err == error.UnexpectedChallenge) {
             std.debug.print("[FATAL] Unexpected Arkose Challenge triggered during signup submission!\n", .{});

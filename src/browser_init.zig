@@ -70,11 +70,26 @@ pub const CHROME_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.3
 /// Temporary profile directory prefix
 pub const PROFILE_PREFIX = "/tmp/ghost_";
 
-/// Number of arguments passed to Chrome.
-pub const CHROME_ARG_COUNT: usize = 19;
+/// Number of arguments passed to Chrome (increased for script injection)
+pub const CHROME_ARG_COUNT: usize = 20;
 
 /// Maximum attempts to generate a unique profile directory
 pub const MAX_MKDTEMP_ATTEMPTS: usize = 10;
+
+/// Subdirectory name for the harvest Chrome extension
+/// SOURCE: Chrome extension loading — --load-extension flag
+pub const HARVEST_EXTENSION_DIR = "harvest_ext";
+
+/// Target URL for signup page (Chrome navigates here after extension loads)
+/// SOURCE: GitHub signup flow — https://github.com/signup
+pub const SIGNUP_URL = "https://github.com/signup";
+
+/// Manifest V3 JSON for harvest extension
+/// SOURCE: Chrome Extension Manifest V3 spec — https://developer.chrome.com/docs/extensions/mv3/manifest/
+/// SOURCE: content_scripts.run_at = document_start — injects before page JS executes
+/// SOURCE: incognito: spanning — allows extension in incognito mode
+pub const MANIFEST_JSON: []const u8 =
+    "{\"manifest_version\":3,\"name\":\"Harvest\",\"version\":\"1.0\",\"incognito\":\"spanning\",\"content_scripts\":[{\"matches\":[\"*://*.github.com/*\",\"*://*.arkoselabs.com/*\"],\"js\":[\"harvest.js\"],\"run_at\":\"document_start\"}]}";
 
 /// Preferences JSON content — forces "Normal" exit type to avoid restore prompts
 /// SOURCE: Chrome Preferences file format — internal Chrome config structure
@@ -190,6 +205,73 @@ pub fn writePreferences(
         return BrowserInitError.PreferencesWriteFailed;
 }
 
+/// Create a Chrome extension directory for token extraction
+///
+/// Creates {profile_dir}/harvest_ext/ with manifest.json and harvest.js.
+/// The extension uses content_scripts to inject harvest.js on GitHub and Arkose Labs pages.
+/// This approach ensures harvest.js runs on EVERY navigated page (not just the initial HTML).
+///
+/// SOURCE: Chrome Extension Manifest V3 — https://developer.chrome.com/docs/extensions/mv3/manifest/
+/// SOURCE: Chrome --load-extension flag — loads unpacked extension from directory
+/// SOURCE: Chrome --disable-extensions-except — allows only specified extension
+///
+/// Why not harvest.html + redirect:
+///   harvest.html loads harvest.js, then redirects to github.com/signup.
+///   After redirect, harvest.js is GONE (new document, no script injection).
+///   Content scripts solve this — they auto-inject on every matching page.
+pub fn writeHarvestExtension(
+    io: Io,
+    profile_dir: []const u8,
+) BrowserInitError!void {
+    const cwd = Io.Dir.cwd();
+
+    // Build extension directory path: {profile_dir}/harvest_ext
+    var ext_dir_buf: [512]u8 = undefined;
+    const ext_dir = std.fmt.bufPrint(&ext_dir_buf, "{s}/{s}", .{ profile_dir, HARVEST_EXTENSION_DIR }) catch
+        return BrowserInitError.OutOfMemory;
+
+    // Create extension directory
+    // SOURCE: vendor/zig-std/std/Io/Dir.zig — createDir needs Permissions enum
+    cwd.createDir(io, ext_dir, .default_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return BrowserInitError.ProfileDirCreationFailed;
+    };
+
+    // Write manifest.json: {profile_dir}/harvest_ext/manifest.json
+    var manifest_path_buf: [512]u8 = undefined;
+    const manifest_path = std.fmt.bufPrint(&manifest_path_buf, "{s}/manifest.json", .{ext_dir}) catch
+        return BrowserInitError.OutOfMemory;
+
+    const manifest_file = cwd.createFile(io, manifest_path, .{ .truncate = true }) catch
+        return BrowserInitError.PreferencesWriteFailed;
+    defer manifest_file.close(io);
+
+    manifest_file.writePositionalAll(io, MANIFEST_JSON, 0) catch
+        return BrowserInitError.PreferencesWriteFailed;
+
+    // Copy harvest.js into extension directory: {profile_dir}/harvest_ext/harvest.js
+    // SOURCE: vendor/zig-std/std/Io/Dir.zig — readFile reads file contents into buffer
+    var src_path_buf: [512]u8 = undefined;
+    const src_path = std.fmt.bufPrint(&src_path_buf, "src/harvest.js", .{}) catch
+        return BrowserInitError.OutOfMemory;
+
+    // Read source harvest.js (max 64KB)
+    var harvest_content_buf: [65536]u8 = undefined;
+    const harvest_content = cwd.readFile(io, src_path, &harvest_content_buf) catch
+        return BrowserInitError.PreferencesWriteFailed;
+
+    // Write to extension directory
+    var dst_path_buf: [512]u8 = undefined;
+    const dst_path = std.fmt.bufPrint(&dst_path_buf, "{s}/harvest.js", .{ext_dir}) catch
+        return BrowserInitError.OutOfMemory;
+
+    const dst_file = cwd.createFile(io, dst_path, .{ .truncate = true }) catch
+        return BrowserInitError.PreferencesWriteFailed;
+    defer dst_file.close(io);
+
+    dst_file.writePositionalAll(io, harvest_content, 0) catch
+        return BrowserInitError.PreferencesWriteFailed;
+}
+
 /// Build a minimal safe environment map for headless Chrome
 ///
 /// Explicitly excludes DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR to prevent GUI leaks.
@@ -243,38 +325,55 @@ pub fn buildSafeEnvironment(
 pub fn buildChromeArgv(
     profile_dir: []const u8,
     user_data_dir_buf: []u8,
+    load_ext_buf: []u8,
+    disable_ext_except_buf: []u8,
 ) BrowserInitError![CHROME_ARG_COUNT][]const u8 {
-    return buildChromeArgvWithBinary(CHROME_BINARY, profile_dir, user_data_dir_buf);
+    return buildChromeArgvWithBinary(CHROME_BINARY, profile_dir, user_data_dir_buf, load_ext_buf, disable_ext_except_buf, null);
 }
 
 fn buildChromeArgvWithBinary(
     chrome_binary: []const u8,
     profile_dir: []const u8,
     user_data_dir_buf: []u8,
+    load_ext_buf: []u8,
+    disable_ext_except_buf: []u8,
+    start_url: ?[]const u8,
 ) BrowserInitError![CHROME_ARG_COUNT][]const u8 {
     const user_data_dir_arg = std.fmt.bufPrint(user_data_dir_buf, "--user-data-dir={s}", .{profile_dir}) catch
         return BrowserInitError.OutOfMemory;
 
+    // Build --load-extension and --disable-extensions-except flag values
+    // SOURCE: Chrome command-line switches — --load-extension loads unpacked extension
+    // SOURCE: Chrome command-line switches — --disable-extensions-except whitelists one extension
+    const load_ext_arg = std.fmt.bufPrint(load_ext_buf, "--load-extension={s}/{s}", .{ profile_dir, HARVEST_EXTENSION_DIR }) catch
+        return BrowserInitError.OutOfMemory;
+    const disable_ext_except_arg = std.fmt.bufPrint(disable_ext_except_buf, "--disable-extensions-except={s}/{s}", .{ profile_dir, HARVEST_EXTENSION_DIR }) catch
+        return BrowserInitError.OutOfMemory;
+
+    // Use SIGNUP_URL as default start page (extension injects harvest.js automatically)
+    const actual_start_url = if (start_url) |url| url else SIGNUP_URL;
+
     return .{
         chrome_binary,
-        "--headless=new",                           // New headless mode (2024+)
+        "--headless=new", // New headless mode (2024+)
         "--disable-blink-features=AutomationControlled", // Hide automation fingerprint
-        "--no-first-run",                           // Skip welcome page
-        "--incognito",                              // Private browsing mode
-        "--disable-gpu",                            // Disable GPU acceleration (headless)
-        "--disable-software-rasterizer",            // Disable software rasterizer
-        "--disable-dev-shm-usage",                  // Use /tmp instead of /dev/shm
-        "--disable-extensions",                     // No extensions
-        "--disable-background-networking",          // Prevent background requests
-        "--disable-default-apps",                   // No default apps
-        "--disable-hang-monitor",                   // Disable hang monitor
-        "--disable-prompt-on-repost",               // No repost prompt
-        "--disable-sync",                           // Disable sync
-        "--metrics-recording-only",                 // Disable metrics
-        "--safebrowsing-disable-auto-update",       // No safebrowsing updates
-        "--user-agent=" ++ CHROME_USER_AGENT,       // Hardcoded UA
+        "--no-first-run", // Skip welcome page
+        "--incognito", // Private browsing mode
+        "--disable-gpu", // Disable GPU acceleration (headless)
+        "--disable-software-rasterizer", // Disable software rasterizer
+        "--disable-dev-shm-usage", // Use /tmp instead of /dev/shm
+        disable_ext_except_arg, // Only allow harvest extension
+        "--disable-background-networking", // Prevent background requests
+        "--disable-default-apps", // No default apps
+        "--disable-hang-monitor", // Disable hang monitor
+        "--disable-prompt-on-repost", // No repost prompt
+        "--disable-sync", // Disable sync
+        "--metrics-recording-only", // Disable metrics
+        "--safebrowsing-disable-auto-update", // No safebrowsing updates
+        "--user-agent=" ++ CHROME_USER_AGENT, // Hardcoded UA
+        load_ext_arg, // Load harvest extension
         user_data_dir_arg,
-        "about:blank",                              // Start on blank page
+        actual_start_url, // Start page (github.com/signup or custom)
     };
 }
 
@@ -340,8 +439,9 @@ pub const StealthBrowser = struct {
     /// Steps:
     ///   1. Generate unique temp profile directory
     ///   2. Write minimal Preferences JSON
-    ///   3. Build safe environment (purge GUI vars)
-    ///   4. Configure and spawn Chrome with stealth flags
+    ///   3. Write harvest extension (manifest.json + harvest.js)
+    ///   4. Build safe environment (purge GUI vars)
+    ///   5. Configure and spawn Chrome with stealth flags
     ///
     /// Caller owns the returned StealthBrowser and must call deinit().
     pub fn init(
@@ -363,16 +463,21 @@ pub const StealthBrowser = struct {
         // Step 2: Write Preferences JSON before Chrome launches
         try writePreferences(io, profile_dir);
 
-        // Step 3: Build safe environment
+        // Step 3: Write harvest extension for token extraction
+        try writeHarvestExtension(io, profile_dir);
+
+        // Step 4: Build safe environment
         var env_map = try buildSafeEnvironment(allocator, profile_dir);
         defer env_map.deinit();
 
-        // Step 4: Build Chrome argv with stealth flags
+        // Step 5: Build Chrome argv with stealth flags
         // SOURCE: Chromium command-line switches — https://peter.sh/experiments/chromium-command-line-switches/
         var user_data_dir_buf: [512]u8 = undefined;
-        const argv = try buildChromeArgvWithBinary(chrome_binary, profile_dir, &user_data_dir_buf);
+        var load_ext_buf: [512]u8 = undefined;
+        var disable_ext_except_buf: [512]u8 = undefined;
+        const argv = try buildChromeArgvWithBinary(chrome_binary, profile_dir, &user_data_dir_buf, &load_ext_buf, &disable_ext_except_buf, null);
 
-        // Step 5: Spawn Chrome
+        // Step 6: Spawn Chrome
         const child = process.spawn(io, .{
             .argv = &argv,
             .environ_map = &env_map,
@@ -536,10 +641,13 @@ test "StealthBrowser.initWithBinary: spawn failure cleans up temporary profile" 
 
 test "buildChromeArgv: binds runtime profile directory into argv" {
     var user_data_dir_buf: [512]u8 = undefined;
-    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf);
+    var load_ext_buf: [512]u8 = undefined;
+    var disable_ext_except_buf: [512]u8 = undefined;
+    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &load_ext_buf, &disable_ext_except_buf);
 
     try std.testing.expectEqualStrings(CHROME_BINARY, argv[0]);
-    try std.testing.expectEqualStrings("about:blank", argv[argv.len - 1]);
+    // Last arg is now SIGNUP_URL (not about:blank)
+    try std.testing.expectEqualStrings(SIGNUP_URL, argv[argv.len - 1]);
 
     var saw_user_data_dir = false;
     for (argv) |arg| {
@@ -550,11 +658,23 @@ test "buildChromeArgv: binds runtime profile directory into argv" {
     }
 
     try std.testing.expect(saw_user_data_dir);
+
+    // Verify --load-extension flag is present
+    var saw_load_extension = false;
+    for (argv) |arg| {
+        if (mem.startsWith(u8, arg, "--load-extension=")) {
+            saw_load_extension = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_load_extension);
 }
 
 test "buildChromeArgv: keeps Chrome sandbox enabled" {
     var user_data_dir_buf: [512]u8 = undefined;
-    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf);
+    var load_ext_buf: [512]u8 = undefined;
+    var disable_ext_except_buf: [512]u8 = undefined;
+    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &load_ext_buf, &disable_ext_except_buf);
 
     for (argv) |arg| {
         try std.testing.expect(!mem.eql(u8, arg, "--no-sandbox"));
@@ -563,7 +683,9 @@ test "buildChromeArgv: keeps Chrome sandbox enabled" {
 
 test "StealthBrowser: argv contains required stealth flags" {
     var user_data_dir_buf: [512]u8 = undefined;
-    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf);
+    var load_ext_buf: [512]u8 = undefined;
+    var disable_ext_except_buf: [512]u8 = undefined;
+    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &load_ext_buf, &disable_ext_except_buf);
 
     // Verify that the argv slice contains all required flags
     const expected_flags = [_][]const u8{
@@ -582,6 +704,11 @@ test "StealthBrowser: argv contains required stealth flags" {
             }
         }
         try std.testing.expect(found);
+    }
+
+    // Verify --disable-extensions is NOT present (replaced by --disable-extensions-except)
+    for (argv) |arg| {
+        try std.testing.expect(!mem.eql(u8, arg, "--disable-extensions"));
     }
 
     // Verify user-agent contains Chrome version

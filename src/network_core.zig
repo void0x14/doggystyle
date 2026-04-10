@@ -6699,6 +6699,17 @@ pub const GitHubCookieJar = struct {
         }
     }
 
+    /// Directly set the _octo cookie from harvested identity data
+    /// SOURCE: browser_bridge.zig HarvestedIdentity struct
+    pub fn setOctoCookie(self: *GitHubCookieJar, octo_value: []const u8) !void {
+        if (octo_value.len == 0) return; // No-op for empty value
+        if (octo_value.len > self.octo.len) return error.CookieTooLarge;
+        const copy_len = octo_value.len;
+        std.debug.assert(copy_len > 0 and copy_len <= self.octo.len);
+        @memcpy(self.octo[0..copy_len], octo_value[0..copy_len]);
+        self.octo_len = copy_len;
+    }
+
     /// Build Cookie header value for outbound requests
     /// SOURCE: RFC 6265, Section 4.2 — Cookie header
     pub fn cookieHeader(self: *const GitHubCookieJar, buf: []u8) ![]u8 {
@@ -7982,8 +7993,12 @@ pub const GitHubHttpClient = struct {
         // Browser submits hidden input (value=0), NOT checkbox (unchecked)
         try buf.appendSlice("&user_signup%5Bmarketing_consent%5D=0");
 
-        // --- Field 13: octocaptcha-token (empty when captcha not solved) ---
+        // --- Field 13: octocaptcha-token (empty when captcha not solved, harvested token when available) ---
+        // SOURCE: browser_bridge.zig harvest.js — extracts token from Arkose Labs challenge
         try buf.appendSlice("&octocaptcha-token=");
+        if (tokens.octocaptcha_token) |token| {
+            try urlEncode(&buf, token);
+        }
 
         // --- Field 14: required_field_xxxx (empty string, browser submits it) ---
         if (form_fields.required_field_name) |required_name| {
@@ -8052,16 +8067,24 @@ pub const GitHubHttpClient = struct {
         password: []const u8,
         sock: anytype,
         dst_ip: u32,
+        harvested_octocaptcha_token: ?[]const u8,
     ) !bool {
         std.debug.print("[Layer 4 (Logic)] Starting GitHub signup flow\n", .{});
         const path = "/signup?social=false";
 
         // STEP 1: Extract tokens from HTML
-        const tokens = try extractSignupTokens(html_buffer, allocator);
+        var tokens = try extractSignupTokens(html_buffer, allocator);
         defer {
             allocator.free(tokens.authenticity_token);
             allocator.free(tokens.timestamp);
             allocator.free(tokens.timestamp_secret);
+        }
+
+        // Inject harvested octocaptcha token from BrowserBridge if available
+        // SOURCE: browser_bridge.zig — harvest.js extracts Arkose Labs token via Chrome extension
+        if (harvested_octocaptcha_token) |token| {
+            tokens.octocaptcha_token = token;
+            std.debug.print("[SIGNUP] Injected harvested octocaptcha token ({d} bytes)\n", .{token.len});
         }
         std.debug.print("[SIGNUP] Extracted tokens: authenticity_token ({d}B), timestamp ({s}), timestamp_secret ({d}B)\n", .{
             tokens.authenticity_token.len,
@@ -8316,8 +8339,8 @@ pub const GitHubHttpClient = struct {
                 // SOURCE: GitHub 2026 flow — verified accounts land on /account_verifications
                 if (response.status_code == 200 and
                     (mem.indexOf(u8, response.body, "/account_verifications") != null or
-                    mem.indexOf(u8, response.body, "dashboard") != null or
-                    mem.indexOf(u8, response.body, "logout") != null))
+                        mem.indexOf(u8, response.body, "dashboard") != null or
+                        mem.indexOf(u8, response.body, "logout") != null))
                 {
                     std.debug.print("[VERIFY] SUCCESS: 200 OK with logged-in indicators\n", .{});
                     return true;
@@ -8431,10 +8454,12 @@ pub const RiskStatus = struct {
 //   1. authenticity_token — Rails CSRF token (base64, ~88 bytes)
 //   2. timestamp — page load timestamp in milliseconds
 //   3. timestamp_secret — anti-automation secret tied to timestamp
+//   4. octocaptcha_token — Arkose Labs token (optional, harvested via browser_bridge.zig)
 pub const SignupTokens = struct {
     authenticity_token: []const u8,
     timestamp: []const u8,
     timestamp_secret: []const u8,
+    octocaptcha_token: ?[]const u8 = null,
 };
 
 pub fn extractSignupTokens(

@@ -1731,3 +1731,79 @@ if (total_len > MTU_LIMIT) {
 **Kök sebep:** `extractStateFromResponse` içerisinde component state'i `snap_escaped` değişkeni aracılığıyla "backslash" içeren escape formatında saklanıyordu. Daha sonra `buildPollRequest` veya `buildUpdateRequest` üzerinden JSON payload'ı inşa ederken `std.json.Stringify.write` çağrıldığında, halihazırda escape edilmiş string bir kez daha escape ediliyordu (örneğin; `{\"data\":...}` -> `"{\\\"data\\\":...}"`). Livewire v3 backend bu bozuk String'i parse edemediği için snapshot'ı onaylayamıyordu.
 **Kaynak:** RFC 8259, `json_decode`, ve Digistallone Livewire Exception behavior.
 **Düzeltme:** `extractStateFromResponse` fonksiyonu içerisine önceden var olan `unescapeJsonStringInto` logiciği entegre edildi. Backend'den dönen escaped JSON component state'i belleğe kaydedilmeden hemen önce _unescape_ edildi. Böylece `std.json.Stringify` paketi kullanıldığında data sadece bir kere, olması gerektiği gibi escape edilmiş oluyor ve backend hata üretmeden lifecycle'ı tamamlıyor. Ayrıca 500 `CorruptComponentPayloadException` gelirse sonsuz döngüden hemen çıkılması için `mem.indexOf` kontrolü eklendi.
+
+---
+
+## [2026-04-10] — Staged Değişiklik İnceleme: 7 Hata Tespit ve Düzeltme
+
+### P1 — CRITICAL: harvest.html Redirect Sonrası Script Kayboluyor (MOCK → GERÇEK)
+
+**Hata:** `harvest.html` yaklaşımıyla `harvest.js` yükleniyor → `window.location.href = "https://github.com/signup"` redirect → **harvest.js kayboluyor**. Yeni sayfada monkey-patch aktif değil, token extraction çalışmaz.
+**Kök sebep:** HTML injection yöntemi, redirect sonrası JavaScript execution context'ini kaybediyor. Content script olarak inject edilmiyor.
+**Kaynak:** Chrome Extension Manifest V3 — `content_scripts[].run_at = "document_start"` her matching sayfada otomatik inject eder
+**Düzeltme:** Chrome Extension yaklaşımına geçildi:
+- `writeHarvestHtml` → `writeHarvestExtension` (Manifest V3, content_scripts)
+- Extension `document_start`'ta inject eder → her GitHub/Arkose sayfasında otomatik çalışır
+- `--disable-extensions` → `--disable-extensions-except` + `--load-extension`
+- Start URL: `harvest.html` → `https://github.com/signup`
+
+### P2 — CRITICAL: readLine Blocking I/O Deadlock Riski
+
+**Hata:** `stdout_file.read()` blocking çağrı — pipe buffer dolunca Chrome yazamaz, biz okuyamaz = **deadlock**.
+**Kök sebep:** Child process stdout pipe'dan blocking read yapıyorduk. Chrome stdout buffer'ı dolduğunda write bloke olur, bizim read de bloke olur = karşılıklı deadlock.
+**Kaynak:** man 2 poll — POLLIN ile fd readiness kontrolü
+**Kaynak:** man 2 read — non-blocking read after poll confirmed data available
+**Düzeltme:** `std.posix.poll()` ile non-blocking kontrol eklendi. Önce POLLIN kontrolü, sonra `std.posix.read()` ile okuma.
+
+### P3 — HIGH: buildChromeArgv Test Assertion Yanlış
+
+**Hata:** Test `about:blank` bekliyordu ama kod artık `SIGNUP_URL` dönüyordu. Extension flag'leri test edilmemişti.
+**Kök sebep:** Test, eski `harvest.html` akışına göre yazılmıştı. Extension yaklaşımına geçişte test güncellenmemişti.
+**Düzeltme:** Test `SIGNUP_URL`, `--load-extension` ve `--disable-extensions-except` flag'lerini doğrulayacak şekilde güncellendi.
+
+### P4 — MEDIUM: byte_buf Uninitialized → Undefined Behavior Riski
+
+**Hata:** `const byte_buf: [1]u8 = undefined;` — read başarısız olursa UB riski.
+**Kök sebep:** Zig'de `undefined` bellek, okunursa UB'dir. `read` hatasında `byte_buf[0]` okunabilir.
+**Düzeltme:** `var byte_buf: [1]u8 = [1]u8{0};` olarak değiştirildi.
+
+### P5 — MEDIUM: `__Host-` Cookie Erişimi (document.cookie ile Okunamaz)
+
+**Hata:** `document.cookie` ile `__Host-next-auth.csrf-token` okunamaz.
+**Kök sebep:** RFC 6265bis Section 4.1.2'ye göre `__Host-` prefixli cookie'ler HttpOnly+Secure ve JavaScript'ten erişilemez.
+**Kaynak:** RFC 6265bis, Section 4.1.2 — Cookie Prefixes
+**Düzeltme:** Session alanı kaldırıldı, `parseIdentityLine` ve `checkForChallengeCompletion` güncellendi.
+
+### P6 — MEDIUM: extractTokenFromResponse Pattern 3 Çok Agresif
+
+**Hata:** `/[a-zA-Z0-9_-]{2000,}/` — herhangi bir 2000+ karakterlik string'i token kabul ediyor (yanlış pozitif riski yüksek).
+**Kök sebep:** Regex, Arkose Labs token formatını bilmeden yazılmıştı. Her uzun string'i token kabul ediyordu.
+**Düzeltme:** Agresif Pattern 3 kaldırıldı. Pattern 2, Arkose Labs'a özgü alan adlarıyla (`session_token`, `solver_response`) sınırlandırıldı. Minimum uzunluk 500 karakter olarak artırıldı.
+
+### P7 — LOW: setOctoCookie Zero-Length Kontrolü
+
+**Hata:** `octo_value.len == 0` durumunda `@memcpy` 0-length slice'larla çağrılıyordu.
+**Kök sebep:** Zero-length `@memcpy` tanımsız davranış riski taşır ve cookie jar'ı bozuk duruma sokabilir.
+**Düzeltme:** Early return + `std.debug.assert` eklendi.
+
+### P8 — HIGH: Zig 0.16 API Uyumsuzluğu — std.time.sleep ve File.read Mevcut Değil
+
+**Hata:** `std.time.sleep()` ve `File.read()` Zig 0.16 vendored stdlib'de mevcut değil — derleme hatası.
+**Kök sebep:** Zig 0.16'da I/O API'si `std.Io` namespace'ine taşındı. `sleep` → `Io.sleep`, `File.read` → `Reader` pattern. Ancak Reader non-blocking I/O ile uyumsuz olduğu için doğrudan POSIX syscall kullanıldı.
+**Kaynak:** man 2 nanosleep — nanosleep syscall
+**Kaynak:** man 2 read — POSIX read syscall
+**Kaynak:** vendor/zig-std/std/Io/File.zig — Reader API
+**Düzeltme:**
+- `std.time.sleep()` → `std.os.linux.nanosleep()` (doğrudan syscall)
+- `stdout_file.read()` → `std.posix.read(stdout_file.handle, &byte_buf)` (doğrudan POSIX read)
+
+### P9 — CRITICAL: BrowserBridge Signup Flow'una Entegre Edilmemişti
+
+**Hata:** Staged değişiklikler (BrowserBridge, StealthBrowser, harvest.js) yazılmış ama `main.zig`'deki signup flow'una bağlanmamıştı. Motor Chrome spawn ediyordu ama harvested token'ı kullanmıyordu.
+**Kök sebep:** Değişiklikler izole modül düzeyinde yapılmış, ana orkestrasyon akışına entegre edilmemişti.
+**Düzeltme:**
+1. `main.zig`'e `browser_bridge` import eklendi
+2. ADIM 11.4'te `BrowserBridge.init` + `harvest()` çağrısı eklendi
+3. Harvest edilen `octocaptcha_token` → `performSignup`'a `harvested_octocaptcha_token` parametresi olarak geçirildi
+4. Harvest edilen `_octo` cookie → `github_client.cookie_jar.setOctoCookie()` ile cookie jar'a inject edildi
+5. `performSignup` fonksiyonuna `?[]const u8` parametre eklendi — harvested token varsa `SignupTokens.octocaptcha_token`'a set ediyor

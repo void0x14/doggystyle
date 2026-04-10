@@ -70,6 +70,14 @@ pub fn build(b: *std.Build) void {
     browser_init_test_run.has_side_effects = true;
     test_step.dependOn(&browser_init_test_run.step);
 
+    // Module 4: Browser Bridge (Chrome stdout interceptor) tests
+    const browser_bridge_test_run = b.addSystemCommand(&.{
+        vendor_zig,      "test",           "src/browser_bridge.zig",
+        "--zig-lib-dir", "vendor/zig-std", "-lc",
+    });
+    browser_bridge_test_run.has_side_effects = true;
+    test_step.dependOn(&browser_bridge_test_run.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
