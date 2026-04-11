@@ -1962,6 +1962,80 @@ pub const BrowserBridge = struct {
         }
         self.cdp.close();
     }
+
+    /// Verify that all required trace artifacts exist after a run.
+    /// SOURCE: PRD "Full Real-Time Browser Observability System", ticket 0b0380bf
+    pub fn verifyArtifacts(self: *BrowserBridge) void {
+        const trace_dir = self.diagnostics_dir orelse {
+            std.debug.print("[ARTIFACTS] ⚠️ No diagnostics directory — skipping verification\n", .{});
+            return;
+        };
+
+        const required_files = [_][]const u8{
+            "browser-state.ndjson",
+            "browser-actions.ndjson",
+            "browser-network.ndjson",
+            "live-view.html",
+        };
+
+        var all_ok = true;
+        var stats_buf: [256]u8 = undefined;
+
+        for (required_files) |fname| {
+            var path_buf: [1024]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ trace_dir, fname }) catch continue;
+
+            const stat = std.posix.stat(path, &stats_buf);
+            if (stat != 0) {
+                std.debug.print("[ARTIFACTS] ❌ Missing: {s}\n", .{fname});
+                all_ok = false;
+            } else {
+                const size = std.mem.nativeToLittle(u64, @bitCast(stats_buf[48..56].*));
+                std.debug.print("[ARTIFACTS] ✅ {s}: {d} bytes\n", .{ fname, size });
+            }
+        }
+
+        // Check for screenshots
+        var screenshot_count: usize = 0;
+        const dir = std.posix.openat(std.posix.AT.FDCWD, trace_dir, .{ .ACCMODE = .RDONLY }, 0) catch {
+            std.debug.print("[ARTIFACTS] ❌ Cannot open trace directory\n", .{});
+            return;
+        };
+        defer _ = std.c.close(dir);
+
+        var linux_dirent_buf: [1024]u8 = undefined;
+        while (true) {
+            const n = std.posix.getdents64(dir, &linux_dirent_buf) catch break;
+            if (n == 0) break;
+            var offset: usize = 0;
+            while (offset < n) {
+                const dirent_ptr = linux_dirent_buf[offset..];
+                if (dirent_ptr.len < 19) break; // minimum d_reclen
+                const d_reclen = std.mem.nativeToLittle(u16, @bitCast(dirent_ptr[16..18].*));
+                if (d_reclen < 19) break;
+                const name_start = 19;
+                if (name_start >= d_reclen) break;
+                const name_end = mem.indexOfScalarPos(u8, dirent_ptr, name_start, 0) orelse break;
+                const entry_name = dirent_ptr[name_start..name_end];
+                if (mem.startsWith(u8, entry_name, "shot-") and mem.endsWith(u8, entry_name, ".png")) {
+                    screenshot_count += 1;
+                }
+                offset += d_reclen;
+            }
+        }
+
+        if (screenshot_count == 0) {
+            std.debug.print("[ARTIFACTS] ⚠️ No screenshots captured\n", .{});
+        } else {
+            std.debug.print("[ARTIFACTS] ✅ screenshots: {d} files\n", .{screenshot_count});
+        }
+
+        if (all_ok and screenshot_count > 0) {
+            std.debug.print("[ARTIFACTS] ✅ All required artifacts present\n", .{});
+        } else if (!all_ok) {
+            std.debug.print("[ARTIFACTS] ❌ Some artifacts missing — check trace directory: {s}\n", .{trace_dir});
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
