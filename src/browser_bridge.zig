@@ -1422,6 +1422,64 @@ pub const BrowserBridge = struct {
         return result;
     }
 
+    /// Log a network event to browser-network.ndjson
+    /// SOURCE: PRD "Full Real-Time Browser Observability System", ticket a273db8e
+    fn logNetworkEvent(
+        self: *BrowserBridge,
+        event_type: []const u8,
+        url: []const u8,
+        method: []const u8,
+        has_post_data: bool,
+        post_data_length: usize,
+        phase_label: []const u8,
+    ) BridgeError!void {
+        const trace_dir = self.diagnostics_dir orelse return;
+
+        var path_buf: [1024]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/browser-network.ndjson", .{trace_dir}) catch return error.OutOfMemory;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .APPEND = true,
+            .CLOEXEC = true,
+        }, 0o644) catch return error.WriteFailed;
+        defer _ = std.c.close(fd);
+
+        var line_buf = std.array_list.Managed(u8).init(self.allocator);
+        defer line_buf.deinit();
+
+        var tmp: [64]u8 = undefined;
+        try line_buf.appendSlice("{\"timestamp_ms\":");
+        try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{currentUnixMs()}) catch return error.OutOfMemory);
+        try line_buf.appendSlice(",\"event_type\":\"");
+        try line_buf.appendSlice(event_type);
+        try line_buf.appendSlice("\",\"url\":\"");
+        // URL-escape the URL (minimal: just escape quotes and backslashes)
+        {
+            var i: usize = 0;
+            while (i < url.len) : (i += 1) {
+                if (url[i] == '"') {
+                    try line_buf.appendSlice("\\\"");
+                } else if (url[i] == '\\') {
+                    try line_buf.appendSlice("\\\\");
+                } else {
+                    try line_buf.appendSlice(url[i .. i + 1]);
+                }
+            }
+        }
+        try line_buf.appendSlice("\",\"method\":\"");
+        try line_buf.appendSlice(method);
+        try line_buf.appendSlice("\",\"has_post_data\":");
+        try line_buf.appendSlice(if (has_post_data) "true" else "false");
+        try line_buf.appendSlice(",\"post_data_length\":");
+        try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{post_data_length}) catch return error.OutOfMemory);
+        try line_buf.appendSlice(",\"phase_label\":\"");
+        try line_buf.appendSlice(phase_label);
+        try line_buf.appendSlice("\"}\n");
+
+        try writeAll(fd, line_buf.items.ptr, line_buf.items.len);
+    }
+
     fn waitForPausedRequest(self: *BrowserBridge, url_substring: []const u8, timeout_ms: u64) BridgeError!PausedRequestCapture {
         const start_ns = currentTimestampNs();
         while (@as(u64, @intCast(@divTrunc(currentTimestampNs() - start_ns, std.time.ns_per_ms))) < timeout_ms) {
@@ -1437,6 +1495,21 @@ pub const BrowserBridge = struct {
                 else => return err,
             };
             if (mem.indexOf(u8, paused.bundle.url, url_substring) != null) {
+                // Log matched network event to browser-network.ndjson
+                const phase_label = if (mem.indexOf(u8, url_substring, "signup") != null)
+                    "signup-capture"
+                else if (mem.indexOf(u8, url_substring, "account_verifications") != null)
+                    "verify-capture"
+                else
+                    "unknown";
+                try self.logNetworkEvent(
+                    "request_paused",
+                    paused.bundle.url,
+                    paused.bundle.method,
+                    paused.bundle.post_data.len > 0,
+                    paused.bundle.post_data.len,
+                    phase_label,
+                );
                 return paused;
             }
             paused.deinit(self.allocator);
