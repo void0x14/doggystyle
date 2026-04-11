@@ -1261,6 +1261,15 @@ pub const BrowserBridge = struct {
 
         // Determine success from response
         const ok = extractRuntimeEvaluateStringValue(self.allocator, response) catch null;
+
+        // Get screenshot name BEFORE capture so we can include it in the audit result
+        var screenshot_name_buf: [32]u8 = undefined;
+        const trace_dir = self.diagnostics_dir;
+        if (trace_dir != null) {
+            screenshot_name_buf = self.nextScreenshotName("signup-start");
+        }
+        const screenshot_path_slice: []const u8 = screenshot_name_buf[0..mem.indexOfScalar(u8, &screenshot_name_buf, 0) orelse 0];
+
         const result: BrowserAuditResult = if (ok) |val| blk: {
             defer self.allocator.free(val);
             break :blk .{
@@ -1270,7 +1279,7 @@ pub const BrowserBridge = struct {
                 .action_kind = .signup_start,
                 .chars_written = total_chars,
                 .state_after = "dispatched",
-                .screenshot_path = null,
+                .screenshot_path = if (trace_dir != null and screenshot_path_slice.len > 0) try self.allocator.dupe(u8, screenshot_path_slice) else null,
                 .timestamp_ms = ts,
                 .err_msg = null,
             };
@@ -1287,7 +1296,6 @@ pub const BrowserBridge = struct {
         };
 
         // Capture screenshot for audit trail
-        const trace_dir = self.diagnostics_dir;
         if (trace_dir) |tdir| {
             self.captureScreenshot(tdir, "signup-start") catch {};
         }
@@ -1303,6 +1311,12 @@ pub const BrowserBridge = struct {
         defer self.allocator.free(response);
 
         const ok = extractRuntimeEvaluateStringValue(self.allocator, response) catch null;
+
+        var ss_buf1: [32]u8 = undefined;
+        const trace_dir1 = self.diagnostics_dir;
+        if (trace_dir1 != null) ss_buf1 = self.nextScreenshotName("signup-submit");
+        const ss_slice1: []const u8 = ss_buf1[0..mem.indexOfScalar(u8, &ss_buf1, 0) orelse 0];
+
         const result: BrowserAuditResult = if (ok) |val| blk: {
             defer self.allocator.free(val);
             break :blk .{
@@ -1312,7 +1326,7 @@ pub const BrowserBridge = struct {
                 .action_kind = .signup_submit,
                 .chars_written = 0,
                 .state_after = "submitted",
-                .screenshot_path = null,
+                .screenshot_path = if (trace_dir1 != null and ss_slice1.len > 0) try self.allocator.dupe(u8, ss_slice1) else null,
                 .timestamp_ms = ts,
                 .err_msg = null,
             };
@@ -1328,8 +1342,7 @@ pub const BrowserBridge = struct {
             .err_msg = "no_response",
         };
 
-        const trace_dir = self.diagnostics_dir;
-        if (trace_dir) |tdir| {
+        if (trace_dir1) |tdir| {
             self.captureScreenshot(tdir, "signup-submit") catch {};
         }
 
@@ -1352,6 +1365,12 @@ pub const BrowserBridge = struct {
         defer self.allocator.free(response);
 
         const ok = extractRuntimeEvaluateStringValue(self.allocator, response) catch null;
+
+        var ss_buf2: [32]u8 = undefined;
+        const trace_dir2 = self.diagnostics_dir;
+        if (trace_dir2 != null) ss_buf2 = self.nextScreenshotName("verify-submit");
+        const ss_slice2: []const u8 = ss_buf2[0..mem.indexOfScalar(u8, &ss_buf2, 0) orelse 0];
+
         const result: BrowserAuditResult = if (ok) |val| blk: {
             defer self.allocator.free(val);
             break :blk .{
@@ -1361,7 +1380,7 @@ pub const BrowserBridge = struct {
                 .action_kind = .verify_submit,
                 .chars_written = code_len,
                 .state_after = "submitted",
-                .screenshot_path = null,
+                .screenshot_path = if (trace_dir2 != null and ss_slice2.len > 0) try self.allocator.dupe(u8, ss_slice2) else null,
                 .timestamp_ms = ts,
                 .err_msg = null,
             };
@@ -1377,8 +1396,7 @@ pub const BrowserBridge = struct {
             .err_msg = "no_response",
         };
 
-        const trace_dir = self.diagnostics_dir;
-        if (trace_dir) |tdir| {
+        if (trace_dir2) |tdir| {
             self.captureScreenshot(tdir, "verify-submit") catch {};
         }
 
@@ -1679,6 +1697,21 @@ pub const BrowserBridge = struct {
         defer self.allocator.free(line);
         try line_buf.appendSlice(line);
         try writeAll(fd, line_buf.items.ptr, line_buf.items.len);
+    }
+
+    /// Return the next screenshot file name (relative to trace dir) without actually capturing.
+    /// Useful for including the screenshot path in audit results before capture.
+    fn nextScreenshotName(self: *const BrowserBridge, label: []const u8) [32]u8 {
+        var safe_label_buf: [64]u8 = undefined;
+        const safe_label = sanitizeTraceLabel(label, &safe_label_buf);
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "shot-{d:0>4}-{s}.png", .{
+            self.screenshot_seq,
+            safe_label,
+        }) catch "shot-unknown.png";
+        var result: [32]u8 = [_]u8{0} ** 32;
+        @memcpy(result[0..name.len], name);
+        return result;
     }
 
     fn captureScreenshot(self: *BrowserBridge, trace_dir: []const u8, label: []const u8) BridgeError!void {
