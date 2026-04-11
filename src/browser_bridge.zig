@@ -826,22 +826,22 @@ const PausedRequestCapture = struct {
 };
 
 const BrowserUiState = struct {
-    url: []const u8,
-    title: []const u8,
-    octocaptcha_length: usize,
-    email_length: usize,
-    password_length: usize,
-    login_length: usize,
-    submit_hidden: ?bool,
-    submit_disabled: ?bool,
-    load_button_hidden: ?bool,
-    load_button_disabled: ?bool,
-    has_captcha_frame: bool,
-    has_verify_completed: bool,
-    has_account_verif_text: bool,
-    has_cookie_banner: bool,
-    iframe_src: ?[]const u8,
-    text_snippet: []const u8,
+    url: []const u8 = "",
+    title: []const u8 = "",
+    octocaptcha_length: usize = 0,
+    email_length: usize = 0,
+    password_length: usize = 0,
+    login_length: usize = 0,
+    submit_hidden: ?bool = null,
+    submit_disabled: ?bool = null,
+    load_button_hidden: ?bool = null,
+    load_button_disabled: ?bool = null,
+    has_captcha_frame: bool = false,
+    has_verify_completed: bool = false,
+    has_account_verif_text: bool = false,
+    has_cookie_banner: bool = false,
+    iframe_src: ?[]const u8 = null,
+    text_snippet: []const u8 = "",
 };
 
 // ---------------------------------------------------------------------------
@@ -1084,7 +1084,10 @@ pub const BrowserBridge = struct {
         self.last_diag_fingerprint = 0;
         self.last_diag_log_ns = 0;
         self.screenshot_seq = 0;
-        try self.emitDiagnosticState("bridge-enabled", true);
+        // Best-effort: if observeUiState fails (e.g. DOM not ready), log minimal state
+        self.emitDiagnosticState("bridge-enabled", true) catch {
+            std.debug.print("[BRIDGE] ⚠️ Failed to emit initial diagnostic state — DOM may not be ready yet\n", .{});
+        };
     }
 
     /// Inject harvest.js and poll for harvested token/identity data
@@ -1566,7 +1569,27 @@ pub const BrowserBridge = struct {
             return;
         }
 
-        const state = try self.observeUiState();
+        const state: BrowserUiState = self.observeUiState() catch |err| blk: {
+            std.debug.print("[BRIDGE] ⚠️ observeUiState failed ({}) — using fallback state\n", .{err});
+            break :blk BrowserUiState{
+                .url = try self.allocator.dupe(u8, "about:blank"),
+                .title = try self.allocator.dupe(u8, "CDP connected"),
+                .octocaptcha_length = 0,
+                .email_length = 0,
+                .password_length = 0,
+                .login_length = 0,
+                .submit_hidden = null,
+                .submit_disabled = null,
+                .load_button_hidden = null,
+                .load_button_disabled = null,
+                .has_captcha_frame = false,
+                .has_verify_completed = false,
+                .has_account_verif_text = false,
+                .has_cookie_banner = false,
+                .iframe_src = null,
+                .text_snippet = try self.allocator.dupe(u8, "observeUiState failed — DOM not available"),
+            };
+        };
         defer self.freeUiState(state);
         const fingerprint = self.fingerprintUiState(state);
         const changed = fingerprint != self.last_diag_fingerprint;
