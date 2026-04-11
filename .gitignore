@@ -31,3 +31,4 @@ req6_body.json
 resp6_body.json
 test_esc.zig
 test_stringify.zig
+artifacts/
