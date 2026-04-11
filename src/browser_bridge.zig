@@ -844,6 +844,112 @@ const BrowserUiState = struct {
     text_snippet: []const u8,
 };
 
+// ---------------------------------------------------------------------------
+// Browser Audit Result — structured observability for every bridge action
+// SOURCE: PRD "Full Real-Time Browser Observability System", ticket 446647de
+// ---------------------------------------------------------------------------
+
+/// Enum of all bridge action kinds for type-safe audit logging
+pub const BrowserActionKind = enum {
+    signup_start,
+    signup_submit,
+    verify_submit,
+    dismiss_blockers,
+    evaluate,
+};
+
+/// Structured audit result returned by every bridge helper function.
+/// Replaces bare `bool` / `void` returns with full provenance:
+/// what was attempted, whether it succeeded, element state before/after,
+/// screenshot path, and precise timestamp.
+pub const BrowserAuditResult = struct {
+    ok: bool = false,
+    selector: ?[]const u8 = null,
+    element_found: bool = false,
+    action_kind: BrowserActionKind = .evaluate,
+    chars_written: usize = 0,
+    state_after: ?[]const u8 = null,
+    screenshot_path: ?[]const u8 = null,
+    timestamp_ms: u64 = 0,
+    err_msg: ?[]const u8 = null,
+
+    /// Serialize this audit result to the browser-actions.ndjson file.
+    /// Must be called by the bridge after the result is fully constructed.
+    pub fn logToActions(self: *const BrowserAuditResult, bridge: *BrowserBridge) BridgeError!void {
+        const trace_dir = bridge.diagnostics_dir orelse return;
+
+        var path_buf: [1024]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/browser-actions.ndjson", .{trace_dir}) catch return error.OutOfMemory;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .APPEND = true,
+            .CLOEXEC = true,
+        }, 0o644) catch return error.WriteFailed;
+        defer _ = std.c.close(fd);
+
+        // Build JSON line manually to avoid type coercion issues
+        var line_buf = std.array_list.Managed(u8).init(bridge.allocator);
+        defer line_buf.deinit();
+
+        var tmp: [64]u8 = undefined;
+        try line_buf.appendSlice("{\"timestamp_ms\":");
+        try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{self.timestamp_ms}) catch return error.OutOfMemory);
+        try line_buf.appendSlice(",\"action\":\"");
+        try line_buf.appendSlice(@tagName(self.action_kind));
+        try line_buf.appendSlice("\",\"ok\":");
+        try line_buf.appendSlice(if (self.ok) "true" else "false");
+        try line_buf.appendSlice(",\"selector\":\"");
+        if (self.selector) |s| {
+            var esc: [512]u8 = undefined;
+            const elen = escapeJsonString(s, &esc);
+            try line_buf.appendSlice(esc[0..elen]);
+        }
+        try line_buf.appendSlice("\",\"element_found\":");
+        try line_buf.appendSlice(if (self.element_found) "true" else "false");
+        try line_buf.appendSlice(",\"chars_written\":");
+        try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{self.chars_written}) catch return error.OutOfMemory);
+        try line_buf.appendSlice(",\"state_after\":\"");
+        if (self.state_after) |s| {
+            var esc: [512]u8 = undefined;
+            const elen = escapeJsonString(s, &esc);
+            try line_buf.appendSlice(esc[0..elen]);
+        }
+        try line_buf.appendSlice("\",\"screenshot_path\":\"");
+        if (self.screenshot_path) |s| {
+            try line_buf.appendSlice(s);
+        }
+        try line_buf.appendSlice("\",\"error\":");
+        if (self.err_msg) |e| {
+            var esc: [512]u8 = undefined;
+            const elen = escapeJsonString(e, &esc);
+            try line_buf.appendSlice("\"");
+            try line_buf.appendSlice(esc[0..elen]);
+            try line_buf.appendSlice("\"");
+        } else {
+            try line_buf.appendSlice("null");
+        }
+        try line_buf.appendSlice("}\n");
+
+        try writeAll(fd, line_buf.items.ptr, line_buf.items.len);
+    }
+
+    /// Construct an error result from a Zig error
+    pub fn fromError(err: anytype, kind: BrowserActionKind, ts: u64) BrowserAuditResult {
+        return .{
+            .ok = false,
+            .action_kind = kind,
+            .timestamp_ms = ts,
+            .err_msg = @errorName(err),
+        };
+    }
+};
+comptime {
+    // BrowserAuditResult is NOT packed (contains slices and optionals).
+    // Size check for sanity: should be reasonable on 64-bit.
+    std.debug.assert(@sizeOf(BrowserAuditResult) <= 128);
+}
+
 const RuntimeEvaluateStringEnvelope = struct {
     result: struct {
         result: struct {
@@ -1058,7 +1164,7 @@ pub const BrowserBridge = struct {
         try self.cdp.enableFetchInterception("*github.com/signup?social=false*");
         defer self.cdp.disableFetchInterception() catch {};
 
-        try self.startSignupChallenge(username, email, password, country);
+        _ = try self.startSignupChallenge(username, email, password, country);
         std.debug.print("[BRIDGE] Waiting for browser-owned final signup request after visible Create account trigger...\n", .{});
 
         const paused = try self.waitForPausedRequest("/signup?social=false", REQUEST_CAPTURE_TIMEOUT_MS);
@@ -1085,7 +1191,7 @@ pub const BrowserBridge = struct {
         try self.cdp.enableFetchInterception("*account_verifications*");
         defer self.cdp.disableFetchInterception() catch {};
 
-        try self.triggerVerificationSubmit(verification_code);
+        _ = try self.triggerVerificationSubmit(verification_code);
 
         const paused = try self.waitForPausedRequest("/account_verifications", REQUEST_CAPTURE_TIMEOUT_MS);
         defer self.allocator.free(paused.request_id);
@@ -1127,7 +1233,9 @@ pub const BrowserBridge = struct {
         email: []const u8,
         password: []const u8,
         country: []const u8,
-    ) BridgeError!void {
+    ) BridgeError!BrowserAuditResult {
+        const ts = @as(u64, @intCast(currentUnixMs()));
+        const selector = "form[action=\"/signup?social=false\"]";
         var user_esc: [512]u8 = undefined;
         var email_esc: [1024]u8 = undefined;
         var pass_esc: [1024]u8 = undefined;
@@ -1136,6 +1244,7 @@ pub const BrowserBridge = struct {
         const email_len = escapeJsonString(email, &email_esc);
         const pass_len = escapeJsonString(password, &pass_esc);
         const country_len = escapeJsonString(country, &country_esc);
+        const total_chars = user_len + email_len + pass_len + country_len;
         var expr_buf: [4096]u8 = undefined;
         const expression = std.fmt.bufPrint(
             &expr_buf,
@@ -1149,16 +1258,88 @@ pub const BrowserBridge = struct {
         ) catch return error.OutOfMemory;
         const response = try self.cdp.evaluate(expression);
         defer self.allocator.free(response);
-        self.logBridgeAction("signup-start", response) catch {};
+
+        // Determine success from response
+        const ok = extractRuntimeEvaluateStringValue(self.allocator, response) catch null;
+        const result: BrowserAuditResult = if (ok) |val| blk: {
+            defer self.allocator.free(val);
+            break :blk .{
+                .ok = true,
+                .selector = selector,
+                .element_found = true,
+                .action_kind = .signup_start,
+                .chars_written = total_chars,
+                .state_after = "dispatched",
+                .screenshot_path = null,
+                .timestamp_ms = ts,
+                .err_msg = null,
+            };
+        } else .{
+            .ok = false,
+            .selector = selector,
+            .element_found = false,
+            .action_kind = .signup_start,
+            .chars_written = total_chars,
+            .state_after = "failed",
+            .screenshot_path = null,
+            .timestamp_ms = ts,
+            .err_msg = "no_response",
+        };
+
+        // Capture screenshot for audit trail
+        const trace_dir = self.diagnostics_dir;
+        if (trace_dir) |tdir| {
+            self.captureScreenshot(tdir, "signup-start") catch {};
+        }
+
+        try result.logToActions(self);
+        return result;
     }
 
-    fn finishSignupSubmit(self: *BrowserBridge) BridgeError!void {
+    fn finishSignupSubmit(self: *BrowserBridge) BridgeError!BrowserAuditResult {
+        const ts = @as(u64, @intCast(currentUnixMs()));
+        const selector = "button.js-octocaptcha-form-submit, button[data-verify-submit-button]";
         const response = try self.cdp.evaluate("window.__ghostBridge.finishSignupSubmit()");
         defer self.allocator.free(response);
-        self.logBridgeAction("signup-submit", response) catch {};
+
+        const ok = extractRuntimeEvaluateStringValue(self.allocator, response) catch null;
+        const result: BrowserAuditResult = if (ok) |val| blk: {
+            defer self.allocator.free(val);
+            break :blk .{
+                .ok = true,
+                .selector = selector,
+                .element_found = true,
+                .action_kind = .signup_submit,
+                .chars_written = 0,
+                .state_after = "submitted",
+                .screenshot_path = null,
+                .timestamp_ms = ts,
+                .err_msg = null,
+            };
+        } else .{
+            .ok = false,
+            .selector = selector,
+            .element_found = false,
+            .action_kind = .signup_submit,
+            .chars_written = 0,
+            .state_after = "failed",
+            .screenshot_path = null,
+            .timestamp_ms = ts,
+            .err_msg = "no_response",
+        };
+
+        const trace_dir = self.diagnostics_dir;
+        if (trace_dir) |tdir| {
+            self.captureScreenshot(tdir, "signup-submit") catch {};
+        }
+
+        try result.logToActions(self);
+        return result;
     }
 
-    fn triggerVerificationSubmit(self: *BrowserBridge, verification_code: []const u8) BridgeError!void {
+    fn triggerVerificationSubmit(self: *BrowserBridge, verification_code: []const u8) BridgeError!BrowserAuditResult {
+        const ts = @as(u64, @intCast(currentUnixMs()));
+        const selector = "input[name=\"verification_code\"], [data-verify-code-input]";
         var code_esc: [128]u8 = undefined;
         const code_len = escapeJsonString(verification_code, &code_esc);
         var expr_buf: [1024]u8 = undefined;
@@ -1169,19 +1350,82 @@ pub const BrowserBridge = struct {
         ) catch return error.OutOfMemory;
         const response = try self.cdp.evaluate(expression);
         defer self.allocator.free(response);
-        self.logBridgeAction("verify-submit", response) catch {};
+
+        const ok = extractRuntimeEvaluateStringValue(self.allocator, response) catch null;
+        const result: BrowserAuditResult = if (ok) |val| blk: {
+            defer self.allocator.free(val);
+            break :blk .{
+                .ok = true,
+                .selector = selector,
+                .element_found = true,
+                .action_kind = .verify_submit,
+                .chars_written = code_len,
+                .state_after = "submitted",
+                .screenshot_path = null,
+                .timestamp_ms = ts,
+                .err_msg = null,
+            };
+        } else .{
+            .ok = false,
+            .selector = selector,
+            .element_found = false,
+            .action_kind = .verify_submit,
+            .chars_written = code_len,
+            .state_after = "failed",
+            .screenshot_path = null,
+            .timestamp_ms = ts,
+            .err_msg = "no_response",
+        };
+
+        const trace_dir = self.diagnostics_dir;
+        if (trace_dir) |tdir| {
+            self.captureScreenshot(tdir, "verify-submit") catch {};
+        }
+
+        try result.logToActions(self);
+        return result;
     }
 
-    fn dismissPageBlockers(self: *BrowserBridge) BridgeError!void {
+    fn dismissPageBlockers(self: *BrowserBridge) BridgeError!BrowserAuditResult {
+        const ts = @as(u64, @intCast(currentUnixMs()));
         const response = try self.cdp.evaluate("JSON.stringify(window.__ghostBridge.dismissPageBlockers())");
         defer self.allocator.free(response);
-        self.logBridgeAction("dismiss-blockers", response) catch {};
+
+        // dismiss-blockers is best-effort; even a response means it ran
+        const ok = extractRuntimeEvaluateStringValue(self.allocator, response) catch null;
+        const result: BrowserAuditResult = if (ok) |val| blk: {
+            defer self.allocator.free(val);
+            break :blk .{
+                .ok = true,
+                .selector = "button[class*=\"dismiss\"], button[aria-label*=\"close\"], [class*=\"cookie-banner\"]",
+                .element_found = true,
+                .action_kind = .dismiss_blockers,
+                .chars_written = 0,
+                .state_after = "dismissed",
+                .screenshot_path = null,
+                .timestamp_ms = ts,
+                .err_msg = null,
+            };
+        } else .{
+            .ok = false,
+            .selector = "button[class*=\"dismiss\"], button[aria-label*=\"close\"], [class*=\"cookie-banner\"]",
+            .element_found = false,
+            .action_kind = .dismiss_blockers,
+            .chars_written = 0,
+            .state_after = "failed",
+            .screenshot_path = null,
+            .timestamp_ms = ts,
+            .err_msg = "no_response",
+        };
+
+        try result.logToActions(self);
+        return result;
     }
 
     fn waitForPausedRequest(self: *BrowserBridge, url_substring: []const u8, timeout_ms: u64) BridgeError!PausedRequestCapture {
         const start_ns = currentTimestampNs();
         while (@as(u64, @intCast(@divTrunc(currentTimestampNs() - start_ns, std.time.ns_per_ms))) < timeout_ms) {
-            self.dismissPageBlockers() catch {};
+            _ = self.dismissPageBlockers() catch {};
             self.emitDiagnosticState("request-wait", false) catch {};
             const message = self.cdp.recvMessage() catch |err| switch (err) {
                 error.ReadFailed => continue,
