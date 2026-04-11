@@ -6,6 +6,87 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-11] — Passive CDP Token Polling Watched The Wrong Session Instead Of Freezing The Real Browser Request
+
+**Hata:** BrowserBridge, `Runtime.evaluate(harvest.js)` ile `window.__ghost_token` / `window.__ghost_identity` poll ederek browser'ın anti-bot state'ini alabileceğini varsayıyordu. Gerçekte signup/risk/final POST raw motor session'ında dönüyor, Chrome tab ise ayrı session'da pasif izleyici olarak kalıyordu. Sonuç: CDP bağlantısı sağlıklı olsa bile browser tarafında üretilecek request hiç oluşmuyor ve harvest timeout veriyordu.
+
+**Kök sebep:** Yanlış source-of-truth. Anti-bot state'i token/cookie/hidden field seviyesinde browser session-bound idi, ama kod raw session ile browser session'ı ayrı tutup sadece tek bir token alanını köprülemeye çalışıyordu. Bu model ya boş token üretiyor ya da yanlış session token'ını raw POST'a takıyordu.
+
+**Kaynak:**
+- Chrome DevTools Protocol `Page.addScriptToEvaluateOnNewDocument` — frame scriptlerinden önce helper yüklenebilir
+- Chrome DevTools Protocol `Fetch.requestPaused` — browser'ın göndermeye hazır olduğu exact request request-stage'de durdurulabilir
+- Chrome DevTools Protocol `Network.setCookie` — raw response'ta dönen session cookie rotasyonu browser session'ına geri yazılabilir
+
+**Düzeltme:**
+1. Browser source-of-truth modeli kuruldu; browser artık pasif token poll etmez, gerçek signup/verify request'ini üretir.
+2. `Fetch.requestPaused` event'inden exact `url + method + headers + postData` yakalanıp `RequestBundle` olarak Zig'e taşınır.
+3. Raw motor final signup/verify POST'larını artık browser-captured bundle ile replay eder; field ordering postData string'inden, modern browser headers ise captured header map'inden gelir.
+4. Raw final signup response'unda dönen cookie rotasyonu `Network.setCookie` ile browser session'ına geri senkronize edilir; böylece `account_verifications` fazı aynı session'da devam eder.
+
+---
+
+## [2026-04-11] — Browser Diagnostics Initially Failed Before Capturing Real UI State
+
+**Hata:** Browser trace modu açıldığında motor gerçek signup UI durumunu kaydetmeden düşüyordu. Sırayla üç ayrı hata gözlendi:
+1. `Runtime.evaluate` dönüşündeki escaped JSON string elle `"value":"..."` aranarak kesiliyor, ilk escaped quote'ta kırılıyordu.
+2. `Page.captureScreenshot` cevabı 64 KB üstüne çıktığında WebSocket alıcısı `WsFrameError` veriyordu.
+3. `sendCommand()` top-level response yerine event payload içindeki nested `"id"` alanını kendi cevabı sanabiliyordu.
+
+**Kök sebep:** CDP mesajları için text-search temelli parsing kullanılması. Hem `Runtime.evaluate` envelope'u hem de WebSocket/CDP response matching'i spec'e uygun, structured parse ile ele alınmıyordu. Screenshot cevabında da RFC 6455 extended payload path'i doğru okunmuyordu.
+
+**Kaynak:**
+- Chrome DevTools Protocol — `Runtime.evaluate` JSON envelope (`id` top-level, `result.result.value` nested)
+- Chrome DevTools Protocol — `Page.captureScreenshot` base64 PNG döndürür, payload büyük olabilir
+- RFC 6455, Section 5.2 — extended payload length (`126` / `127`) framing
+- RFC 6455, Section 5.4 — message boundaries ve continuation mantığı
+
+**Düzeltme:**
+1. `Runtime.evaluate` string value extraction structured JSON parse ile yapıldı; escaped string elle kesilmiyor.
+2. WebSocket alıcısı allocator-backed `recvWsTextAlloc()` yoluna taşındı; 64 KB üstü server text frame'leri okunuyor.
+3. `sendCommand()` artık sadece top-level `id` alanını parse ediyor; event içindeki nested `context.id` response sanılmıyor.
+4. Browser observability zinciri doğrulandı: gerçek koşuda `browser.mp4`, `browser-state.ndjson` ve `shot-*.png` artefact'leri üretiliyor.
+
+---
+
+---
+
+## [2026-04-11] — GitHub HTTP/2 Transport Was Reused Across Long External Phases After Peer `close_notify`
+
+**Hata:** GitHub signup akışı ilk `GET /signup` ve risk-check'ten sonra aynı TLS/HTTP/2 transport'u Xvfb/Chrome/CDP harvest ve mailbox hazırlığı boyunca elde tutuyordu. Sonraki preflight/signup veya verify-email isteği geldiğinde peer zaten `close_notify` ile bağlantıyı kapatmış olabiliyordu. Kod bu durumu `ReadTimeout` olarak raporluyor, ardından faz doğrudan fail oluyordu.
+
+**Kök sebep:** İki katmanlı hata vardı:
+1. `receiveTlsApplicationData()` `close_notify` gördüğünde bunu temiz kapanış olarak işaretleyip üst katmana `ConnectionClosed` taşımıyor, döngü sonunda `ReadTimeout` üretiyordu.
+2. Orkestrasyon katmanı, uzun browser/mailbox fazlarından sonra GitHub transport'unun artık canlı olduğunu varsayıp aynı session state ile devam ediyordu; kapalı peer transport'u için refresh/retry yolu yoktu.
+
+**Kaynak:**
+- RFC 8446, Section 6.1 / verified errata 7303 — `close_notify` sender'ın bu connection üzerinde artık mesaj göndermeyeceğini bildirir; sonrasındaki veri yok sayılmalıdır.
+- RFC 9113, Sections 5.1 / 6.1 / 6.2 — HTTP/2 stream tamamlanması `END_STREAM` ile olur; kapanmış transport tekrar kullanılamaz, yeni connection yeni preface/SETTINGS ile başlar.
+
+**Düzeltme:**
+1. `classifyTlsAlert()` eklendi; `close_notify` artık `ReadTimeout` yerine `ConnectionClosed` semantiği üretiyor.
+2. `GitHubHttpClient.adoptHandshake()` eklendi; yeni handshake state'i alınırken cookie jar korunuyor, HTTP/2 preface state'i sıfırlanıyor.
+3. `main.zig` signup ve verify-email fazlarında `ConnectionClosed` yakalandığında yeni SYN + yeni TLS handshake başlatıp aynı GitHub client state'ine yeni transport'u bağlıyor ve isteği bir kez retry ediyor.
+
+---
+
+## [2026-04-10] — CDP WebSocket Client Frame Length Was Byte-Swapped For 16-Bit Payloads
+
+**Hata:** `CdpClient.sendWsText()` WebSocket text frame'i 126..65535 byte araligindaki payload'lar icin `frame-payload-length-16` alanini ters byte sirasi ile yaziyordu. `harvest.js` 10637 byte oldugu icin bu dal tetikleniyor, Chrome frame uzunlugunu yanlis okuyordu ve `Runtime.evaluate` cevabi gelmeden `sendCommand()` `ReadFailed` ile dusuyordu.
+
+**Kök sebep:** `payload.len` once `nativeToBig(u16, ...)` ile byte-swap ediliyor, sonra tekrar `>> 8` / `& 0xFF` ile manual ayriliyordu. Bu iki donusum birlikte little-endian hostta wire uzerine `0x7E 0x00` benzeri ters length byte'lari yazdi.
+
+**Kaynak:**
+- RFC 6455, Section 5.2 — `frame-payload-length = ( %x00-7D ) / ( %x7E frame-payload-length-16 ) / ( %x7F frame-payload-length-63 )`
+- RFC 6455, Section 5.4 — frame sinirlari garanti degildir; alici frame layout'una degil tam mesaja gore calismalidir
+- man 7 socket — `SO_RCVTIMEO` socket I/O timeout'u uygular
+
+**Düzeltme:**
+1. `sendWsText()` 16-bit payload uzunlugunu dogrudan network byte order'da yazacak sekilde duzeltildi.
+2. Regression testi eklendi: `sendWsText: 16-bit payload length is encoded in network byte order`.
+3. WebSocket socket'ine `SO_RCVTIMEO` eklendi ve `recvExact()` hata/EOF siniri debug log'landi.
+
+---
+
 ## [2026-04-10] — SYN Serializer Was Coupled To Live `TCP_INFO` Socket Telemetry
 
 **Hata:** `buildTCPSynAlloc()`, `buildTCPAckAlloc()` ve `buildTCPDataAlloc()` packet serialize ederken `getLinuxTcpInfo()` ile yeni bir TCP socket aciyor, `getsockopt(TCP_INFO)` cevabindan `window` / `wscale` turetmeye calisiyordu. Sandbox veya yetki kisitli ortamlarda bu yol `EPERM` ile patliyor ve `zig build test` kirmaya basliyordu.

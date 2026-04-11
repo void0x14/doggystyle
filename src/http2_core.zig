@@ -1,6 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
 const ascii = std.ascii;
+const browser_bundle = @import("browser_bundle.zig");
 const hpack_tables = @import("hpack_tables.zig");
 
 const Http2Error = error{
@@ -996,6 +997,71 @@ pub fn buildGitHubHeaders(
         offset += encoded_upgrade.len;
     }
 
+    std.debug.assert(offset == total_len);
+    return result;
+}
+
+fn encodeLiteralHeaderPreservingValue(
+    allocator: mem.Allocator,
+    name: []const u8,
+    value: []const u8,
+) ![]u8 {
+    const literal = LiteralHeaderFieldNeverIndexed{
+        .name_index = 0,
+        .name = name,
+        .value = value,
+    };
+    return literal.encode(allocator);
+}
+
+// SOURCE: RFC 9113, Section 8.3 — pseudo-header fields MUST appear before regular header fields.
+// SOURCE: RFC 7541, Section 6.2.3 — literal never-indexed representation preserves exact values.
+pub fn buildBrowserRequestHeaders(
+    allocator: mem.Allocator,
+    method: []const u8,
+    url: []const u8,
+    headers: []const browser_bundle.HeaderPair,
+) ![]u8 {
+    const scheme_sep = mem.indexOf(u8, url, "://") orelse return error.InvalidResponseHeaders;
+    const after_scheme = url[scheme_sep + 3 ..];
+    const path_idx = mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
+    const authority = after_scheme[0..path_idx];
+    const path = if (path_idx < after_scheme.len) after_scheme[path_idx..] else "/";
+
+    var parts = std.array_list.Managed([]u8).init(allocator);
+    defer {
+        for (parts.items) |part| allocator.free(part);
+        parts.deinit();
+    }
+
+    const method_index: u64 = if (ascii.eqlIgnoreCase(method, "GET")) 2 else 3;
+    const indexed_method = IndexedHeaderField{ .index = method_index };
+    try parts.append(try indexed_method.encode(allocator));
+
+    const indexed_scheme = IndexedHeaderField{ .index = 7 };
+    try parts.append(try indexed_scheme.encode(allocator));
+
+    const encoded_path = try encodeLiteralHeaderPreservingValue(allocator, ":path", path);
+    try parts.append(encoded_path);
+
+    const encoded_authority = try encodeLiteralHeaderPreservingValue(allocator, ":authority", authority);
+    try parts.append(encoded_authority);
+
+    for (headers) |header| {
+        // HTTP/2 pseudo-headers are reconstructed above from the request URL/method.
+        if (header.name.len > 0 and header.name[0] == ':') continue;
+        try parts.append(try encodeLiteralHeaderPreservingValue(allocator, header.name, header.value));
+    }
+
+    var total_len: usize = 0;
+    for (parts.items) |part| total_len += part.len;
+
+    const result = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+    for (parts.items) |part| {
+        @memcpy(result[offset .. offset + part.len], part);
+        offset += part.len;
+    }
     std.debug.assert(offset == total_len);
     return result;
 }
@@ -2797,4 +2863,58 @@ test "buildGitHubValidationGetHeaders: round-trip" {
     try std.testing.expectEqualStrings("https://github.com/signup", headers[7].value);
     try std.testing.expectEqualStrings("cookie", headers[8].name);
     try std.testing.expectEqualStrings("_gh_sess=test; _octo=octo; logged_in=no; tz=Europe%2FIstanbul", headers[8].value);
+}
+
+test "buildBrowserRequestHeaders: preserves regular header order from browser bundle" {
+    const allocator = std.testing.allocator;
+    var headers = try allocator.alloc(browser_bundle.HeaderPair, 4);
+    headers[0] = .{
+        .name = try allocator.dupe(u8, "user-agent"),
+        .value = try allocator.dupe(u8, "Mozilla/5.0 Test"),
+    };
+    headers[1] = .{
+        .name = try allocator.dupe(u8, "sec-fetch-site"),
+        .value = try allocator.dupe(u8, "same-origin"),
+    };
+    headers[2] = .{
+        .name = try allocator.dupe(u8, "cookie"),
+        .value = try allocator.dupe(u8, "_gh_sess=abc; _octo=def"),
+    };
+    headers[3] = .{
+        .name = try allocator.dupe(u8, "content-type"),
+        .value = try allocator.dupe(u8, "application/x-www-form-urlencoded"),
+    };
+    defer {
+        for (headers) |*header| header.deinit(allocator);
+        allocator.free(headers);
+    }
+
+    const block = try buildBrowserRequestHeaders(
+        allocator,
+        "POST",
+        "https://github.com/signup?social=false",
+        headers,
+    );
+    defer allocator.free(block);
+
+    var decoder = HpackDecoder.init(allocator);
+    defer decoder.deinit();
+
+    const decoded = try decoder.decodeHeaderBlock(allocator, block);
+    defer {
+        for (decoded) |*header| header.deinit(allocator);
+        allocator.free(decoded);
+    }
+
+    try std.testing.expectEqualStrings(":method", decoded[0].name);
+    try std.testing.expectEqualStrings("POST", decoded[0].value);
+    try std.testing.expectEqualStrings(":scheme", decoded[1].name);
+    try std.testing.expectEqualStrings(":path", decoded[2].name);
+    try std.testing.expectEqualStrings("/signup?social=false", decoded[2].value);
+    try std.testing.expectEqualStrings(":authority", decoded[3].name);
+    try std.testing.expectEqualStrings("github.com", decoded[3].value);
+    try std.testing.expectEqualStrings("user-agent", decoded[4].name);
+    try std.testing.expectEqualStrings("sec-fetch-site", decoded[5].name);
+    try std.testing.expectEqualStrings("cookie", decoded[6].name);
+    try std.testing.expectEqualStrings("content-type", decoded[7].name);
 }

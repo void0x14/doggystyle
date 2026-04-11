@@ -25,6 +25,7 @@ const std = @import("std");
 const mem = std.mem;
 const linux = std.os.linux;
 const posix = std.posix;
+const browser_bundle = @import("browser_bundle.zig");
 
 // ---------------------------------------------------------------------------
 // Error Types
@@ -58,6 +59,9 @@ pub const CDP_PORT: u16 = 9222;
 /// NOTE: Kept under typical TLS idle timeout (~20-30s) to prevent TlsAlertReceived
 pub const EXTRACTION_TIMEOUT_MS: u64 = 15000;
 
+/// Maximum time to wait for browser-generated request capture
+pub const REQUEST_CAPTURE_TIMEOUT_MS: u64 = 30000;
+
 /// Poll timeout for CDP WebSocket checking (100ms)
 /// SOURCE: man 2 poll — timeout in milliseconds
 pub const POLL_TIMEOUT_MS: i32 = 100;
@@ -67,6 +71,9 @@ pub const MAX_CDP_BUF: usize = 65536;
 
 /// Maximum buffer size for harvest.js source file
 pub const MAX_HARVEST_SIZE: usize = 65536;
+
+/// Maximum buffer size for browser_session_bridge.js source file
+pub const MAX_BRIDGE_SCRIPT_SIZE: usize = 32768;
 
 /// WebSocket opcodes
 /// SOURCE: RFC 6455, Section 5.2 — Base Framing Protocol
@@ -214,6 +221,11 @@ pub const CdpClient = struct {
 
         std.debug.print("[CDP] WebSocket connected to Chrome\n", .{});
 
+        // Set socket receive timeout for WebSocket operations
+        // SOURCE: man 7 socket — SO_RCVTIMEO prevents recvExact from blocking forever
+        const ws_timeout = std.os.linux.timeval{ .sec = 1, .usec = 0 };
+        _ = std.os.linux.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, @ptrCast(&ws_timeout), @sizeOf(std.os.linux.timeval));
+
         return .{
             .fd = fd,
             .allocator = allocator,
@@ -246,19 +258,14 @@ pub const CdpClient = struct {
         try self.sendWsText(msg);
 
         // Read response (match message id)
-        var recv_buf: [MAX_CDP_BUF]u8 = undefined;
         while (true) {
-            const response = try self.recvWsText(&recv_buf);
-            // Check if this response matches our message id
-            const id_marker = "\"id\":";
-            const id_idx = mem.indexOf(u8, response, id_marker) orelse continue;
-            const id_start = id_idx + id_marker.len;
-            const id_end = mem.indexOfAnyPos(u8, response, id_start, ",}") orelse continue;
-            const id_str = response[id_start..id_end];
-            const resp_id = std.fmt.parseInt(u32, id_str, 10) catch continue;
-            if (resp_id == self.msg_id) {
-                return self.allocator.dupe(u8, response);
+            const response = try self.recvWsTextAlloc();
+            if (extractTopLevelMessageId(self.allocator, response)) |resp_id| {
+                if (resp_id == self.msg_id) {
+                    return response;
+                }
             }
+            self.allocator.free(response);
         }
     }
 
@@ -274,10 +281,111 @@ pub const CdpClient = struct {
             &params_buf,
             "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true}}",
             .{expr_escaped[0..escaped_len]},
-        ) catch return error.OutOfMemory;
+        ) catch {
+            std.debug.print("[CDP] evaluate: params bufPrint failed (expr_len={d}, escaped_len={d})\n", .{ expression.len, escaped_len });
+            return error.OutOfMemory;
+        };
 
-        const response = try self.sendCommand("Runtime.evaluate", params);
+        std.debug.print("[CDP] evaluate: sending Runtime.evaluate (expr_len={d}, params_len={d})\n", .{ expression.len, params.len });
+        const response = self.sendCommand("Runtime.evaluate", params) catch |err| {
+            std.debug.print("[CDP] evaluate: sendCommand failed: {}\n", .{err});
+            return err;
+        };
+        std.debug.print("[CDP] evaluate: got response ({d} bytes)\n", .{response.len});
         return response;
+    }
+
+    // SOURCE: Chrome DevTools Protocol Page.addScriptToEvaluateOnNewDocument — evaluate before frame scripts.
+    pub fn addScriptOnNewDocument(self: *CdpClient, source: []const u8) !void {
+        var source_escaped: [MAX_CDP_BUF]u8 = undefined;
+        const escaped_len = escapeJsonString(source, &source_escaped);
+        var params_buf: [MAX_CDP_BUF]u8 = undefined;
+        const params = std.fmt.bufPrint(
+            &params_buf,
+            "{{\"source\":\"{s}\"}}",
+            .{source_escaped[0..escaped_len]},
+        ) catch return error.OutOfMemory;
+        const response = try self.sendCommand("Page.addScriptToEvaluateOnNewDocument", params);
+        defer self.allocator.free(response);
+    }
+
+    // SOURCE: Chrome DevTools Protocol Page.reload — reload the inspected page.
+    pub fn reloadPage(self: *CdpClient) !void {
+        const response = try self.sendCommand("Page.reload", "{}");
+        defer self.allocator.free(response);
+    }
+
+    // SOURCE: Chrome DevTools Protocol Page.navigate — navigate the inspected page to a URL.
+    pub fn navigatePage(self: *CdpClient, url: []const u8) !void {
+        var url_escaped: [2048]u8 = undefined;
+        const escaped_len = escapeJsonString(url, &url_escaped);
+        var params_buf: [4096]u8 = undefined;
+        const params = std.fmt.bufPrint(
+            &params_buf,
+            "{{\"url\":\"{s}\"}}",
+            .{url_escaped[0..escaped_len]},
+        ) catch return error.OutOfMemory;
+        const response = try self.sendCommand("Page.navigate", params);
+        defer self.allocator.free(response);
+    }
+
+    // SOURCE: Chrome DevTools Protocol Fetch.enable — pause matching requests at request stage.
+    pub fn enableFetchInterception(self: *CdpClient, url_pattern: []const u8) !void {
+        var pattern_escaped: [1024]u8 = undefined;
+        const escaped_len = escapeJsonString(url_pattern, &pattern_escaped);
+        var params_buf: [4096]u8 = undefined;
+        const params = std.fmt.bufPrint(
+            &params_buf,
+            "{{\"patterns\":[{{\"urlPattern\":\"{s}\",\"requestStage\":\"Request\"}}]}}",
+            .{pattern_escaped[0..escaped_len]},
+        ) catch return error.OutOfMemory;
+        const response = try self.sendCommand("Fetch.enable", params);
+        defer self.allocator.free(response);
+    }
+
+    pub fn disableFetchInterception(self: *CdpClient) !void {
+        const response = try self.sendCommand("Fetch.disable", "{}");
+        defer self.allocator.free(response);
+    }
+
+    // SOURCE: Chrome DevTools Protocol Fetch.failRequest — abort paused browser request.
+    pub fn failPausedRequest(self: *CdpClient, request_id: []const u8) !void {
+        var reqid_escaped: [1024]u8 = undefined;
+        const escaped_len = escapeJsonString(request_id, &reqid_escaped);
+        var params_buf: [2048]u8 = undefined;
+        const params = std.fmt.bufPrint(
+            &params_buf,
+            "{{\"requestId\":\"{s}\",\"errorReason\":\"Aborted\"}}",
+            .{reqid_escaped[0..escaped_len]},
+        ) catch return error.OutOfMemory;
+        const response = try self.sendCommand("Fetch.failRequest", params);
+        defer self.allocator.free(response);
+    }
+
+    // SOURCE: Chrome DevTools Protocol Network.setCookie — set browser cookie for a URL-derived scope.
+    pub fn setCookie(self: *CdpClient, name: []const u8, value: []const u8, url: []const u8) !void {
+        var name_esc: [512]u8 = undefined;
+        var value_esc: [2048]u8 = undefined;
+        var url_esc: [1024]u8 = undefined;
+        const name_len = escapeJsonString(name, &name_esc);
+        const value_len = escapeJsonString(value, &value_esc);
+        const url_len = escapeJsonString(url, &url_esc);
+        var params_buf: [4096]u8 = undefined;
+        const params = std.fmt.bufPrint(
+            &params_buf,
+            "{{\"name\":\"{s}\",\"value\":\"{s}\",\"url\":\"{s}\"}}",
+            .{
+                name_esc[0..name_len],
+                value_esc[0..value_len],
+                url_esc[0..url_len],
+            },
+        ) catch return error.OutOfMemory;
+        const response = try self.sendCommand("Network.setCookie", params);
+        defer self.allocator.free(response);
+    }
+
+    fn recvMessage(self: *CdpClient) ![]u8 {
+        return self.recvWsTextAlloc();
     }
 
     /// Send a WebSocket text frame
@@ -299,9 +407,9 @@ pub const CdpClient = struct {
             header_len = 2;
         } else if (payload.len <= 65535) {
             header_buf[1] = WS_MASK_BIT | 126;
-            const len_be = std.mem.nativeToBig(u16, @as(u16, @intCast(payload.len)));
-            header_buf[2] = @intCast(len_be >> 8);
-            header_buf[3] = @intCast(len_be & 0xFF);
+            const payload_len_u16: u16 = @intCast(payload.len);
+            header_buf[2] = @intCast(payload_len_u16 >> 8);
+            header_buf[3] = @intCast(payload_len_u16 & 0xFF);
             header_len = 4;
         } else {
             header_buf[1] = WS_MASK_BIT | 127;
@@ -331,7 +439,7 @@ pub const CdpClient = struct {
 
     /// Receive a WebSocket text frame and return the payload
     /// SOURCE: RFC 6455, Section 5.2 — Base framing protocol (server→client, no mask)
-    fn recvWsText(self: *CdpClient, buf: []u8) ![]u8 {
+    fn recvWsTextAlloc(self: *CdpClient) ![]u8 {
         // Read frame header (at least 2 bytes)
         var header: [2]u8 = undefined;
         _ = try recvExact(self.fd, &header);
@@ -357,9 +465,8 @@ pub const CdpClient = struct {
         // Server frames are NOT masked (MASK bit should be 0)
         // SOURCE: RFC 6455, Section 5.3 — server-to-client frames are NOT masked
 
-        // Read payload
-        if (payload_len > buf.len) return error.WsFrameError;
-        const payload = buf[0..payload_len];
+        const payload = try self.allocator.alloc(u8, payload_len);
+        errdefer self.allocator.free(payload);
         _ = try recvExact(self.fd, payload);
 
         // Handle close frame
@@ -473,14 +580,16 @@ pub const CdpClient = struct {
         const body = resp_buf[body_start + 4 .. total];
 
         std.debug.print("[CDP] /json response: {d} bytes, body: {d} bytes\n", .{ total, body.len });
-        const body_preview = @min(body.len, 500);
+        const body_preview = @min(body.len, 1500);
         std.debug.print("[CDP] Body preview: {s}\n", .{body[0..body_preview]});
 
         // Parse JSON array of tab objects
         // Look for "webSocketDebuggerUrl" and "url" fields
         // Minimal JSON parsing: find the tab with matching URL prefix
-        const ws_key = "\"webSocketDebuggerUrl\":\"";
-        const url_key = "\"url\":\"";
+        // NOTE: CDP JSON includes spaces after colons: "url": "https://..."
+        // We search for the key with space flexibility
+        const ws_key = "\"webSocketDebuggerUrl\": \"";
+        const url_key = "\"url\": \"";
 
         var idx: usize = 0;
         while (idx < body.len) {
@@ -546,11 +655,87 @@ fn writeAll(fd: i32, data: [*]const u8, len: usize) !void {
 fn recvExact(fd: i32, buf: []u8) ![]u8 {
     var total: usize = 0;
     while (total < buf.len) {
-        const n = std.posix.read(fd, buf[total..]) catch return error.ReadFailed;
-        if (n == 0) return error.ReadFailed;
+        const n = std.posix.read(fd, buf[total..]) catch |err| {
+            std.debug.print("[CDP] recvExact: read failed after {d}/{d} bytes: {}\n", .{ total, buf.len, err });
+            return error.ReadFailed;
+        };
+        if (n == 0) {
+            std.debug.print("[CDP] recvExact: EOF after {d}/{d} bytes\n", .{ total, buf.len });
+            return error.ReadFailed;
+        }
         total += n;
     }
     return buf;
+}
+
+fn currentTimestampNs() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+}
+
+fn currentUnixMs() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    return (@as(i64, @intCast(ts.sec)) * 1000) + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
+fn parseFetchRequestPaused(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+) !PausedRequestCapture {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, message, .{}) catch return error.ParseFailed;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return error.ParseFailed;
+    const method_value = root.object.get("method") orelse return error.ParseFailed;
+    if (method_value != .string or !mem.eql(u8, method_value.string, "Fetch.requestPaused")) {
+        return error.ParseFailed;
+    }
+
+    const params_value = root.object.get("params") orelse return error.ParseFailed;
+    if (params_value != .object) return error.ParseFailed;
+    if (params_value.object.get("responseStatusCode") != null) return error.ParseFailed;
+
+    const request_id_value = params_value.object.get("requestId") orelse return error.ParseFailed;
+    if (request_id_value != .string) return error.ParseFailed;
+
+    const request_value = params_value.object.get("request") orelse return error.ParseFailed;
+    if (request_value != .object) return error.ParseFailed;
+
+    const url_value = request_value.object.get("url") orelse return error.ParseFailed;
+    const req_method_value = request_value.object.get("method") orelse return error.ParseFailed;
+    const headers_value = request_value.object.get("headers") orelse return error.ParseFailed;
+    if (url_value != .string or req_method_value != .string or headers_value != .object) return error.ParseFailed;
+
+    var headers = try allocator.alloc(browser_bundle.HeaderPair, headers_value.object.count());
+    errdefer allocator.free(headers);
+    var header_iter = headers_value.object.iterator();
+    var header_count: usize = 0;
+    while (header_iter.next()) |entry| {
+        if (entry.value_ptr.* != .string) return error.ParseFailed;
+        headers[header_count] = .{
+            .name = try allocator.dupe(u8, entry.key_ptr.*),
+            .value = try allocator.dupe(u8, entry.value_ptr.*.string),
+        };
+        header_count += 1;
+    }
+
+    const post_data = if (request_value.object.get("postData")) |pd| blk: {
+        if (pd != .string) return error.ParseFailed;
+        break :blk try allocator.dupe(u8, pd.string);
+    } else try allocator.dupe(u8, "");
+
+    return .{
+        .request_id = try allocator.dupe(u8, request_id_value.string),
+        .bundle = .{
+            .url = try allocator.dupe(u8, url_value.string),
+            .method = try allocator.dupe(u8, req_method_value.string),
+            .post_data = post_data,
+            .headers = headers[0..header_count],
+        },
+    };
 }
 
 /// Parse IPv4 address string (e.g., "127.0.0.1") into network-byte-order u32
@@ -597,9 +782,80 @@ fn escapeJsonString(input: []const u8, output: []u8) usize {
     return out_idx;
 }
 
+fn readBrowserSessionBridgeScript(buf: []u8) ![]u8 {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "src/browser_session_bridge.js", .{ .ACCMODE = .RDONLY }, 0) catch
+        return error.ReadFailed;
+    defer _ = std.c.close(fd);
+
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.posix.read(fd, buf[total..]) catch return error.ReadFailed;
+        if (n == 0) break;
+        total += n;
+    }
+    return buf[0..total];
+}
+
+fn sanitizeTraceLabel(label: []const u8, buf: []u8) []const u8 {
+    var len: usize = 0;
+    for (label) |ch| {
+        if (len >= buf.len) break;
+        buf[len] = if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_') ch else '_';
+        len += 1;
+    }
+    if (len == 0) {
+        buf[0] = 'x';
+        return buf[0..1];
+    }
+    return buf[0..len];
+}
+
 // ---------------------------------------------------------------------------
 // Harvested Data Structures
 // ---------------------------------------------------------------------------
+
+const PausedRequestCapture = struct {
+    request_id: []u8,
+    bundle: browser_bundle.RequestBundle,
+
+    fn deinit(self: *const PausedRequestCapture, allocator: std.mem.Allocator) void {
+        allocator.free(self.request_id);
+        var bundle = self.bundle;
+        bundle.deinit(allocator);
+    }
+};
+
+const BrowserUiState = struct {
+    url: []const u8,
+    title: []const u8,
+    octocaptcha_length: usize,
+    email_length: usize,
+    password_length: usize,
+    login_length: usize,
+    submit_hidden: ?bool,
+    submit_disabled: ?bool,
+    load_button_hidden: ?bool,
+    load_button_disabled: ?bool,
+    has_captcha_frame: bool,
+    has_verify_completed: bool,
+    has_account_verif_text: bool,
+    has_cookie_banner: bool,
+    iframe_src: ?[]const u8,
+    text_snippet: []const u8,
+};
+
+const RuntimeEvaluateStringEnvelope = struct {
+    result: struct {
+        result: struct {
+            type: []const u8,
+            value: []const u8,
+        },
+    },
+};
+
+const TopLevelMessageIdEnvelope = struct {
+    id: ?u32 = null,
+};
 
 /// Captured Arkose token data from Chrome stdout
 /// SOURCE: harvest.js GHOST_TOKEN: prefix format
@@ -660,6 +916,11 @@ pub const BrowserBridge = struct {
     cdp: CdpClient,
     result: HarvestResult = .{},
     start_time_ns: i64 = 0,
+    diagnostics_dir: ?[]u8 = null,
+    last_diag_fingerprint: u64 = 0,
+    last_diag_log_ns: i64 = 0,
+    screenshot_seq: usize = 0,
+    latest_screenshot_name: ?[]u8 = null,
 
     /// Initialize bridge by connecting to Chrome's CDP WebSocket
     ///
@@ -695,11 +956,29 @@ pub const BrowserBridge = struct {
             return BridgeError.ConnectFailed;
         }
 
+        var bridge_script_buf: [MAX_BRIDGE_SCRIPT_SIZE]u8 = undefined;
+        const bridge_script = readBrowserSessionBridgeScript(&bridge_script_buf) catch return BridgeError.ReadFailed;
+        try cdp.addScriptOnNewDocument(bridge_script);
+        try cdp.reloadPage();
+
         return BrowserBridge{
             .allocator = allocator,
             .cdp = cdp,
             .start_time_ns = now_ns,
         };
+    }
+
+    pub fn enableDiagnostics(self: *BrowserBridge, trace_dir: []const u8) BridgeError!void {
+        if (self.diagnostics_dir) |existing| self.allocator.free(existing);
+        if (self.latest_screenshot_name) |existing| {
+            self.allocator.free(existing);
+            self.latest_screenshot_name = null;
+        }
+        self.diagnostics_dir = try self.allocator.dupe(u8, trace_dir);
+        self.last_diag_fingerprint = 0;
+        self.last_diag_log_ns = 0;
+        self.screenshot_seq = 0;
+        try self.emitDiagnosticState("bridge-enabled", true);
     }
 
     /// Inject harvest.js and poll for harvested token/identity data
@@ -765,27 +1044,468 @@ pub const BrowserBridge = struct {
         return self.result;
     }
 
+    pub fn captureSignupBundle(
+        self: *BrowserBridge,
+        username: []const u8,
+        email: []const u8,
+        password: []const u8,
+        country: []const u8,
+    ) BridgeError!browser_bundle.SignupBundle {
+        try self.waitForTruthyExpression(
+            "document.readyState === 'complete' && !!document.querySelector('form[action=\"/signup?social=false\"]')",
+            REQUEST_CAPTURE_TIMEOUT_MS,
+        );
+        try self.cdp.enableFetchInterception("*github.com/signup?social=false*");
+        defer self.cdp.disableFetchInterception() catch {};
+
+        try self.startSignupChallenge(username, email, password, country);
+        std.debug.print("[BRIDGE] Waiting for browser-owned final signup request after visible Create account trigger...\n", .{});
+
+        const paused = try self.waitForPausedRequest("/signup?social=false", REQUEST_CAPTURE_TIMEOUT_MS);
+        defer self.allocator.free(paused.request_id);
+        try self.cdp.failPausedRequest(paused.request_id);
+
+        std.debug.print("[BRIDGE] Signup bundle captured: url={s}, method={s}, body={d} bytes\n", .{
+            paused.bundle.url,
+            paused.bundle.method,
+            paused.bundle.post_data.len,
+        });
+        if (paused.bundle.headerValue("cookie")) |cookie| {
+            std.debug.print("[BRIDGE] Signup bundle cookie header: {d} bytes\n", .{cookie.len});
+        }
+
+        return .{ .request = paused.bundle };
+    }
+
+    pub fn captureVerifyBundle(self: *BrowserBridge, verification_code: []const u8) BridgeError!browser_bundle.VerifyBundle {
+        try self.waitForTruthyExpression(
+            "location.pathname.includes('/account_verifications') && !!document.querySelector('form')",
+            REQUEST_CAPTURE_TIMEOUT_MS,
+        );
+        try self.cdp.enableFetchInterception("*account_verifications*");
+        defer self.cdp.disableFetchInterception() catch {};
+
+        try self.triggerVerificationSubmit(verification_code);
+
+        const paused = try self.waitForPausedRequest("/account_verifications", REQUEST_CAPTURE_TIMEOUT_MS);
+        defer self.allocator.free(paused.request_id);
+        try self.cdp.failPausedRequest(paused.request_id);
+
+        std.debug.print("[BRIDGE] Verify bundle captured: url={s}, method={s}, body={d} bytes\n", .{
+            paused.bundle.url,
+            paused.bundle.method,
+            paused.bundle.post_data.len,
+        });
+
+        return .{ .request = paused.bundle };
+    }
+
+    pub fn navigateToAccountVerifications(self: *BrowserBridge) BridgeError!void {
+        try self.cdp.navigatePage("https://github.com/account_verifications");
+        try self.waitForTruthyExpression(
+            "location.pathname.includes('/account_verifications')",
+            REQUEST_CAPTURE_TIMEOUT_MS,
+        );
+    }
+
+    pub fn syncGitHubCookies(
+        self: *BrowserBridge,
+        user_session: ?[]const u8,
+        host_user_session: ?[]const u8,
+        gh_sess: ?[]const u8,
+        octo: ?[]const u8,
+    ) BridgeError!void {
+        if (user_session) |value| try self.cdp.setCookie("user_session", value, "https://github.com/");
+        if (host_user_session) |value| try self.cdp.setCookie("__Host-user_session_same_site", value, "https://github.com/");
+        if (gh_sess) |value| try self.cdp.setCookie("_gh_sess", value, "https://github.com/");
+        if (octo) |value| try self.cdp.setCookie("_octo", value, "https://github.com/");
+    }
+
+    fn startSignupChallenge(
+        self: *BrowserBridge,
+        username: []const u8,
+        email: []const u8,
+        password: []const u8,
+        country: []const u8,
+    ) BridgeError!void {
+        var user_esc: [512]u8 = undefined;
+        var email_esc: [1024]u8 = undefined;
+        var pass_esc: [1024]u8 = undefined;
+        var country_esc: [128]u8 = undefined;
+        const user_len = escapeJsonString(username, &user_esc);
+        const email_len = escapeJsonString(email, &email_esc);
+        const pass_len = escapeJsonString(password, &pass_esc);
+        const country_len = escapeJsonString(country, &country_esc);
+        var expr_buf: [4096]u8 = undefined;
+        const expression = std.fmt.bufPrint(
+            &expr_buf,
+            "window.__ghostBridge.startSignupChallenge({{\"username\":\"{s}\",\"email\":\"{s}\",\"password\":\"{s}\",\"country\":\"{s}\"}})",
+            .{
+                user_esc[0..user_len],
+                email_esc[0..email_len],
+                pass_esc[0..pass_len],
+                country_esc[0..country_len],
+            },
+        ) catch return error.OutOfMemory;
+        const response = try self.cdp.evaluate(expression);
+        defer self.allocator.free(response);
+        self.logBridgeAction("signup-start", response) catch {};
+    }
+
+    fn finishSignupSubmit(self: *BrowserBridge) BridgeError!void {
+        const response = try self.cdp.evaluate("window.__ghostBridge.finishSignupSubmit()");
+        defer self.allocator.free(response);
+        self.logBridgeAction("signup-submit", response) catch {};
+    }
+
+    fn triggerVerificationSubmit(self: *BrowserBridge, verification_code: []const u8) BridgeError!void {
+        var code_esc: [128]u8 = undefined;
+        const code_len = escapeJsonString(verification_code, &code_esc);
+        var expr_buf: [1024]u8 = undefined;
+        const expression = std.fmt.bufPrint(
+            &expr_buf,
+            "window.__ghostBridge.submitVerification({{\"code\":\"{s}\"}})",
+            .{code_esc[0..code_len]},
+        ) catch return error.OutOfMemory;
+        const response = try self.cdp.evaluate(expression);
+        defer self.allocator.free(response);
+        self.logBridgeAction("verify-submit", response) catch {};
+    }
+
+    fn dismissPageBlockers(self: *BrowserBridge) BridgeError!void {
+        const response = try self.cdp.evaluate("JSON.stringify(window.__ghostBridge.dismissPageBlockers())");
+        defer self.allocator.free(response);
+        self.logBridgeAction("dismiss-blockers", response) catch {};
+    }
+
+    fn waitForPausedRequest(self: *BrowserBridge, url_substring: []const u8, timeout_ms: u64) BridgeError!PausedRequestCapture {
+        const start_ns = currentTimestampNs();
+        while (@as(u64, @intCast(@divTrunc(currentTimestampNs() - start_ns, std.time.ns_per_ms))) < timeout_ms) {
+            self.dismissPageBlockers() catch {};
+            self.emitDiagnosticState("request-wait", false) catch {};
+            const message = self.cdp.recvMessage() catch |err| switch (err) {
+                error.ReadFailed => continue,
+                else => return err,
+            };
+            defer self.allocator.free(message);
+            const paused = parseFetchRequestPaused(self.allocator, message) catch |err| switch (err) {
+                error.ParseFailed => continue,
+                else => return err,
+            };
+            if (mem.indexOf(u8, paused.bundle.url, url_substring) != null) {
+                return paused;
+            }
+            paused.deinit(self.allocator);
+        }
+        self.logSignupBrowserState() catch {};
+        return BridgeError.Timeout;
+    }
+
+    fn waitForTruthyExpression(self: *BrowserBridge, expression: []const u8, timeout_ms: u64) BridgeError!void {
+        const start_ns = currentTimestampNs();
+        while (@as(u64, @intCast(@divTrunc(currentTimestampNs() - start_ns, std.time.ns_per_ms))) < timeout_ms) {
+            try self.emitDiagnosticState("wait-loop", false);
+            const response = self.cdp.evaluate(expression) catch {
+                const sleep_req = std.os.linux.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+                _ = std.os.linux.nanosleep(&sleep_req, null);
+                continue;
+            };
+            defer self.allocator.free(response);
+            if (mem.indexOf(u8, response, "\"value\":true") != null) return;
+
+            const sleep_req = std.os.linux.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+            _ = std.os.linux.nanosleep(&sleep_req, null);
+        }
+        self.logSignupBrowserState() catch {};
+        return BridgeError.Timeout;
+    }
+
+    fn logSignupBrowserState(self: *BrowserBridge) BridgeError!void {
+        try self.emitDiagnosticState("timeout", true);
+    }
+
+    fn emitDiagnosticState(self: *BrowserBridge, label: []const u8, force_screenshot: bool) BridgeError!void {
+        const trace_dir = self.diagnostics_dir orelse return;
+        const now_ns = currentTimestampNs();
+        if (!force_screenshot and self.last_diag_log_ns != 0 and now_ns - self.last_diag_log_ns < std.time.ns_per_s) {
+            return;
+        }
+
+        const state = try self.observeUiState();
+        defer self.freeUiState(state);
+        const fingerprint = self.fingerprintUiState(state);
+        const changed = fingerprint != self.last_diag_fingerprint;
+        self.last_diag_fingerprint = fingerprint;
+        self.last_diag_log_ns = now_ns;
+        const timestamp_ms = currentUnixMs();
+
+        std.debug.print(
+            "[BRIDGE][{s}][{d}] url={s} title={s} token_len={d} email_len={d} password_len={d} login_len={d} load_hidden={any} load_disabled={any} submit_hidden={any} submit_disabled={any} captcha_frame={} verify_completed={} account_verif={} cookie_banner={} iframe={s}\n",
+            .{
+                label,
+                timestamp_ms,
+                state.url,
+                state.title,
+                state.octocaptcha_length,
+                state.email_length,
+                state.password_length,
+                state.login_length,
+                state.load_button_hidden,
+                state.load_button_disabled,
+                state.submit_hidden,
+                state.submit_disabled,
+                state.has_captcha_frame,
+                state.has_verify_completed,
+                state.has_account_verif_text,
+                state.has_cookie_banner,
+                state.iframe_src orelse "",
+            },
+        );
+
+        try self.appendDiagnosticLine(trace_dir, label, timestamp_ms, state);
+        if (force_screenshot or changed) {
+            try self.captureScreenshot(trace_dir, label);
+        }
+        try self.writeLiveView(trace_dir, label, timestamp_ms, state);
+    }
+
+    fn observeUiState(self: *BrowserBridge) BridgeError!BrowserUiState {
+        const expression =
+            "JSON.stringify((() => { const token = document.querySelector('input[name=\"octocaptcha-token\"]'); const submit = document.querySelector('button.js-octocaptcha-form-submit'); const load = document.querySelector('button.js-octocaptcha-load-captcha'); const email = document.querySelector('input[name=\"user[email]\"]'); const password = document.querySelector('input[name=\"user[password]\"]'); const login = document.querySelector('input[name=\"user[login]\"]'); const captcha = document.querySelector('iframe[src*=\"octocaptcha\"], iframe[src*=\"arkose\"], iframe[title*=\"captcha\"]'); const text = document.body.innerText || ''; const buttons = Array.from(document.querySelectorAll('button,input[type=\"button\"],input[type=\"submit\"]')).map((el) => (el.textContent || el.value || el.getAttribute('aria-label') || '').trim()).filter(Boolean); return { url: location.href, title: document.title || '', octocaptcha_length: token?.value?.length || 0, email_length: email?.value?.length || 0, password_length: password?.value?.length || 0, login_length: login?.value?.length || 0, submit_hidden: submit ? !!submit.hidden : null, submit_disabled: submit ? !!submit.disabled : null, load_button_hidden: load ? !!load.hidden : null, load_button_disabled: load ? !!load.disabled : null, has_captcha_frame: !!captcha, has_verify_completed: /verify completed|verification completed/i.test(text), has_account_verif_text: /account verification|verify your account|enter code|verification code/i.test(text), has_cookie_banner: /how to manage cookie preferences|manage cookies|privacy statement/i.test(text) || buttons.some((value) => /accept all cookies|accept all|manage cookies|reject/i.test(value)), iframe_src: captcha?.src || null, text_snippet: text.slice(0, 240) }; })())";
+        const response = try self.cdp.evaluate(expression);
+        defer self.allocator.free(response);
+
+        var parsed = parseBrowserUiStateFromEvaluateResponse(self.allocator, response) catch return error.ParseFailed;
+        defer parsed.deinit();
+        return .{
+            .url = try self.allocator.dupe(u8, parsed.value.url),
+            .title = try self.allocator.dupe(u8, parsed.value.title),
+            .octocaptcha_length = parsed.value.octocaptcha_length,
+            .email_length = parsed.value.email_length,
+            .password_length = parsed.value.password_length,
+            .login_length = parsed.value.login_length,
+            .submit_hidden = parsed.value.submit_hidden,
+            .submit_disabled = parsed.value.submit_disabled,
+            .load_button_hidden = parsed.value.load_button_hidden,
+            .load_button_disabled = parsed.value.load_button_disabled,
+            .has_captcha_frame = parsed.value.has_captcha_frame,
+            .has_verify_completed = parsed.value.has_verify_completed,
+            .has_account_verif_text = parsed.value.has_account_verif_text,
+            .has_cookie_banner = parsed.value.has_cookie_banner,
+            .iframe_src = if (parsed.value.iframe_src) |src| try self.allocator.dupe(u8, src) else null,
+            .text_snippet = try self.allocator.dupe(u8, parsed.value.text_snippet),
+        };
+    }
+
+    fn fingerprintUiState(self: *BrowserBridge, state: BrowserUiState) u64 {
+        _ = self;
+        return std.hash.Wyhash.hash(0, state.url) ^
+            std.hash.Wyhash.hash(1, state.title) ^
+            std.hash.Wyhash.hash(2, state.text_snippet) ^
+            @as(u64, state.octocaptcha_length);
+    }
+
+    fn freeUiState(self: *BrowserBridge, state: BrowserUiState) void {
+        self.allocator.free(state.url);
+        self.allocator.free(state.title);
+        if (state.iframe_src) |src| self.allocator.free(src);
+        self.allocator.free(state.text_snippet);
+    }
+
+    fn appendDiagnosticLine(self: *BrowserBridge, trace_dir: []const u8, label: []const u8, timestamp_ms: i64, state: BrowserUiState) BridgeError!void {
+        var path_buf: [1024]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/browser-state.ndjson", .{trace_dir}) catch return error.OutOfMemory;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .APPEND = true,
+            .CLOEXEC = true,
+        }, 0o644) catch return error.WriteFailed;
+        defer _ = std.c.close(fd);
+
+        var line_buf = std.array_list.Managed(u8).init(self.allocator);
+        defer line_buf.deinit();
+        var label_esc: [128]u8 = undefined;
+        var url_esc: [2048]u8 = undefined;
+        var title_esc: [512]u8 = undefined;
+        var iframe_esc: [2048]u8 = undefined;
+        var text_esc: [1024]u8 = undefined;
+        const label_len = escapeJsonString(label, &label_esc);
+        const url_len = escapeJsonString(state.url, &url_esc);
+        const title_len = escapeJsonString(state.title, &title_esc);
+        const iframe_len = escapeJsonString(state.iframe_src orelse "", &iframe_esc);
+        const text_len = escapeJsonString(state.text_snippet, &text_esc);
+        const line = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"label\":\"{s}\",\"timestamp_ms\":{d},\"url\":\"{s}\",\"title\":\"{s}\",\"octocaptcha_length\":{d},\"email_length\":{d},\"password_length\":{d},\"login_length\":{d},\"submit_hidden\":{any},\"submit_disabled\":{any},\"load_button_hidden\":{any},\"load_button_disabled\":{any},\"has_captcha_frame\":{},\"has_verify_completed\":{},\"has_account_verif_text\":{},\"has_cookie_banner\":{},\"iframe_src\":\"{s}\",\"text_snippet\":\"{s}\"}}\n",
+            .{
+                label_esc[0..label_len],
+                timestamp_ms,
+                url_esc[0..url_len],
+                title_esc[0..title_len],
+                state.octocaptcha_length,
+                state.email_length,
+                state.password_length,
+                state.login_length,
+                state.submit_hidden,
+                state.submit_disabled,
+                state.load_button_hidden,
+                state.load_button_disabled,
+                state.has_captcha_frame,
+                state.has_verify_completed,
+                state.has_account_verif_text,
+                state.has_cookie_banner,
+                iframe_esc[0..iframe_len],
+                text_esc[0..text_len],
+            },
+        );
+        defer self.allocator.free(line);
+        try line_buf.appendSlice(line);
+        try writeAll(fd, line_buf.items.ptr, line_buf.items.len);
+    }
+
+    fn captureScreenshot(self: *BrowserBridge, trace_dir: []const u8, label: []const u8) BridgeError!void {
+        const response = try self.cdp.sendCommand("Page.captureScreenshot", "{\"format\":\"png\"}");
+        defer self.allocator.free(response);
+
+        const data_marker = "\"data\":\"";
+        const data_idx = mem.indexOf(u8, response, data_marker) orelse return error.ParseFailed;
+        const data_start = data_idx + data_marker.len;
+        const data_end = mem.indexOfScalarPos(u8, response, data_start, '"') orelse return error.ParseFailed;
+        const b64 = response[data_start..data_end];
+
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(b64) catch return error.ParseFailed;
+        const png = try self.allocator.alloc(u8, decoded_len);
+        defer self.allocator.free(png);
+        _ = decoder.decode(png, b64) catch return error.ParseFailed;
+
+        var safe_label_buf: [64]u8 = undefined;
+        const safe_label = sanitizeTraceLabel(label, &safe_label_buf);
+        var path_buf: [1024]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/shot-{d:0>4}-{s}.png", .{
+            trace_dir,
+            self.screenshot_seq,
+            safe_label,
+        }) catch return error.OutOfMemory;
+        self.screenshot_seq += 1;
+        if (self.latest_screenshot_name) |existing| self.allocator.free(existing);
+        self.latest_screenshot_name = self.allocator.dupe(u8, path[path.len - (safe_label.len + 14)..]) catch null;
+
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        }, 0o644) catch return error.WriteFailed;
+        defer _ = std.c.close(fd);
+        try writeAll(fd, png.ptr, png.len);
+    }
+
+    fn writeLiveView(self: *BrowserBridge, trace_dir: []const u8, label: []const u8, timestamp_ms: i64, state: BrowserUiState) BridgeError!void {
+        var path_buf: [1024]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/live-view.html", .{trace_dir}) catch return error.OutOfMemory;
+        const screenshot_name = self.latest_screenshot_name orelse "";
+        var text_esc: [1024]u8 = undefined;
+        const text_len = escapeJsonString(state.text_snippet, &text_esc);
+        const screenshot_html = if (screenshot_name.len > 0)
+            try std.fmt.allocPrint(self.allocator, "<h2>Latest Screenshot</h2><img src=\"{s}\" alt=\"latest screenshot\">", .{screenshot_name})
+        else
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(screenshot_html);
+        const html = try std.fmt.allocPrint(
+            self.allocator,
+            "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"1\"><title>Ghost Browser Live View</title><style>body{{font-family:monospace;background:#111;color:#eee;margin:24px}}img{{max-width:100%;border:1px solid #333}}pre{{white-space:pre-wrap}}a{{color:#9cf}}</style></head><body><h1>Ghost Browser Live View</h1><p>label={s} timestamp_ms={d}</p><p><a href=\"browser.mp4\">video</a> | <a href=\"browser-state.ndjson\">state log</a> | <a href=\"browser-actions.ndjson\">action log</a></p><pre>url={s}\ntitle={s}\noctocaptcha_length={d}\nemail_length={d}\npassword_length={d}\nlogin_length={d}\nload_hidden={any}\nload_disabled={any}\nsubmit_hidden={any}\nsubmit_disabled={any}\ncaptcha_frame={}\nverify_completed={}\naccount_verif={}\ncookie_banner={}\niframe={s}\n\n{s}</pre>{s}</body></html>",
+            .{
+                label,
+                timestamp_ms,
+                state.url,
+                state.title,
+                state.octocaptcha_length,
+                state.email_length,
+                state.password_length,
+                state.login_length,
+                state.load_button_hidden,
+                state.load_button_disabled,
+                state.submit_hidden,
+                state.submit_disabled,
+                state.has_captcha_frame,
+                state.has_verify_completed,
+                state.has_account_verif_text,
+                state.has_cookie_banner,
+                state.iframe_src orelse "",
+                text_esc[0..text_len],
+                screenshot_html,
+            },
+        );
+        defer self.allocator.free(html);
+
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        }, 0o644) catch return error.WriteFailed;
+        defer _ = std.c.close(fd);
+        try writeAll(fd, html.ptr, html.len);
+    }
+
+    fn logBridgeAction(self: *BrowserBridge, kind: []const u8, response: []const u8) BridgeError!void {
+        const trace_dir = self.diagnostics_dir orelse return;
+
+        var path_buf: [1024]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/browser-actions.ndjson", .{trace_dir}) catch return error.OutOfMemory;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .APPEND = true,
+            .CLOEXEC = true,
+        }, 0o644) catch return error.WriteFailed;
+        defer _ = std.c.close(fd);
+
+        var kind_esc: [128]u8 = undefined;
+        const kind_len = escapeJsonString(kind, &kind_esc);
+        const line = if (extractRuntimeEvaluateStringValue(self.allocator, response)) |value| blk: {
+            defer self.allocator.free(value);
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"kind\":\"{s}\",\"timestamp_ms\":{d},\"payload\":{s}}}\n",
+                .{
+                    kind_esc[0..kind_len],
+                    currentUnixMs(),
+                    value,
+                },
+            );
+        } else |_| blk: {
+            var raw_esc: [4096]u8 = undefined;
+            const raw_len = escapeJsonString(response, &raw_esc);
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"kind\":\"{s}\",\"timestamp_ms\":{d},\"raw_response\":\"{s}\"}}\n",
+                .{
+                    kind_esc[0..kind_len],
+                    currentUnixMs(),
+                    raw_esc[0..raw_len],
+                },
+            );
+        };
+        defer self.allocator.free(line);
+        try writeAll(fd, line.ptr, line.len);
+    }
+
     /// Parse CDP Runtime.evaluate response value
     /// CDP response format: {"id":N,"result":{"result":{"type":"string","value":"..."}}}
     fn parseCdpValue(self: *BrowserBridge, response: []const u8, field: []const u8) !void {
-        // Extract the "value" field from CDP response
-        const value_marker = "\"value\":\"";
-        const val_idx = mem.indexOf(u8, response, value_marker) orelse return;
-        const val_start = val_idx + value_marker.len;
-        const val_end = mem.indexOfScalarPos(u8, response, val_start, '"') orelse return;
-        const value_str = response[val_start..val_end];
+        const value = try extractRuntimeEvaluateStringValue(self.allocator, response);
+        defer self.allocator.free(value);
 
         // "null" means the global is not set yet
-        if (mem.eql(u8, value_str, "null")) return;
-
-        // Unescape basic JSON escapes in the value
-        var unescaped_buf: [MAX_CDP_BUF]u8 = undefined;
-        const unescaped = unescapeJsonString(value_str, &unescaped_buf);
+        if (mem.eql(u8, value, "null")) return;
 
         if (mem.eql(u8, field, "token")) {
-            try self.parseTokenLine(unescaped);
+            try self.parseTokenLine(value);
         } else if (mem.eql(u8, field, "identity")) {
-            try self.parseIdentityLine(unescaped);
+            try self.parseIdentityLine(value);
         }
     }
 
@@ -882,6 +1602,14 @@ pub const BrowserBridge = struct {
 
     /// Clean up — close CDP WebSocket
     pub fn deinit(self: *BrowserBridge) void {
+        if (self.latest_screenshot_name) |name| {
+            self.allocator.free(name);
+            self.latest_screenshot_name = null;
+        }
+        if (self.diagnostics_dir) |dir| {
+            self.allocator.free(dir);
+            self.diagnostics_dir = null;
+        }
         self.cdp.close();
     }
 };
@@ -906,6 +1634,36 @@ fn readHarvestJs(buf: []u8) ![]u8 {
         total += n;
     }
     return buf[0..total];
+}
+
+fn extractRuntimeEvaluateStringValue(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(RuntimeEvaluateStringEnvelope, allocator, response, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.ParseFailed;
+    defer parsed.deinit();
+
+    const inner = parsed.value.result.result;
+    if (!mem.eql(u8, inner.type, "string")) return error.ParseFailed;
+    return allocator.dupe(u8, inner.value);
+}
+
+fn extractTopLevelMessageId(allocator: std.mem.Allocator, response: []const u8) ?u32 {
+    var parsed = std.json.parseFromSlice(TopLevelMessageIdEnvelope, allocator, response, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.id;
+}
+
+fn parseBrowserUiStateFromEvaluateResponse(
+    allocator: std.mem.Allocator,
+    response: []const u8,
+) !std.json.Parsed(BrowserUiState) {
+    const value = try extractRuntimeEvaluateStringValue(allocator, response);
+    defer allocator.free(value);
+    return std.json.parseFromSlice(BrowserUiState, allocator, value, .{
+        .allocate = .alloc_always,
+    }) catch error.ParseFailed;
 }
 
 /// Unescape basic JSON string escapes (\\, \", \n, \r, \t)
@@ -1008,8 +1766,154 @@ test "unescapeJsonString: unescapes JSON strings" {
     try std.testing.expect(mem.indexOf(u8, result, "\n") != null);
 }
 
+test "extractRuntimeEvaluateStringValue: preserves escaped JSON payload from CDP Runtime.evaluate" {
+    const allocator = std.testing.allocator;
+    const response =
+        "{\"id\":7,\"result\":{\"result\":{\"type\":\"string\",\"value\":\"{\\\"url\\\":\\\"https://github.com/signup\\\",\\\"title\\\":\\\"Sign up for GitHub · GitHub\\\",\\\"octocaptcha_length\\\":0,\\\"email_length\\\":12,\\\"password_length\\\":20,\\\"login_length\\\":8,\\\"submit_hidden\\\":true,\\\"submit_disabled\\\":true,\\\"load_button_hidden\\\":false,\\\"load_button_disabled\\\":false,\\\"has_captcha_frame\\\":false,\\\"has_verify_completed\\\":false,\\\"has_account_verif_text\\\":true,\\\"has_cookie_banner\\\":false,\\\"iframe_src\\\":null,\\\"text_snippet\\\":\\\"Verify your account\\\"}\"}}}";
+
+    const value = try extractRuntimeEvaluateStringValue(allocator, response);
+    defer allocator.free(value);
+
+    try std.testing.expectEqualStrings(
+        "{\"url\":\"https://github.com/signup\",\"title\":\"Sign up for GitHub · GitHub\",\"octocaptcha_length\":0,\"email_length\":12,\"password_length\":20,\"login_length\":8,\"submit_hidden\":true,\"submit_disabled\":true,\"load_button_hidden\":false,\"load_button_disabled\":false,\"has_captcha_frame\":false,\"has_verify_completed\":false,\"has_account_verif_text\":true,\"has_cookie_banner\":false,\"iframe_src\":null,\"text_snippet\":\"Verify your account\"}",
+        value,
+    );
+}
+
+test "parseBrowserUiStateFromEvaluateResponse: decodes escaped BrowserUiState payload" {
+    const allocator = std.testing.allocator;
+    const response =
+        "{\"id\":7,\"result\":{\"result\":{\"type\":\"string\",\"value\":\"{\\\"url\\\":\\\"https://github.com/signup\\\",\\\"title\\\":\\\"Sign up for GitHub · GitHub\\\",\\\"octocaptcha_length\\\":0,\\\"email_length\\\":12,\\\"password_length\\\":20,\\\"login_length\\\":8,\\\"submit_hidden\\\":true,\\\"submit_disabled\\\":true,\\\"load_button_hidden\\\":false,\\\"load_button_disabled\\\":false,\\\"has_captcha_frame\\\":true,\\\"has_verify_completed\\\":false,\\\"has_account_verif_text\\\":true,\\\"has_cookie_banner\\\":true,\\\"iframe_src\\\":\\\"https://octocaptcha.com/frame\\\",\\\"text_snippet\\\":\\\"Verify your account\\\"}\"}}}";
+
+    var state = try parseBrowserUiStateFromEvaluateResponse(allocator, response);
+    defer state.deinit();
+
+    try std.testing.expectEqualStrings("https://github.com/signup", state.value.url);
+    try std.testing.expectEqualStrings("Sign up for GitHub · GitHub", state.value.title);
+    try std.testing.expectEqual(@as(usize, 0), state.value.octocaptcha_length);
+    try std.testing.expectEqual(@as(usize, 12), state.value.email_length);
+    try std.testing.expectEqual(@as(usize, 20), state.value.password_length);
+    try std.testing.expectEqual(@as(usize, 8), state.value.login_length);
+    try std.testing.expectEqual(true, state.value.has_captcha_frame);
+    try std.testing.expectEqual(true, state.value.has_cookie_banner);
+    try std.testing.expectEqualStrings("https://octocaptcha.com/frame", state.value.iframe_src.?);
+}
+
 test "parseIpv4Addr: parses 127.0.0.1" {
     const addr = try parseIpv4Addr("127.0.0.1");
     // Should be 0x7F000001 in big-endian (network byte order)
     try std.testing.expectEqual(@as(u32, 0x7F000001), addr);
+}
+
+test "sendWsText: 16-bit payload length is encoded in network byte order" {
+    var fds: [2]i32 = undefined;
+    // SOURCE: man 2 socketpair — creates a connected pair of sockets for local IPC.
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+    if (rc == std.math.maxInt(usize)) return error.SocketFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    var payload: [126]u8 = undefined;
+    @memset(&payload, 'A');
+
+    var client = CdpClient{
+        .fd = fds[0],
+        .allocator = std.testing.allocator,
+        .msg_id = 0,
+    };
+    try client.sendWsText(&payload);
+
+    var frame: [2 + 2 + 4 + payload.len]u8 = undefined;
+    _ = try recvExact(fds[1], &frame);
+
+    try std.testing.expectEqual(@as(u8, WS_FIN_BIT | WS_OPCODE_TEXT), frame[0]);
+    try std.testing.expectEqual(@as(u8, WS_MASK_BIT | 126), frame[1]);
+    try std.testing.expectEqual(@as(u8, 0x00), frame[2]);
+    try std.testing.expectEqual(@as(u8, 0x7E), frame[3]);
+}
+
+test "recvWsTextAlloc: supports server text frames larger than MAX_CDP_BUF" {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+    if (rc == std.math.maxInt(usize)) return error.SocketFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const allocator = std.testing.allocator;
+    const payload_len = MAX_CDP_BUF + 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'Z');
+
+    var header: [10]u8 = undefined;
+    header[0] = WS_FIN_BIT | WS_OPCODE_TEXT;
+    header[1] = 127;
+    const len_be = std.mem.nativeToBig(u64, @as(u64, payload_len));
+    header[2..10].* = @bitCast(len_be);
+    try writeAll(fds[1], &header, header.len);
+    try writeAll(fds[1], payload.ptr, payload.len);
+
+    var client = CdpClient{
+        .fd = fds[0],
+        .allocator = allocator,
+        .msg_id = 0,
+    };
+
+    const received = try client.recvWsTextAlloc();
+    defer allocator.free(received);
+
+    try std.testing.expectEqual(payload_len, received.len);
+    try std.testing.expectEqual(@as(u8, 'Z'), received[0]);
+    try std.testing.expectEqual(@as(u8, 'Z'), received[received.len - 1]);
+}
+
+test "sendCommand: ignores event messages with nested id before matching top-level response id" {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+    if (rc == std.math.maxInt(usize)) return error.SocketFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const allocator = std.testing.allocator;
+    var client = CdpClient{
+        .fd = fds[0],
+        .allocator = allocator,
+        .msg_id = 0,
+    };
+
+    const event_message =
+        "{\"method\":\"Runtime.executionContextCreated\",\"params\":{\"context\":{\"id\":1,\"origin\":\"https://github.com\"}}}";
+    const reply_message =
+        "{\"id\":1,\"result\":{\"result\":{\"type\":\"string\",\"value\":\"ok\"}}}";
+
+    var event_header: [2]u8 = .{ WS_FIN_BIT | WS_OPCODE_TEXT, @intCast(event_message.len) };
+    var reply_header: [2]u8 = .{ WS_FIN_BIT | WS_OPCODE_TEXT, @intCast(reply_message.len) };
+    try writeAll(fds[1], &event_header, event_header.len);
+    try writeAll(fds[1], event_message.ptr, event_message.len);
+    try writeAll(fds[1], &reply_header, reply_header.len);
+    try writeAll(fds[1], reply_message.ptr, reply_message.len);
+
+    const response = try client.sendCommand("Runtime.evaluate", "{\"expression\":\"1\"}");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings(reply_message, response);
+}
+
+test "parseFetchRequestPaused: extracts ordered headers and postData" {
+    const allocator = std.testing.allocator;
+    const message =
+        \\{"method":"Fetch.requestPaused","params":{"requestId":"req-1","request":{"url":"https://github.com/signup?social=false","method":"POST","headers":{"user-agent":"UA","sec-fetch-mode":"navigate","cookie":"_gh_sess=abc"},"postData":"authenticity_token=abc&octocaptcha-token=xyz"}}}
+    ;
+
+    var paused = try parseFetchRequestPaused(allocator, message);
+    defer paused.deinit(allocator);
+
+    try std.testing.expectEqualStrings("req-1", paused.request_id);
+    try std.testing.expectEqualStrings("https://github.com/signup?social=false", paused.bundle.url);
+    try std.testing.expectEqualStrings("POST", paused.bundle.method);
+    try std.testing.expectEqualStrings("authenticity_token=abc&octocaptcha-token=xyz", paused.bundle.post_data);
+    try std.testing.expectEqual(@as(usize, 3), paused.bundle.headers.len);
+    try std.testing.expectEqualStrings("user-agent", paused.bundle.headers[0].name);
+    try std.testing.expectEqualStrings("sec-fetch-mode", paused.bundle.headers[1].name);
+    try std.testing.expectEqualStrings("cookie", paused.bundle.headers[2].name);
 }

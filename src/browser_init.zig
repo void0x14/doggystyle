@@ -97,7 +97,7 @@ pub const MANIFEST_JSON: []const u8 =
 /// Preferences JSON content — forces "Normal" exit type to avoid restore prompts
 /// SOURCE: Chrome Preferences file format — internal Chrome config structure
 pub const PREFERENCES_JSON =
-    \\{"exit_type":"Normal","exit_count":1,"browser":{"enabled_labs_experiments":[],"last_redirect_origin":""},"profile":{"content_settings":{"clear_on_exit":{"exceptions":{}}},"exited_cleanly":true}
+    \\{"exit_type":"Normal","exit_count":1,"browser":{"enabled_labs_experiments":[],"last_redirect_origin":""},"profile":{"content_settings":{"clear_on_exit":{"exceptions":{}}},"exited_cleanly":true}}
 ;
 
 // ---------------------------------------------------------------------------
@@ -557,6 +557,14 @@ test "writePreferences: creates valid Preferences file" {
     var content_buf: [PREFERENCES_JSON.len]u8 = undefined;
     const content = try cwd.readFile(io, prefs_path, &content_buf);
     try std.testing.expectEqualStrings(PREFERENCES_JSON, content);
+}
+
+test "Preferences JSON parses as valid JSON" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, PREFERENCES_JSON, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .object);
 }
 
 test "buildSafeEnvironment: purges dangerous variables" {

@@ -7,6 +7,7 @@ const tls = std.crypto.tls;
 const Certificate = std.crypto.Certificate;
 const jitter_core = @import("jitter_core.zig");
 const http2_core = @import("http2_core.zig");
+const browser_bundle = @import("browser_bundle.zig");
 
 const NetworkError = error{
     ServerNameTooLong,
@@ -114,7 +115,7 @@ var cleanup_port: u16 = 0;
 fn signalHandler(sig: std.os.linux.SIG) callconv(.c) void {
     _ = sig;
     if (cleanup_port != 0) {
-        var buf: [256]u8 = undefined;
+        var buf: [320]u8 = undefined;
         const cmd_str = std.fmt.bufPrintZ(&buf, "iptables -D OUTPUT -p tcp --tcp-flags RST RST --sport {d} -j DROP", .{cleanup_port}) catch return;
         _ = system(cmd_str.ptr);
 
@@ -1872,7 +1873,7 @@ extern "c" fn system(cmd: [*:0]const u8) c_int;
 pub fn applyRstSuppression(allocator: std.mem.Allocator, port: u16) !void {
     _ = allocator;
     if (is_linux) {
-        var buf: [256]u8 = undefined;
+        var buf: [320]u8 = undefined;
 
         // 1. RST Suppression: prevent kernel from sending RST for our raw SYN
         const cmd_rst = std.fmt.bufPrintZ(&buf, "iptables -A OUTPUT -p tcp --tcp-flags RST RST --sport {d} -j DROP", .{port}) catch return error.CmdFormatFailed;
@@ -1909,7 +1910,7 @@ pub fn applyRstSuppression(allocator: std.mem.Allocator, port: u16) !void {
 pub fn removeRstSuppression(allocator: std.mem.Allocator, port: u16) void {
     _ = allocator;
     if (is_linux) {
-        var buf: [256]u8 = undefined;
+        var buf: [320]u8 = undefined;
 
         const cmd_rst = std.fmt.bufPrintZ(&buf, "iptables -D OUTPUT -p tcp --tcp-flags RST RST --sport {d} -j DROP", .{port}) catch return;
         _ = system(cmd_rst.ptr);
@@ -2450,6 +2451,20 @@ pub const TlsError = error{
     ServerFinishedVerifyFailed,
     TlsKeyScheduleUnimplemented,
 };
+
+const TlsAlertDisposition = enum {
+    ignore,
+    close_notify,
+    fatal,
+};
+
+// SOURCE: RFC 8446, Section 6.1 — close_notify means the sender will not send more messages.
+// SOURCE: RFC 8446, Section 6.2 — fatal alerts terminate the connection.
+fn classifyTlsAlert(level: u8, description: u8) TlsAlertDisposition {
+    if (level == 1 and description == 0) return .close_notify;
+    if (level == 2) return .fatal;
+    return .ignore;
+}
 
 const Tls13CertificateEntry = struct {
     cert_data: []const u8,
@@ -5358,6 +5373,8 @@ fn receiveTlsApplicationData(
         self.pending_server_tls_ciphertext = &.{};
     }
 
+    var saw_graceful_close = false;
+
     while (currentTimestampMs() - timeout_start < timeout_ms) {
         const packet_len = sock.recvPacket(packet_buffer[0..]) catch |err| switch (err) {
             error.WouldBlock => continue,
@@ -5396,7 +5413,7 @@ fn receiveTlsApplicationData(
         try tls_record_buffer.appendSlice(fresh_payload.payload);
 
         var record_offset: usize = 0;
-        while (tls_record_buffer.items.len - record_offset >= TLS_REC_HEADER_LEN) {
+        record_loop: while (tls_record_buffer.items.len - record_offset >= TLS_REC_HEADER_LEN) {
             const record_length = readBe16(
                 tls_record_buffer.items[record_offset + TLS_REC_LENGTH .. record_offset + TLS_REC_LENGTH + 2],
             );
@@ -5420,11 +5437,43 @@ fn receiveTlsApplicationData(
                     switch (decrypted.inner_content_type) {
                         0x17 => try plaintext_records.appendSlice(decrypted.plaintext),
                         0x16 => {},
-                        0x15 => return error.TlsAlertReceived,
+                        0x15 => {
+                            // SOURCE: RFC 8446, Section 6 — Alert messages: level + description
+                            if (decrypted.plaintext.len >= 2) {
+                                const alert_level = decrypted.plaintext[0];
+                                const alert_desc = decrypted.plaintext[1];
+                                std.debug.print("[TLS] Alert received: level={d} description={d}\n", .{ alert_level, alert_desc });
+                                switch (classifyTlsAlert(alert_level, alert_desc)) {
+                                    .close_notify => {
+                                        saw_graceful_close = true;
+                                        record_offset = tls_record_buffer.items.len;
+                                        break :record_loop;
+                                    },
+                                    .fatal => return error.TlsAlertReceived,
+                                    .ignore => {},
+                                }
+                            }
+                        },
                         else => {},
                     }
                 },
-                0x15 => return error.TlsAlertReceived,
+                0x15 => {
+                    // SOURCE: RFC 8446, Section 6 — Alert record received before decryption
+                    if (record.len > TLS_REC_HEADER_LEN + 1) {
+                        const raw_level = record[TLS_REC_HEADER_LEN];
+                        const raw_desc = record[TLS_REC_HEADER_LEN + 1];
+                        std.debug.print("[TLS] Raw alert record: level={d} description={d}\n", .{ raw_level, raw_desc });
+                        switch (classifyTlsAlert(raw_level, raw_desc)) {
+                            .close_notify => {
+                                saw_graceful_close = true;
+                                record_offset = tls_record_buffer.items.len;
+                                break :record_loop;
+                            },
+                            .fatal => return error.TlsAlertReceived,
+                            .ignore => {},
+                        }
+                    } else return error.TlsAlertReceived;
+                },
                 else => return error.UnexpectedContentType,
             }
             record_offset += total_record_len;
@@ -5445,6 +5494,10 @@ fn receiveTlsApplicationData(
                 self.pending_server_tls_ciphertext = try allocator.dupe(u8, tls_record_buffer.items);
             }
             return plaintext_records.toOwnedSlice();
+        }
+
+        if (saw_graceful_close) {
+            return error.ConnectionClosed;
         }
     }
 
@@ -5572,7 +5625,7 @@ pub fn shutdown(fd: std.posix.fd_t) void {
     // We need the port; in a real engine this would be passed in or stored.
     // For now, use cleanup_port global (set during engine init).
     if (cleanup_port != 0) {
-        var buf: [256]u8 = undefined;
+        var buf: [320]u8 = undefined;
 
         // Remove OUTPUT DROP rule (-D instead of -A)
         const cmd_rst = std.fmt.bufPrintZ(&buf, "iptables -D OUTPUT -p tcp --tcp-flags RST RST --sport {d} -j DROP", .{cleanup_port}) catch {
@@ -6923,7 +6976,7 @@ pub const HttpResponse = struct {
     }
 };
 
-fn extractCookiesFromHttp2Response(response: *const http2_core.Http2Response, jar: *GitHubCookieJar) !void {
+pub fn extractCookiesFromHttp2Response(response: *const http2_core.Http2Response, jar: *GitHubCookieJar) !void {
     for (response.headers) |header| {
         if (ascii.eqlIgnoreCase(header.name, "set-cookie")) {
             try jar.setCookie(header.value);
@@ -7015,6 +7068,33 @@ pub const GitHubHttpClient = struct {
             .client_tsval = client_tsval,
             .server_tsval = server_tsval,
         };
+    }
+
+    // SOURCE: RFC 9113, Section 3.4 — a fresh HTTP/2 connection starts with a new preface/SETTINGS exchange.
+    // SOURCE: RFC 8446, Section 6.1 — post-close_notify transport state must not be reused for new messages.
+    pub fn adoptHandshake(self: *GitHubHttpClient, allocator: std.mem.Allocator, handshake: HandshakeResultFull) !void {
+        if (self.hpack_decoder) |*decoder| {
+            decoder.deinit();
+            self.hpack_decoder = null;
+        }
+        if (self.pending_server_tls_ciphertext.len > 0) {
+            allocator.free(self.pending_server_tls_ciphertext);
+            self.pending_server_tls_ciphertext = &.{};
+        }
+
+        self.sock_fd = handshake.sock_fd;
+        self.tls_session = handshake.tls_session;
+        self.pending_server_tls_ciphertext = handshake.pending_server_tls_ciphertext;
+        self.src_ip = handshake.src_ip;
+        self.dst_ip = handshake.dst_ip;
+        self.src_port = handshake.src_port;
+        self.dst_port = handshake.dst_port;
+        self.client_seq = handshake.client_seq;
+        self.server_seq = handshake.server_seq;
+        self.client_tsval = handshake.client_tsval;
+        self.server_tsval = handshake.server_tsval;
+        self.http2_connection_ready = false;
+        self.next_stream_id = 1;
     }
 
     /// Follow redirects until we reach the target path
@@ -7857,6 +7937,37 @@ pub const GitHubHttpClient = struct {
         return error.ReadTimeout;
     }
 
+    pub fn performCapturedBrowserRequest(
+        self: *GitHubHttpClient,
+        allocator: std.mem.Allocator,
+        request: *const browser_bundle.RequestBundle,
+        sock: anytype,
+        dst_ip: u32,
+        timeout_ms: i64,
+        headers_trace: []const u8,
+        data_trace: []const u8,
+    ) !http2_core.Http2Response {
+        const hpack_block = try http2_core.buildBrowserRequestHeaders(
+            allocator,
+            request.method,
+            request.url,
+            request.headers,
+        );
+        defer allocator.free(hpack_block);
+
+        const body = if (request.post_data.len > 0) request.post_data else null;
+        return self.sendHttp2Request(
+            allocator,
+            hpack_block,
+            body,
+            sock,
+            dst_ip,
+            timeout_ms,
+            headers_trace,
+            data_trace,
+        );
+    }
+
     fn performMultipartValidationCheck(
         self: *GitHubHttpClient,
         allocator: std.mem.Allocator,
@@ -8089,7 +8200,7 @@ pub const GitHubHttpClient = struct {
 
     // SOURCE: Live GitHub signup observation (2026-04-09) — successful signup moves
     // into the email-verification flow, which exposes verification-specific paths/fields.
-    fn isSignupVerificationState(status_code: u16, body: []const u8) bool {
+    pub fn isSignupVerificationState(status_code: u16, body: []const u8) bool {
         if (status_code == 302) return true;
         if (status_code != 200) return false;
 
@@ -8110,8 +8221,32 @@ pub const GitHubHttpClient = struct {
         return false;
     }
 
+    pub fn isAccountVerificationSuccessState(status_code: u16, body: []const u8) bool {
+        if (status_code == 302) return true;
+        if (status_code != 200) return false;
+
+        const success_markers = [_][]const u8{
+            "verification completed",
+            "Verification completed",
+            "email address has been verified",
+            "sign in",
+            "Sign in",
+            "success",
+        };
+        for (success_markers) |marker| {
+            if (mem.indexOf(u8, body, marker) != null) return true;
+        }
+        return false;
+    }
+
+    pub fn isAccountVerificationRetryState(status_code: u16, body: []const u8) bool {
+        if (status_code != 200) return false;
+        return mem.indexOf(u8, body, "verification_code") != null or
+            mem.indexOf(u8, body, "/account_verifications") != null;
+    }
+
     fn dumpSignupFailureBody(body: []const u8) !void {
-        const fd = try posix.openat(posix.AT.FDCWD, "/tmp/github-signup-failure.html", .{
+        const fd = try posix.openat(posix.AT.FDCWD, "artifacts/github-signup-failure.html", .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
             .TRUNC = true,
@@ -8881,6 +9016,21 @@ test "GitHubHttpClient: signup success detection requires verification markers" 
     ));
 }
 
+test "GitHubHttpClient: account verification success detection requires completion markers" {
+    try std.testing.expect(GitHubHttpClient.isAccountVerificationSuccessState(
+        200,
+        "<div class=\"flash flash-success\">Verification completed. Please sign in.</div>",
+    ));
+    try std.testing.expect(GitHubHttpClient.isAccountVerificationSuccessState(
+        302,
+        "",
+    ));
+    try std.testing.expect(!GitHubHttpClient.isAccountVerificationSuccessState(
+        200,
+        "<form action=\"/account_verifications\"><input name=\"verification_code\"></form>",
+    ));
+}
+
 test "HttpResponse: parse 200 OK response" {
     const raw_response = "HTTP/1.1 200 OK\r\n" ++
         "Content-Type: text/html; charset=utf-8\r\n" ++
@@ -9131,4 +9281,65 @@ test "GitHubCookieJar: round-trip setCookie -> cookieHeader -> setCookie" {
         jar1.gh_sess[0..jar1.gh_sess_len],
         jar2.gh_sess[0..jar2.gh_sess_len],
     );
+}
+
+test "classifyTlsAlert: close_notify is graceful shutdown" {
+    try std.testing.expectEqual(.close_notify, classifyTlsAlert(1, 0));
+    try std.testing.expectEqual(.fatal, classifyTlsAlert(2, 40));
+    try std.testing.expectEqual(.ignore, classifyTlsAlert(1, 100));
+}
+
+test "GitHubHttpClient.adoptHandshake resets transport state but preserves cookies" {
+    const allocator = std.testing.allocator;
+
+    const old_pending = try allocator.dupe(u8, "old");
+    var client = GitHubHttpClient.initFromHandshake(
+        "github.com",
+        443,
+        11,
+        std.mem.zeroes(TlsSession),
+        old_pending,
+        0x01020304,
+        0x05060708,
+        40000,
+        443,
+        123,
+        456,
+        789,
+        101112,
+    );
+    defer client.deinit(allocator);
+
+    try client.cookie_jar.setCookie("_gh_sess=session_before_refresh; Path=/; HttpOnly; Secure");
+    try client.cookie_jar.setCookie("_octo=octo_before_refresh; Path=/; Secure; SameSite=None");
+    client.hpack_decoder = http2_core.HpackDecoder.init(allocator);
+    client.http2_connection_ready = true;
+    client.next_stream_id = 9;
+
+    const new_pending = try allocator.dupe(u8, "new");
+    const handshake = HandshakeResultFull{
+        .sock_fd = 22,
+        .tls_session = std.mem.zeroes(TlsSession),
+        .src_ip = 0x11111111,
+        .dst_ip = 0x22222222,
+        .src_port = 40000,
+        .dst_port = 443,
+        .client_seq = 1000,
+        .server_seq = 2000,
+        .client_tsval = 3000,
+        .server_tsval = 4000,
+        .cipher_suite = 0x1301,
+        .server_random = [_]u8{0} ** 32,
+        .pending_server_tls_ciphertext = new_pending,
+    };
+
+    try client.adoptHandshake(allocator, handshake);
+
+    try std.testing.expectEqual(@as(posix.socket_t, 22), client.sock_fd.?);
+    try std.testing.expect(client.hpack_decoder == null);
+    try std.testing.expect(!client.http2_connection_ready);
+    try std.testing.expectEqual(@as(u32, 1), client.next_stream_id);
+    try std.testing.expectEqualStrings("session_before_refresh", client.cookie_jar.gh_sess[0..client.cookie_jar.gh_sess_len]);
+    try std.testing.expectEqualStrings("octo_before_refresh", client.cookie_jar.octo[0..client.cookie_jar.octo_len]);
+    try std.testing.expectEqualStrings("new", client.pending_server_tls_ciphertext);
 }

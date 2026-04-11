@@ -37,6 +37,121 @@ fn resolveIpv4Host(host: [:0]const u8) !u32 {
     return error.TcpConnectFailed;
 }
 
+fn currentMonotonicMs() u32 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @intCast((@as(u64, @intCast(ts.sec)) * 1000) + (@as(u64, @intCast(ts.nsec)) / 1000000));
+}
+
+fn buildBrowserTraceDirPath(allocator: std.mem.Allocator, cwd: []const u8, monotonic_ms: u32) ![]u8 {
+    // SOURCE: POSIX path semantics — relative artifact directories should be rooted at the current working directory.
+    return std.fmt.allocPrint(allocator, "{s}/artifacts/browser-trace-{d}", .{ cwd, monotonic_ms });
+}
+
+fn createBrowserTraceDir(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+    var cwd_buf: [std.posix.PATH_MAX]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.TraceDirCreateFailed;
+    const cwd = std.mem.sliceTo(@as([*:0]u8, @ptrCast(cwd_ptr)), 0);
+
+    const trace_dir = try buildBrowserTraceDirPath(allocator, cwd, currentMonotonicMs());
+    errdefer allocator.free(trace_dir);
+
+    std.Io.Dir.cwd().createDirPath(io, trace_dir) catch return error.TraceDirCreateFailed;
+    return trace_dir;
+}
+
+fn startBrowserRecorder(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    trace_dir: []const u8,
+) !?process.Child {
+    var output_buf: [1024]u8 = undefined;
+    const output = try std.fmt.bufPrint(&output_buf, "{s}/browser.mp4", .{trace_dir});
+    var env_map = try browser_init.buildSafeEnvironment(allocator, trace_dir);
+    defer env_map.deinit();
+
+    const argv = [_][]const u8{
+        "ffmpeg",
+        "-y",
+        "-video_size",
+        "1280x720",
+        "-framerate",
+        "5",
+        "-f",
+        "x11grab",
+        "-i",
+        browser_init.XVFB_DISPLAY,
+        "-codec:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        output,
+    };
+
+    return process.spawn(io, .{
+        .argv = &argv,
+        .environ_map = &env_map,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch null;
+}
+
+fn refreshGitHubTransport(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    github_client: *network.GitHubHttpClient,
+    sock: anytype,
+) !void {
+    const now_ms = currentMonotonicMs();
+    const client_isn: u32 = now_ms;
+    const client_tsval: u32 = @intCast(@as(u64, now_ms) / 10);
+
+    std.debug.print("[GITHUB] Transport refresh: sending new SYN on {d}->{d}\n", .{
+        github_client.src_port,
+        github_client.dst_port,
+    });
+
+    const syn_packet = try network.buildTCPSynAlloc(
+        allocator,
+        github_client.src_ip,
+        github_client.dst_ip,
+        github_client.src_port,
+        github_client.dst_port,
+        client_isn,
+        client_tsval,
+        0,
+    );
+    defer allocator.free(syn_packet);
+
+    _ = try sock.sendPacket(syn_packet, github_client.dst_ip);
+
+    const handshake = try network.completeHandshakeFull(
+        allocator,
+        io,
+        github_client.dst_ip,
+        github_client.dst_port,
+        github_client.host,
+        github_client.src_ip,
+        github_client.src_port,
+        sock,
+        client_isn,
+        client_tsval,
+    );
+    try github_client.adoptHandshake(allocator, handshake);
+    std.debug.print("[GITHUB] Transport refresh complete; HTTP/2 state reset\n", .{});
+}
+
+test "buildBrowserTraceDirPath: roots artifacts under current working directory" {
+    const allocator = std.testing.allocator;
+    const path = try buildBrowserTraceDirPath(allocator, "/repo/project", 12345);
+    defer allocator.free(path);
+
+    try std.testing.expectEqualStrings("/repo/project/artifacts/browser-trace-12345", path);
+}
+
 /// Ghost Engine — Master Orchestrator (PRODUCTION)
 ///
 /// Bu dosya tüm modülleri kronolojik sırada birleştirir:
@@ -124,9 +239,7 @@ pub fn main(init: std.process.Init) !void {
     // =========================================================================
     // ADIM 4: Ephemeral Port Generation
     // =========================================================================
-    var ts: std.posix.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    const now_ms: u32 = @intCast((@as(u64, @intCast(ts.sec)) * 1000) + (@as(u64, @intCast(ts.nsec)) / 1000000));
+    const now_ms: u32 = currentMonotonicMs();
     var r_state: u32 = now_ms;
     r_state ^= r_state << 13;
     r_state ^= r_state >> 17;
@@ -320,8 +433,6 @@ pub fn main(init: std.process.Init) !void {
     //   4. Inject harvest.js via Runtime.evaluate
     //   5. Poll window.__ghost_token / window.__ghost_identity globals
     //   6. Parse harvested data into HarvestResult
-    var harvested_octocaptcha: ?[]const u8 = null;
-
     // Step 1: Start Xvfb BEFORE Chrome
     // SOURCE: Xvfb — X Virtual Framebuffer provides X11 display without physical screen
     std.debug.print("\n[XVFB] Starting Xvfb on display {s}...\n", .{browser_init.XVFB_DISPLAY});
@@ -341,6 +452,18 @@ pub fn main(init: std.process.Init) !void {
     const xvfb_sleep = std.os.linux.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_ms };
     _ = std.os.linux.nanosleep(&xvfb_sleep, null);
 
+    const browser_trace_dir = try createBrowserTraceDir(allocator, io);
+    defer allocator.free(browser_trace_dir);
+    std.debug.print("[BROWSER] Trace dir: {s}\n", .{browser_trace_dir});
+
+    var browser_recorder = try startBrowserRecorder(allocator, io, browser_trace_dir);
+    defer if (browser_recorder) |*recorder| recorder.kill(io);
+    if (browser_recorder != null) {
+        std.debug.print("[BROWSER] Xvfb video recorder started\n", .{});
+    } else {
+        std.debug.print("[BROWSER] Xvfb video recorder unavailable; continuing with CDP screenshots/state logs\n", .{});
+    }
+
     // Step 2: Spawn Chrome with CDP on display :99
     std.debug.print("[BROWSER] Launching stealth Chrome for token harvest (Xvfb + CDP)...\n", .{});
     var stealth_browser = try browser_init.StealthBrowser.init(allocator, io);
@@ -357,42 +480,11 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
-    // Step 3: Connect to Chrome CDP and inject harvest.js
-    // BrowserBridge.init() connects to CDP WebSocket for the signup tab
+    // Step 3: Connect to Chrome CDP and install the browser session bridge.
     std.debug.print("[CDP] Connecting to Chrome CDP on localhost:{d}...\n", .{browser_bridge.CDP_PORT});
-    var bridge = browser_bridge.BrowserBridge.init(allocator, "https://github.com/signup") catch |err| blk: {
-        std.debug.print("[CDP] Failed to connect to CDP: {} — continuing without harvest\n", .{err});
-        break :blk null;
-    };
-    defer if (bridge) |*b| b.deinit();
-
-    // Step 4: Harvest tokens via CDP (inject harvest.js, poll globals)
-    var harvest_result = browser_bridge.HarvestResult{};
-    if (bridge) |*b| {
-        std.debug.print("[BROWSER] Starting token harvest (timeout={d}ms)...\n", .{browser_bridge.EXTRACTION_TIMEOUT_MS});
-        harvest_result = b.harvest() catch |err| blk: {
-            std.debug.print("[BROWSER] Harvest failed: {} — continuing without harvested token\n", .{err});
-            break :blk browser_bridge.HarvestResult{};
-        };
-
-        // Extract harvested octocaptcha token (if captured)
-        if (harvest_result.token_captured) {
-            harvested_octocaptcha = harvest_result.token.token[0..harvest_result.token.token_len];
-            std.debug.print("[BROWSER] Harvested octocaptcha token: {d} bytes\n", .{harvest_result.token.token_len});
-        } else {
-            std.debug.print("[BROWSER] No octocaptcha token harvested (captcha may not have completed in time)\n", .{});
-        }
-
-        // Inject harvested _octo cookie into cookie jar (if captured)
-        // SOURCE: RFC 6265, Section 4.2 — Cookie header includes _octo for session tracking
-        if (harvest_result.identity_captured and harvest_result.identity._octo_len > 0) {
-            const octo_value = harvest_result.identity._octo[0..harvest_result.identity._octo_len];
-            github_client.cookie_jar.setOctoCookie(octo_value) catch |err| {
-                std.debug.print("[BROWSER] Failed to set _octo cookie: {}\n", .{err});
-            };
-            std.debug.print("[BROWSER] Injected _octo cookie into jar ({d} bytes)\n", .{harvest_result.identity._octo_len});
-        }
-    }
+    var bridge = try browser_bridge.BrowserBridge.init(allocator, "https://github.com/signup");
+    defer bridge.deinit();
+    try bridge.enableDiagnostics(browser_trace_dir);
 
     // =========================================================================
     // ADIM 11.5: Final Signup Submission
@@ -430,24 +522,48 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("[SIGNUP] Using Email: {s} (TEST MODE - Digistallone bypassed)\n", .{email});
     std.debug.print("[SIGNUP] Submitting POST to /signup...\n", .{});
 
-    const signup_success = github_client.performSignup(
+    std.debug.print("[BROWSER] Capturing exact browser-owned signup bundle...\n", .{});
+    var signup_bundle = bridge.captureSignupBundle(username, email, password, "") catch |err| {
+        std.debug.print("[BROWSER] FAILED: Could not capture signup bundle: {}\n", .{err});
+        return err;
+    };
+    defer signup_bundle.deinit(allocator);
+
+    var signup_success = github_client.performCapturedBrowserRequest(
         allocator,
-        response.body,
-        username,
-        email,
-        password,
+        &signup_bundle.request,
         &sock,
         dst_ip,
-        harvested_octocaptcha,
-    ) catch |err| {
-        if (err == error.UnexpectedChallenge) {
-            std.debug.print("[FATAL] Unexpected Arkose Challenge triggered during signup submission!\n", .{});
-            return err;
+        10000,
+        "HTTP/2 browser signup HEADERS",
+        "HTTP/2 browser signup DATA CHUNK",
+    ) catch |err| blk: {
+        if (err == error.ConnectionClosed) {
+            std.debug.print("[SIGNUP] GitHub transport was closed after the long browser/mail phase; refreshing and retrying once...\n", .{});
+            try refreshGitHubTransport(allocator, io, &github_client, &sock);
+            break :blk try github_client.performCapturedBrowserRequest(
+                allocator,
+                &signup_bundle.request,
+                &sock,
+                dst_ip,
+                10000,
+                "HTTP/2 browser signup HEADERS",
+                "HTTP/2 browser signup DATA CHUNK",
+            );
         }
         return err;
     };
+    defer signup_success.deinit(allocator);
 
-    if (signup_success) {
+    try network.extractCookiesFromHttp2Response(&signup_success, &github_client.cookie_jar);
+    try bridge.syncGitHubCookies(
+        if (github_client.cookie_jar.user_session_len > 0) github_client.cookie_jar.user_session[0..github_client.cookie_jar.user_session_len] else null,
+        if (github_client.cookie_jar.host_user_session_len > 0) github_client.cookie_jar.host_user_session[0..github_client.cookie_jar.host_user_session_len] else null,
+        if (github_client.cookie_jar.gh_sess_len > 0) github_client.cookie_jar.gh_sess[0..github_client.cookie_jar.gh_sess_len] else null,
+        if (github_client.cookie_jar.octo_len > 0) github_client.cookie_jar.octo[0..github_client.cookie_jar.octo_len] else null,
+    );
+
+    if (network.GitHubHttpClient.isSignupVerificationState(signup_success.status_code, signup_success.body)) {
         std.debug.print("[SUCCESS] Signup Form Submitted. Waiting for Redirect...\n", .{});
     } else {
         std.debug.print("[FATAL] Signup did not reach the verification step. Polling mailbox would stall because no verification mail is guaranteed.\n", .{});
@@ -504,15 +620,48 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("[MAIL] Livewire sync successful. Code {s} found. Submitting...\n", .{github_code});
 
     // --- 3. Submit code to GitHub ---
-    const verify_success = github_client.verifyEmail(
+    const post_signup_grace = std.os.linux.timespec{ .sec = 1, .nsec = 500 * std.time.ns_per_ms };
+    _ = std.os.linux.nanosleep(&post_signup_grace, null);
+    try bridge.navigateToAccountVerifications();
+    std.debug.print("[BROWSER] Capturing exact browser-owned verify bundle...\n", .{});
+    var verify_bundle = bridge.captureVerifyBundle(github_code) catch |err| {
+        std.debug.print("[BROWSER] FAILED: Could not capture verify bundle: {}\n", .{err});
+        return err;
+    };
+    defer verify_bundle.deinit(allocator);
+
+    var verify_response = github_client.performCapturedBrowserRequest(
         allocator,
-        github_code,
+        &verify_bundle.request,
         &sock,
         dst_ip,
-    ) catch |err| {
+        10000,
+        "HTTP/2 browser verify HEADERS",
+        "HTTP/2 browser verify DATA CHUNK",
+    ) catch |err| blk: {
+        if (err == error.ConnectionClosed) {
+            std.debug.print("[VERIFY] GitHub transport was closed while waiting for the mailbox code; refreshing and retrying once...\n", .{});
+            try refreshGitHubTransport(allocator, io, &github_client, &sock);
+            break :blk try github_client.performCapturedBrowserRequest(
+                allocator,
+                &verify_bundle.request,
+                &sock,
+                dst_ip,
+                10000,
+                "HTTP/2 browser verify HEADERS",
+                "HTTP/2 browser verify DATA CHUNK",
+            );
+        }
         std.debug.print("[VERIFY] FAILED: Email verification error: {}\n", .{err});
         std.process.exit(1);
     };
+    defer verify_response.deinit(allocator);
+
+    try network.extractCookiesFromHttp2Response(&verify_response, &github_client.cookie_jar);
+    const verify_success = network.GitHubHttpClient.isAccountVerificationSuccessState(
+        verify_response.status_code,
+        verify_response.body,
+    );
 
     if (verify_success) {
         std.debug.print("\n╔══════════════════════════════════════════════════════════╗\n", .{});

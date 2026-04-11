@@ -78,7 +78,13 @@ pub fn build(b: *std.Build) void {
     browser_bridge_test_run.has_side_effects = true;
     test_step.dependOn(&browser_bridge_test_run.step);
 
-    const run_cmd = b.addRunArtifact(exe);
+    // Run with sudo — NOPASSWD configured in /etc/sudoers.d/ghost-engine
+    // Required for raw sockets (SOCK_RAW) and iptables (RST suppression)
+    const exe_path = b.pathFromRoot("zig-out/bin/ghost_engine");
+    const run_cmd = b.addSystemCommand(&.{
+        "sudo",
+        exe_path,
+    });
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
