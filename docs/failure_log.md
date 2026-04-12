@@ -6,6 +6,46 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-11] — Browser Bridge Readiness Check Advanced On The Stale Pre-Reload DOM And Hid Injection Failures
+
+**Hata:** `captureSignupBundle()`, `captureVerifyBundle()` ve `navigateToAccountVerifications()` yalnızca form/path varlığına bakarak ilerliyordu. Reload asenkron yürürken eski document üzerindeki form hâlâ bulunduğu için wait erken true dönüyor, sonra `window.__ghostBridge.*` çağrıları yeni sayfada bridge yüklenmeden çalışıp `TypeError` üretiyordu. Aynı anda `addScriptOnNewDocument()` CDP yanıtındaki top-level `error` alanını kontrol etmediği için bridge enjeksiyon hataları sessizce yutuluyordu.
+
+**Kök sebep:** Browser readiness için yanlış source-of-truth seçildi. DOM/form varlığı tek başına yeni document'in hazır olduğunu kanıtlamıyordu; bridge global'i reload sonrası gerçek senkronizasyon işaretiydi. Ayrıca CDP command ack envelope'u structured parse edilmediği için `Page.addScriptToEvaluateOnNewDocument` başarısız olsa bile akış başarılı sanılıyordu.
+
+**Kaynak:**
+- Chrome DevTools Protocol `Page.addScriptToEvaluateOnNewDocument` — script yeni document oluşturulurken frame scriptlerinden önce yüklenir; başarısız command response’u top-level `error` taşıyabilir
+- Chrome DevTools Protocol `Runtime.evaluate` — hatalar `exceptionDetails` ve `result.result.description` ile raporlanır
+
+**Düzeltme:**
+1. Reload/navigate sonrası wait ifadeleri `!!window.__ghostBridge` şartı ile güçlendirildi.
+2. `addScriptOnNewDocument()` CDP `error` envelope’unu parse edip `CdpError` döndürüyor.
+3. `BrowserBridge.init()` reload sonrası bridge readiness doğruluyor; kayıt başarısızsa veya bridge hâlâ yoksa script doğrudan `Runtime.evaluate` ile fallback enjekte ediliyor.
+4. `extractRuntimeEvaluateStringValue()` artık `exceptionDetails` / `description` ayrıntılarını logluyor; audit hata kodu da artık `no_response` yerine sınıflandırılmış hata etiketi taşıyor.
+5. `dismissPageBlockers()` bridge yokken `TypeError` üretmek yerine güvenli şekilde skip ediyor.
+
+---
+
+## [2026-04-12] — Browser Startup Wait, Cookie Dismiss False Positive, And Flash-Fill Behavior Hid The Real Signup Bridge State
+
+**Hata:** Signup videosunda motor uzun süre hiçbir şey yapmıyor, sonra form alanları bir anda doluyor gibi görünüyordu. Ayrıca cookie banner kapatılmış gibi log düşmesine rağmen banner ekranda kalabiliyordu.
+
+**Kök sebep:** Üç ayrı problem üst üste biniyordu:
+1. `BrowserBridge.init()` current page üzerinde bridge yoksa doğrudan inject etmek yerine `addScriptOnNewDocument` + readiness wait hattında uzun süre bekliyordu. Bu yüzden browser video uzun süre statik kalıyordu.
+2. `findCookieBannerRoot()` gerçek cookie banner node'unu değil çoğu zaman tüm signup page container'ını eşliyordu. Bu yüzden `dismissPageBlockers()` button aramasını yanlış scope'ta yapıp sahte başarı üretebiliyordu.
+3. Signup bridge JS alanlara `el.value = ...` ile tek hamlede yazıyor, sabit `sleep(50)` gecikmeleri kullanıyor, karakter bazlı typing / jitter / adımlı scroll yapmıyordu. Sonuç: insan davranışı yerine “flash-fill” görünümü oluşuyordu.
+
+**Kaynak:**
+- Chrome DevTools Protocol `Runtime.evaluate` — current page context'e helper script doğrudan inject edilebilir
+- GitHub live signup DOM inspection, 2026-04-12 — cookie banner altta `Accept/Reject/Manage cookies` button'ları ile ayrı görünür node olarak bulunuyor
+- `src/jitter_core.zig` — projedeki mevcut behavioral jitter source-of-truth
+
+**Düzeltme:**
+1. Browser bridge startup hattı current page'e direct inject + kısa readiness timeout modeline çekildi; reload bekleyişi primary path olmaktan çıkarıldı.
+2. Cookie dismiss logic banner-root regex yerine visible `Accept` button aramasına çevrildi.
+3. Signup/verify JS akışları Zig jitter planından beslenen karakter bazlı typing, adımlı scroll ve human click modeline taşındı.
+
+---
+
 ## [2026-04-11] — Passive CDP Token Polling Watched The Wrong Session Instead Of Freezing The Real Browser Request
 
 **Hata:** BrowserBridge, `Runtime.evaluate(harvest.js)` ile `window.__ghost_token` / `window.__ghost_identity` poll ederek browser'ın anti-bot state'ini alabileceğini varsayıyordu. Gerçekte signup/risk/final POST raw motor session'ında dönüyor, Chrome tab ise ayrı session'da pasif izleyici olarak kalıyordu. Sonuç: CDP bağlantısı sağlıklı olsa bile browser tarafında üretilecek request hiç oluşmuyor ve harvest timeout veriyordu.

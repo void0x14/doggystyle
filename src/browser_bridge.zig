@@ -26,6 +26,7 @@ const mem = std.mem;
 const linux = std.os.linux;
 const posix = std.posix;
 const browser_bundle = @import("browser_bundle.zig");
+const jitter_core = @import("jitter_core.zig");
 
 // ---------------------------------------------------------------------------
 // Error Types
@@ -61,6 +62,20 @@ pub const EXTRACTION_TIMEOUT_MS: u64 = 15000;
 
 /// Maximum time to wait for browser-generated request capture
 pub const REQUEST_CAPTURE_TIMEOUT_MS: u64 = 30000;
+pub const BRIDGE_INIT_READY_TIMEOUT_MS: u64 = 2500;
+pub const DEFAULT_CDP_RECEIVE_TIMEOUT_MS: u64 = 1000;
+pub const HUMAN_ACTION_EVALUATE_TIMEOUT_MS: u64 = 15000;
+
+/// Readiness expressions must require the bridge global after reload/navigation to avoid
+/// observing stale pre-reload DOM state.
+/// SOURCE: Chrome DevTools Protocol Page.addScriptToEvaluateOnNewDocument — script runs on new documents.
+pub const BRIDGE_READY_EXPRESSION = "document.readyState === 'complete' && !!window.__ghostBridge";
+pub const SIGNUP_FORM_READY_EXPRESSION =
+    BRIDGE_READY_EXPRESSION ++ " && !!document.querySelector('form[action=\"/signup?social=false\"]')";
+pub const VERIFY_FORM_READY_EXPRESSION =
+    BRIDGE_READY_EXPRESSION ++ " && location.pathname.includes('/account_verifications') && !!document.querySelector('form')";
+pub const ACCOUNT_VERIFICATIONS_READY_EXPRESSION =
+    BRIDGE_READY_EXPRESSION ++ " && location.pathname.includes('/account_verifications')";
 
 /// Poll timeout for CDP WebSocket checking (100ms)
 /// SOURCE: man 2 poll — timeout in milliseconds
@@ -295,6 +310,26 @@ pub const CdpClient = struct {
         return response;
     }
 
+    pub fn evaluateWithTimeout(self: *CdpClient, expression: []const u8, timeout_ms: u64) ![]u8 {
+        self.setReceiveTimeoutMs(timeout_ms);
+        defer self.setReceiveTimeoutMs(DEFAULT_CDP_RECEIVE_TIMEOUT_MS);
+        return self.evaluate(expression);
+    }
+
+    fn setReceiveTimeoutMs(self: *CdpClient, timeout_ms: u64) void {
+        const timeout = std.os.linux.timeval{
+            .sec = @intCast(timeout_ms / std.time.ms_per_s),
+            .usec = @intCast((timeout_ms % std.time.ms_per_s) * std.time.us_per_ms),
+        };
+        _ = std.os.linux.setsockopt(
+            self.fd,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            @ptrCast(&timeout),
+            @sizeOf(std.os.linux.timeval),
+        );
+    }
+
     // SOURCE: Chrome DevTools Protocol Page.addScriptToEvaluateOnNewDocument — evaluate before frame scripts.
     pub fn addScriptOnNewDocument(self: *CdpClient, source: []const u8) !void {
         var source_escaped: [MAX_CDP_BUF]u8 = undefined;
@@ -307,6 +342,7 @@ pub const CdpClient = struct {
         ) catch return error.OutOfMemory;
         const response = try self.sendCommand("Page.addScriptToEvaluateOnNewDocument", params);
         defer self.allocator.free(response);
+        try ensureCdpCommandSucceeded(self.allocator, "Page.addScriptToEvaluateOnNewDocument", response);
     }
 
     // SOURCE: Chrome DevTools Protocol Page.reload — reload the inspected page.
@@ -951,16 +987,36 @@ comptime {
 }
 
 const RuntimeEvaluateStringEnvelope = struct {
-    result: struct {
-        result: struct {
-            type: []const u8,
-            value: []const u8,
-        },
-    },
+    @"error": ?CdpErrorObject = null,
+    result: ?struct {
+        result: ?struct {
+            type: ?[]const u8 = null,
+            value: ?std.json.Value = null,
+            description: ?[]const u8 = null,
+        } = null,
+        exceptionDetails: ?RuntimeEvaluateExceptionDetails = null,
+    } = null,
 };
 
 const TopLevelMessageIdEnvelope = struct {
     id: ?u32 = null,
+};
+
+const CdpErrorObject = struct {
+    code: i32 = 0,
+    message: []const u8 = "",
+    data: ?[]const u8 = null,
+};
+
+const CdpCommandErrorEnvelope = struct {
+    @"error": ?CdpErrorObject = null,
+};
+
+const RuntimeEvaluateExceptionDetails = struct {
+    text: ?[]const u8 = null,
+    exception: ?struct {
+        description: ?[]const u8 = null,
+    } = null,
 };
 
 /// Captured Arkose token data from Chrome stdout
@@ -1004,6 +1060,75 @@ pub const HarvestResult = struct {
 
     pub fn isComplete(self: *const HarvestResult) bool {
         return self.token_captured and self.identity_captured;
+    }
+};
+
+const SignupHumanPlan = struct {
+    email_key_delays: []u16,
+    password_key_delays: []u16,
+    username_key_delays: []u16,
+    scroll_step_delays: []u16,
+    post_dismiss_pause_ms: u16,
+    between_fields_pause_ms: u16,
+    focus_pause_ms: u16,
+    pre_click_pause_ms: u16,
+    click_hold_pause_ms: u16,
+    post_click_pause_ms: u16,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        username_len: usize,
+        email_len: usize,
+        password_len: usize,
+    ) !SignupHumanPlan {
+        try jitter_core.JitterEngine.initJitterEngine();
+        return .{
+            .email_key_delays = try buildJitterDelaySequence(allocator, email_len, 45, 125),
+            .password_key_delays = try buildJitterDelaySequence(allocator, password_len, 40, 110),
+            .username_key_delays = try buildJitterDelaySequence(allocator, username_len, 45, 135),
+            .scroll_step_delays = try buildJitterDelaySequence(allocator, 8, 24, 58),
+            .post_dismiss_pause_ms = @intCast(jitter_core.JitterEngine.getRandomJitter(140, 260)),
+            .between_fields_pause_ms = @intCast(jitter_core.JitterEngine.getRandomJitter(130, 280)),
+            .focus_pause_ms = @intCast(jitter_core.JitterEngine.getRandomJitter(60, 140)),
+            .pre_click_pause_ms = @intCast(jitter_core.JitterEngine.getRandomJitter(180, 360)),
+            .click_hold_pause_ms = @intCast(jitter_core.JitterEngine.getRandomJitter(45, 110)),
+            .post_click_pause_ms = @intCast(jitter_core.JitterEngine.getRandomJitter(420, 720)),
+        };
+    }
+
+    fn deinit(self: *SignupHumanPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.email_key_delays);
+        allocator.free(self.password_key_delays);
+        allocator.free(self.username_key_delays);
+        allocator.free(self.scroll_step_delays);
+    }
+};
+
+const VerificationHumanPlan = struct {
+    code_key_delays: []u16,
+    scroll_step_delays: []u16,
+    post_dismiss_pause_ms: u16,
+    focus_pause_ms: u16,
+    pre_click_pause_ms: u16,
+    click_hold_pause_ms: u16,
+    post_click_pause_ms: u16,
+
+    fn init(allocator: std.mem.Allocator, code_len: usize) !VerificationHumanPlan {
+        try jitter_core.JitterEngine.initJitterEngine();
+        return .{
+            .code_key_delays = try buildJitterDelaySequence(allocator, code_len, 55, 145),
+            .scroll_step_delays = try buildJitterDelaySequence(allocator, 6, 22, 52),
+            .post_dismiss_pause_ms = @intCast(jitter_core.JitterEngine.getRandomJitter(120, 240)),
+            .focus_pause_ms = @intCast(jitter_core.JitterEngine.getRandomJitter(70, 150)),
+            .pre_click_pause_ms = @intCast(jitter_core.JitterEngine.getRandomJitter(160, 320)),
+            .click_hold_pause_ms = @intCast(jitter_core.JitterEngine.getRandomJitter(35, 90)),
+            .post_click_pause_ms = @intCast(jitter_core.JitterEngine.getRandomJitter(260, 520)),
+        };
+    }
+
+    fn deinit(self: *VerificationHumanPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.code_key_delays);
+        allocator.free(self.scroll_step_delays);
     }
 };
 
@@ -1062,16 +1187,56 @@ pub const BrowserBridge = struct {
             return BridgeError.ConnectFailed;
         }
 
-        var bridge_script_buf: [MAX_BRIDGE_SCRIPT_SIZE]u8 = undefined;
-        const bridge_script = readBrowserSessionBridgeScript(&bridge_script_buf) catch return BridgeError.ReadFailed;
-        try cdp.addScriptOnNewDocument(bridge_script);
-        try cdp.reloadPage();
-
-        return BrowserBridge{
+        var bridge = BrowserBridge{
             .allocator = allocator,
             .cdp = cdp,
             .start_time_ns = now_ns,
         };
+        errdefer bridge.deinit();
+
+        var bridge_script_buf: [MAX_BRIDGE_SCRIPT_SIZE]u8 = undefined;
+        const bridge_script = readBrowserSessionBridgeScript(&bridge_script_buf) catch return BridgeError.ReadFailed;
+        _ = blk: {
+            bridge.cdp.addScriptOnNewDocument(bridge_script) catch |err| {
+                std.debug.print("[BRIDGE] addScriptOnNewDocument failed: {}\n", .{err});
+                break :blk false;
+            };
+            break :blk true;
+        };
+        try bridge.ensureBridgeReadyOnCurrentPage(BRIDGE_INIT_READY_TIMEOUT_MS);
+
+        return bridge;
+    }
+
+    // SOURCE: Chrome DevTools Protocol Runtime.evaluate — page scripts can be evaluated directly in the
+    // current document; this avoids waiting on a reload before browser input can begin.
+    fn ensureBridgeReadyOnCurrentPage(self: *BrowserBridge, timeout_ms: u64) BridgeError!void {
+        if (self.isGhostBridgeReady()) return;
+
+        var bridge_script_buf: [MAX_BRIDGE_SCRIPT_SIZE]u8 = undefined;
+        const bridge_script = readBrowserSessionBridgeScript(&bridge_script_buf) catch return BridgeError.ReadFailed;
+        std.debug.print("[BRIDGE] __ghostBridge missing on current page — injecting directly before continuing\n", .{});
+        try self.injectBridgeScriptDirect(bridge_script);
+        try self.waitForTruthyExpression(BRIDGE_READY_EXPRESSION, timeout_ms);
+    }
+
+    // SOURCE: Chrome DevTools Protocol Runtime.evaluate — evaluates JavaScript in the page execution context.
+    fn injectBridgeScriptDirect(self: *BrowserBridge, bridge_script: []const u8) BridgeError!void {
+        std.debug.print("[BRIDGE] Injecting browser_session_bridge.js via Runtime.evaluate fallback\n", .{});
+        const response = try self.cdp.evaluate(bridge_script);
+        defer self.allocator.free(response);
+
+        if (try extractRuntimeEvaluateFailureMessage(self.allocator, response)) |detail| {
+            defer self.allocator.free(detail);
+            std.debug.print("[BRIDGE] Direct bridge injection failed: {s}\n", .{detail});
+            return BridgeError.CdpError;
+        }
+    }
+
+    fn isGhostBridgeReady(self: *BrowserBridge) bool {
+        const response = self.cdp.evaluate(BRIDGE_READY_EXPRESSION) catch return false;
+        defer self.allocator.free(response);
+        return mem.indexOf(u8, response, "\"value\":true") != null;
     }
 
     pub fn enableDiagnostics(self: *BrowserBridge, trace_dir: []const u8) BridgeError!void {
@@ -1160,10 +1325,8 @@ pub const BrowserBridge = struct {
         password: []const u8,
         country: []const u8,
     ) BridgeError!browser_bundle.SignupBundle {
-        try self.waitForTruthyExpression(
-            "document.readyState === 'complete' && !!document.querySelector('form[action=\"/signup?social=false\"]')",
-            REQUEST_CAPTURE_TIMEOUT_MS,
-        );
+        try self.ensureBridgeReadyOnCurrentPage(BRIDGE_INIT_READY_TIMEOUT_MS);
+        try self.waitForTruthyExpression(SIGNUP_FORM_READY_EXPRESSION, REQUEST_CAPTURE_TIMEOUT_MS);
         try self.cdp.enableFetchInterception("*github.com/signup?social=false*");
         defer self.cdp.disableFetchInterception() catch {};
 
@@ -1187,10 +1350,8 @@ pub const BrowserBridge = struct {
     }
 
     pub fn captureVerifyBundle(self: *BrowserBridge, verification_code: []const u8) BridgeError!browser_bundle.VerifyBundle {
-        try self.waitForTruthyExpression(
-            "location.pathname.includes('/account_verifications') && !!document.querySelector('form')",
-            REQUEST_CAPTURE_TIMEOUT_MS,
-        );
+        try self.ensureBridgeReadyOnCurrentPage(BRIDGE_INIT_READY_TIMEOUT_MS);
+        try self.waitForTruthyExpression(VERIFY_FORM_READY_EXPRESSION, REQUEST_CAPTURE_TIMEOUT_MS);
         try self.cdp.enableFetchInterception("*account_verifications*");
         defer self.cdp.disableFetchInterception() catch {};
 
@@ -1211,10 +1372,8 @@ pub const BrowserBridge = struct {
 
     pub fn navigateToAccountVerifications(self: *BrowserBridge) BridgeError!void {
         try self.cdp.navigatePage("https://github.com/account_verifications");
-        try self.waitForTruthyExpression(
-            "location.pathname.includes('/account_verifications')",
-            REQUEST_CAPTURE_TIMEOUT_MS,
-        );
+        try self.ensureBridgeReadyOnCurrentPage(BRIDGE_INIT_READY_TIMEOUT_MS);
+        try self.waitForTruthyExpression(ACCOUNT_VERIFICATIONS_READY_EXPRESSION, REQUEST_CAPTURE_TIMEOUT_MS);
     }
 
     pub fn syncGitHubCookies(
@@ -1239,27 +1398,20 @@ pub const BrowserBridge = struct {
     ) BridgeError!BrowserAuditResult {
         const ts = @as(u64, @intCast(currentUnixMs()));
         const selector = "form[action=\"/signup?social=false\"]";
-        var user_esc: [512]u8 = undefined;
-        var email_esc: [1024]u8 = undefined;
-        var pass_esc: [1024]u8 = undefined;
-        var country_esc: [128]u8 = undefined;
-        const user_len = escapeJsonString(username, &user_esc);
-        const email_len = escapeJsonString(email, &email_esc);
-        const pass_len = escapeJsonString(password, &pass_esc);
-        const country_len = escapeJsonString(country, &country_esc);
-        const total_chars = user_len + email_len + pass_len + country_len;
-        var expr_buf: [4096]u8 = undefined;
-        const expression = std.fmt.bufPrint(
-            &expr_buf,
-            "window.__ghostBridge.startSignupChallenge({{\"username\":\"{s}\",\"email\":\"{s}\",\"password\":\"{s}\",\"country\":\"{s}\"}})",
-            .{
-                user_esc[0..user_len],
-                email_esc[0..email_len],
-                pass_esc[0..pass_len],
-                country_esc[0..country_len],
-            },
-        ) catch return error.OutOfMemory;
-        const response = try self.cdp.evaluate(expression);
+        var plan = try SignupHumanPlan.init(self.allocator, username.len, email.len, password.len);
+        defer plan.deinit(self.allocator);
+        const total_chars = email.len + password.len + username.len + country.len;
+        const expression = try buildStartSignupExpression(
+            self.allocator,
+            username,
+            email,
+            password,
+            country,
+            &plan,
+        );
+        defer self.allocator.free(expression);
+
+        const response = try self.cdp.evaluateWithTimeout(expression, HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
         defer self.allocator.free(response);
 
         // Determine success from response
@@ -1271,7 +1423,7 @@ pub const BrowserBridge = struct {
         if (trace_dir != null) {
             screenshot_name_buf = self.nextScreenshotName("signup-start");
         }
-        const screenshot_path_slice: []const u8 = screenshot_name_buf[0..mem.indexOfScalar(u8, &screenshot_name_buf, 0) orelse 0];
+        const screenshot_path_slice: []const u8 = screenshot_name_buf[0 .. mem.indexOfScalar(u8, &screenshot_name_buf, 0) orelse 0];
 
         const result: BrowserAuditResult = if (ok) |val| blk: {
             defer self.allocator.free(val);
@@ -1295,7 +1447,7 @@ pub const BrowserBridge = struct {
             .state_after = "failed",
             .screenshot_path = null,
             .timestamp_ms = ts,
-            .err_msg = "no_response",
+            .err_msg = classifyRuntimeEvaluateFailure(response),
         };
 
         // Capture screenshot for audit trail
@@ -1310,7 +1462,7 @@ pub const BrowserBridge = struct {
     fn finishSignupSubmit(self: *BrowserBridge) BridgeError!BrowserAuditResult {
         const ts = @as(u64, @intCast(currentUnixMs()));
         const selector = "button.js-octocaptcha-form-submit, button[data-verify-submit-button]";
-        const response = try self.cdp.evaluate("window.__ghostBridge.finishSignupSubmit()");
+        const response = try self.cdp.evaluateWithTimeout("window.__ghostBridge.finishSignupSubmit()", HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
         defer self.allocator.free(response);
 
         const ok = extractRuntimeEvaluateStringValue(self.allocator, response) catch null;
@@ -1318,7 +1470,7 @@ pub const BrowserBridge = struct {
         var ss_buf1: [32]u8 = undefined;
         const trace_dir1 = self.diagnostics_dir;
         if (trace_dir1 != null) ss_buf1 = self.nextScreenshotName("signup-submit");
-        const ss_slice1: []const u8 = ss_buf1[0..mem.indexOfScalar(u8, &ss_buf1, 0) orelse 0];
+        const ss_slice1: []const u8 = ss_buf1[0 .. mem.indexOfScalar(u8, &ss_buf1, 0) orelse 0];
 
         const result: BrowserAuditResult = if (ok) |val| blk: {
             defer self.allocator.free(val);
@@ -1342,7 +1494,7 @@ pub const BrowserBridge = struct {
             .state_after = "failed",
             .screenshot_path = null,
             .timestamp_ms = ts,
-            .err_msg = "no_response",
+            .err_msg = classifyRuntimeEvaluateFailure(response),
         };
 
         if (trace_dir1) |tdir| {
@@ -1356,15 +1508,13 @@ pub const BrowserBridge = struct {
     fn triggerVerificationSubmit(self: *BrowserBridge, verification_code: []const u8) BridgeError!BrowserAuditResult {
         const ts = @as(u64, @intCast(currentUnixMs()));
         const selector = "input[name=\"verification_code\"], [data-verify-code-input]";
-        var code_esc: [128]u8 = undefined;
-        const code_len = escapeJsonString(verification_code, &code_esc);
-        var expr_buf: [1024]u8 = undefined;
-        const expression = std.fmt.bufPrint(
-            &expr_buf,
-            "window.__ghostBridge.submitVerification({{\"code\":\"{s}\"}})",
-            .{code_esc[0..code_len]},
-        ) catch return error.OutOfMemory;
-        const response = try self.cdp.evaluate(expression);
+        var plan = try VerificationHumanPlan.init(self.allocator, verification_code.len);
+        defer plan.deinit(self.allocator);
+        const code_len = verification_code.len;
+        const expression = try buildSubmitVerificationExpression(self.allocator, verification_code, &plan);
+        defer self.allocator.free(expression);
+
+        const response = try self.cdp.evaluateWithTimeout(expression, HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
         defer self.allocator.free(response);
 
         const ok = extractRuntimeEvaluateStringValue(self.allocator, response) catch null;
@@ -1372,7 +1522,7 @@ pub const BrowserBridge = struct {
         var ss_buf2: [32]u8 = undefined;
         const trace_dir2 = self.diagnostics_dir;
         if (trace_dir2 != null) ss_buf2 = self.nextScreenshotName("verify-submit");
-        const ss_slice2: []const u8 = ss_buf2[0..mem.indexOfScalar(u8, &ss_buf2, 0) orelse 0];
+        const ss_slice2: []const u8 = ss_buf2[0 .. mem.indexOfScalar(u8, &ss_buf2, 0) orelse 0];
 
         const result: BrowserAuditResult = if (ok) |val| blk: {
             defer self.allocator.free(val);
@@ -1396,7 +1546,7 @@ pub const BrowserBridge = struct {
             .state_after = "failed",
             .screenshot_path = null,
             .timestamp_ms = ts,
-            .err_msg = "no_response",
+            .err_msg = classifyRuntimeEvaluateFailure(response),
         };
 
         if (trace_dir2) |tdir| {
@@ -1409,7 +1559,23 @@ pub const BrowserBridge = struct {
 
     fn dismissPageBlockers(self: *BrowserBridge) BridgeError!BrowserAuditResult {
         const ts = @as(u64, @intCast(currentUnixMs()));
-        const response = try self.cdp.evaluate("JSON.stringify(window.__ghostBridge.dismissPageBlockers())");
+        if (!self.isGhostBridgeReady()) {
+            const result = BrowserAuditResult{
+                .ok = false,
+                .selector = "button[class*=\"dismiss\"], button[aria-label*=\"close\"], [class*=\"cookie-banner\"]",
+                .element_found = false,
+                .action_kind = .dismiss_blockers,
+                .chars_written = 0,
+                .state_after = "skipped",
+                .screenshot_path = null,
+                .timestamp_ms = ts,
+                .err_msg = "ghost_bridge_missing",
+            };
+            try result.logToActions(self);
+            return result;
+        }
+
+        const response = try self.cdp.evaluateWithTimeout("window.__ghostBridge.dismissPageBlockers()", 4000);
         defer self.allocator.free(response);
 
         // dismiss-blockers is best-effort; even a response means it ran
@@ -1436,7 +1602,7 @@ pub const BrowserBridge = struct {
             .state_after = "failed",
             .screenshot_path = null,
             .timestamp_ms = ts,
-            .err_msg = "no_response",
+            .err_msg = classifyRuntimeEvaluateFailure(response),
         };
 
         try result.logToActions(self);
@@ -1763,7 +1929,7 @@ pub const BrowserBridge = struct {
         }) catch return error.OutOfMemory;
         self.screenshot_seq += 1;
         if (self.latest_screenshot_name) |existing| self.allocator.free(existing);
-        self.latest_screenshot_name = self.allocator.dupe(u8, path[path.len - (safe_label.len + 14)..]) catch null;
+        self.latest_screenshot_name = self.allocator.dupe(u8, path[path.len - (safe_label.len + 14) ..]) catch null;
 
         const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
             .ACCMODE = .WRONLY,
@@ -2083,15 +2249,234 @@ fn readHarvestJs(buf: []u8) ![]u8 {
     return buf[0..total];
 }
 
+fn buildJitterDelaySequence(
+    allocator: std.mem.Allocator,
+    len: usize,
+    min_ms: u16,
+    max_ms: u16,
+) ![]u16 {
+    try jitter_core.JitterEngine.initJitterEngine();
+    const delays = try allocator.alloc(u16, len);
+    for (delays, 0..) |*delay, idx| {
+        _ = idx;
+        delay.* = @intCast(jitter_core.JitterEngine.getRandomJitter(min_ms, max_ms));
+    }
+    return delays;
+}
+
+fn appendJsonEscapedString(line_buf: *std.array_list.Managed(u8), value: []const u8) !void {
+    var escaped = try line_buf.allocator.alloc(u8, value.len * 2 + 1);
+    defer line_buf.allocator.free(escaped);
+    const escaped_len = escapeJsonString(value, escaped);
+    try line_buf.appendSlice(escaped[0..escaped_len]);
+}
+
+fn appendU16ArrayJson(line_buf: *std.array_list.Managed(u8), values: []const u16) !void {
+    try line_buf.appendSlice("[");
+    for (values, 0..) |value, idx| {
+        if (idx != 0) try line_buf.appendSlice(",");
+        var tmp: [16]u8 = undefined;
+        try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{value}) catch return error.OutOfMemory);
+    }
+    try line_buf.appendSlice("]");
+}
+
+fn buildStartSignupExpression(
+    allocator: std.mem.Allocator,
+    username: []const u8,
+    email: []const u8,
+    password: []const u8,
+    country: []const u8,
+    plan: *const SignupHumanPlan,
+) ![]u8 {
+    var line_buf = std.array_list.Managed(u8).init(allocator);
+    defer line_buf.deinit();
+
+    try line_buf.appendSlice("window.__ghostBridge.startSignupChallenge({\"username\":\"");
+    try appendJsonEscapedString(&line_buf, username);
+    try line_buf.appendSlice("\",\"email\":\"");
+    try appendJsonEscapedString(&line_buf, email);
+    try line_buf.appendSlice("\",\"password\":\"");
+    try appendJsonEscapedString(&line_buf, password);
+    try line_buf.appendSlice("\",\"country\":\"");
+    try appendJsonEscapedString(&line_buf, country);
+    try line_buf.appendSlice("\",\"human\":{\"email_key_delays\":");
+    try appendU16ArrayJson(&line_buf, plan.email_key_delays);
+    try line_buf.appendSlice(",\"password_key_delays\":");
+    try appendU16ArrayJson(&line_buf, plan.password_key_delays);
+    try line_buf.appendSlice(",\"username_key_delays\":");
+    try appendU16ArrayJson(&line_buf, plan.username_key_delays);
+    try line_buf.appendSlice(",\"scroll_step_delays\":");
+    try appendU16ArrayJson(&line_buf, plan.scroll_step_delays);
+
+    var tmp: [32]u8 = undefined;
+    try line_buf.appendSlice(",\"post_dismiss_pause_ms\":");
+    try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{plan.post_dismiss_pause_ms}) catch return error.OutOfMemory);
+    try line_buf.appendSlice(",\"between_fields_pause_ms\":");
+    try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{plan.between_fields_pause_ms}) catch return error.OutOfMemory);
+    try line_buf.appendSlice(",\"focus_pause_ms\":");
+    try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{plan.focus_pause_ms}) catch return error.OutOfMemory);
+    try line_buf.appendSlice(",\"pre_click_pause_ms\":");
+    try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{plan.pre_click_pause_ms}) catch return error.OutOfMemory);
+    try line_buf.appendSlice(",\"click_hold_pause_ms\":");
+    try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{plan.click_hold_pause_ms}) catch return error.OutOfMemory);
+    try line_buf.appendSlice(",\"post_click_pause_ms\":");
+    try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{plan.post_click_pause_ms}) catch return error.OutOfMemory);
+    try line_buf.appendSlice("}})");
+    return line_buf.toOwnedSlice();
+}
+
+fn buildSubmitVerificationExpression(
+    allocator: std.mem.Allocator,
+    verification_code: []const u8,
+    plan: *const VerificationHumanPlan,
+) ![]u8 {
+    var line_buf = std.array_list.Managed(u8).init(allocator);
+    defer line_buf.deinit();
+
+    try line_buf.appendSlice("window.__ghostBridge.submitVerification({\"code\":\"");
+    try appendJsonEscapedString(&line_buf, verification_code);
+    try line_buf.appendSlice("\",\"human\":{\"code_key_delays\":");
+    try appendU16ArrayJson(&line_buf, plan.code_key_delays);
+    try line_buf.appendSlice(",\"scroll_step_delays\":");
+    try appendU16ArrayJson(&line_buf, plan.scroll_step_delays);
+
+    var tmp: [32]u8 = undefined;
+    try line_buf.appendSlice(",\"post_dismiss_pause_ms\":");
+    try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{plan.post_dismiss_pause_ms}) catch return error.OutOfMemory);
+    try line_buf.appendSlice(",\"focus_pause_ms\":");
+    try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{plan.focus_pause_ms}) catch return error.OutOfMemory);
+    try line_buf.appendSlice(",\"pre_click_pause_ms\":");
+    try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{plan.pre_click_pause_ms}) catch return error.OutOfMemory);
+    try line_buf.appendSlice(",\"click_hold_pause_ms\":");
+    try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{plan.click_hold_pause_ms}) catch return error.OutOfMemory);
+    try line_buf.appendSlice(",\"post_click_pause_ms\":");
+    try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{plan.post_click_pause_ms}) catch return error.OutOfMemory);
+    try line_buf.appendSlice("}})");
+    return line_buf.toOwnedSlice();
+}
+
+// SOURCE: Chrome DevTools Protocol command responses — failed commands include a top-level `error`
+// object with `code` and `message`.
+fn extractCdpResponseErrorMessage(allocator: std.mem.Allocator, response: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(CdpCommandErrorEnvelope, allocator, response, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+
+    const err = parsed.value.@"error" orelse return null;
+    if (err.data) |data| {
+        const message: []u8 = try std.fmt.allocPrint(allocator, "CDP error {d}: {s} ({s})", .{ err.code, err.message, data });
+        return message;
+    }
+    const message: []u8 = try std.fmt.allocPrint(allocator, "CDP error {d}: {s}", .{ err.code, err.message });
+    return message;
+}
+
+fn ensureCdpCommandSucceeded(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    response: []const u8,
+) !void {
+    if (try extractCdpResponseErrorMessage(allocator, response)) |detail| {
+        defer allocator.free(detail);
+        std.debug.print("[CDP] {s} failed: {s}\n", .{ method, detail });
+        return error.CdpError;
+    }
+}
+
+// SOURCE: Chrome DevTools Protocol Runtime.evaluate — failures surface through `exceptionDetails`
+// and RemoteObject `description` fields.
+fn extractRuntimeEvaluateFailureMessage(allocator: std.mem.Allocator, response: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(RuntimeEvaluateStringEnvelope, allocator, response, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+
+    if (parsed.value.@"error") |err| {
+        if (err.data) |data| {
+            const message: []u8 = try std.fmt.allocPrint(allocator, "CDP error {d}: {s} ({s})", .{ err.code, err.message, data });
+            return message;
+        }
+        const message: []u8 = try std.fmt.allocPrint(allocator, "CDP error {d}: {s}", .{ err.code, err.message });
+        return message;
+    }
+
+    const result = parsed.value.result orelse return null;
+    if (result.exceptionDetails) |details| {
+        if (details.exception) |exception| {
+            if (exception.description) |description| {
+                const message: []u8 = try allocator.dupe(u8, description);
+                return message;
+            }
+        }
+        if (details.text) |text| {
+            const message: []u8 = try allocator.dupe(u8, text);
+            return message;
+        }
+    }
+
+    if (result.result) |inner| {
+        if (inner.description) |description| {
+            const message: []u8 = try allocator.dupe(u8, description);
+            return message;
+        }
+    }
+    return null;
+}
+
+fn logRuntimeEvaluateFailureDetail(allocator: std.mem.Allocator, response: []const u8, context: []const u8) void {
+    const detail = extractRuntimeEvaluateFailureMessage(allocator, response) catch |err| {
+        std.debug.print("[BRIDGE] {s}: failed to extract Runtime.evaluate failure detail: {}\n", .{ context, err });
+        return;
+    };
+    if (detail) |message| {
+        defer allocator.free(message);
+        std.debug.print("[BRIDGE] {s}: {s}\n", .{ context, message });
+    }
+}
+
+fn classifyRuntimeEvaluateFailure(response: []const u8) []const u8 {
+    if (mem.indexOf(u8, response, "__ghostBridge") != null) return "ghost_bridge_missing";
+    if (mem.indexOf(u8, response, "TypeError") != null) return "runtime_type_error";
+    if (mem.indexOf(u8, response, "ReferenceError") != null) return "runtime_reference_error";
+    if (mem.indexOf(u8, response, "\"error\"") != null) return "cdp_error";
+    return "runtime_evaluate_failed";
+}
+
 fn extractRuntimeEvaluateStringValue(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
     var parsed = std.json.parseFromSlice(RuntimeEvaluateStringEnvelope, allocator, response, .{
         .ignore_unknown_fields = true,
     }) catch return error.ParseFailed;
     defer parsed.deinit();
 
-    const inner = parsed.value.result.result;
-    if (!mem.eql(u8, inner.type, "string")) return error.ParseFailed;
-    return allocator.dupe(u8, inner.value);
+    const result = parsed.value.result orelse {
+        logRuntimeEvaluateFailureDetail(allocator, response, "Runtime.evaluate missing result object");
+        return error.ParseFailed;
+    };
+    const inner = result.result orelse {
+        logRuntimeEvaluateFailureDetail(allocator, response, "Runtime.evaluate missing result payload");
+        return error.ParseFailed;
+    };
+    const inner_type = inner.type orelse {
+        logRuntimeEvaluateFailureDetail(allocator, response, "Runtime.evaluate missing result type");
+        return error.ParseFailed;
+    };
+    if (!mem.eql(u8, inner_type, "string")) {
+        logRuntimeEvaluateFailureDetail(allocator, response, "Runtime.evaluate returned non-string result");
+        std.debug.print("[BRIDGE] Runtime.evaluate expected string, got type={s}\n", .{inner_type});
+        return error.ParseFailed;
+    }
+
+    const raw_value = inner.value orelse {
+        logRuntimeEvaluateFailureDetail(allocator, response, "Runtime.evaluate string result missing value");
+        return error.ParseFailed;
+    };
+    if (raw_value != .string) {
+        logRuntimeEvaluateFailureDetail(allocator, response, "Runtime.evaluate string result had non-string value payload");
+        return error.ParseFailed;
+    }
+    return allocator.dupe(u8, raw_value.string);
 }
 
 fn extractTopLevelMessageId(allocator: std.mem.Allocator, response: []const u8) ?u32 {
@@ -2244,6 +2629,81 @@ test "parseBrowserUiStateFromEvaluateResponse: decodes escaped BrowserUiState pa
     try std.testing.expectEqual(true, state.value.has_captcha_frame);
     try std.testing.expectEqual(true, state.value.has_cookie_banner);
     try std.testing.expectEqualStrings("https://octocaptcha.com/frame", state.value.iframe_src.?);
+}
+
+test "bridge readiness expressions require window.__ghostBridge after navigation" {
+    try std.testing.expect(mem.indexOf(u8, SIGNUP_FORM_READY_EXPRESSION, "!!window.__ghostBridge") != null);
+    try std.testing.expect(mem.indexOf(u8, VERIFY_FORM_READY_EXPRESSION, "!!window.__ghostBridge") != null);
+    try std.testing.expect(mem.indexOf(u8, ACCOUNT_VERIFICATIONS_READY_EXPRESSION, "!!window.__ghostBridge") != null);
+}
+
+test "addScriptOnNewDocument: rejects CDP error response" {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+    if (rc == std.math.maxInt(usize)) return error.SocketFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    var client = CdpClient{
+        .fd = fds[0],
+        .allocator = std.testing.allocator,
+        .msg_id = 0,
+    };
+
+    const reply_message = "{\"id\":1,\"error\":{\"code\":-32000,\"message\":\"Cannot add script\"}}";
+    var reply_header: [2]u8 = .{ WS_FIN_BIT | WS_OPCODE_TEXT, @intCast(reply_message.len) };
+    try writeAll(fds[1], &reply_header, reply_header.len);
+    try writeAll(fds[1], reply_message.ptr, reply_message.len);
+
+    try std.testing.expectError(error.CdpError, client.addScriptOnNewDocument("window.__ghostBridge = {};"));
+}
+
+test "extractRuntimeEvaluateFailureMessage: surfaces exception description" {
+    const allocator = std.testing.allocator;
+    const response =
+        "{\"id\":11,\"result\":{\"result\":{\"type\":\"object\",\"subtype\":\"error\",\"className\":\"TypeError\",\"description\":\"TypeError: Cannot read properties of undefined (reading 'startSignupChallenge')\",\"objectId\":\"-1.1.1\"},\"exceptionDetails\":{\"text\":\"Uncaught\",\"exception\":{\"type\":\"object\",\"subtype\":\"error\",\"className\":\"TypeError\",\"description\":\"TypeError: Cannot read properties of undefined (reading 'startSignupChallenge')\",\"objectId\":\"-1.1.1\"}}}}";
+
+    const detail = try extractRuntimeEvaluateFailureMessage(allocator, response);
+    defer allocator.free(detail.?);
+
+    try std.testing.expect(detail != null);
+    try std.testing.expectEqualStrings(
+        "TypeError: Cannot read properties of undefined (reading 'startSignupChallenge')",
+        detail.?,
+    );
+}
+
+test "buildJitterDelaySequence: returns one delay per character within bounds" {
+    const allocator = std.testing.allocator;
+    const delays = try buildJitterDelaySequence(allocator, 12, 45, 125);
+    defer allocator.free(delays);
+
+    try std.testing.expectEqual(@as(usize, 12), delays.len);
+    for (delays) |delay| {
+        try std.testing.expect(delay >= 45);
+        try std.testing.expect(delay <= 125);
+    }
+}
+
+test "buildStartSignupExpression: embeds human pacing payload" {
+    const allocator = std.testing.allocator;
+    var plan = try SignupHumanPlan.init(allocator, 5, 12, 16);
+    defer plan.deinit(allocator);
+
+    const expression = try buildStartSignupExpression(
+        allocator,
+        "ghost",
+        "ghost@example.com",
+        "Password123456!!",
+        "",
+        &plan,
+    );
+    defer allocator.free(expression);
+
+    try std.testing.expect(mem.indexOf(u8, expression, "startSignupChallenge") != null);
+    try std.testing.expect(mem.indexOf(u8, expression, "\"human\"") != null);
+    try std.testing.expect(mem.indexOf(u8, expression, "\"email_key_delays\"") != null);
+    try std.testing.expect(mem.indexOf(u8, expression, "\"scroll_step_delays\"") != null);
 }
 
 test "parseIpv4Addr: parses 127.0.0.1" {
