@@ -487,6 +487,42 @@ pub fn main(init: std.process.Init) !void {
     try bridge.enableDiagnostics(browser_trace_dir);
 
     // =========================================================================
+    // FINGERPRINT DIAGNOSTIC — Collect baseline BEFORE any Arkose interaction
+    // This writes browser-fingerprint.ndjson with ALL 25+ signals Arkose sees
+    // =========================================================================
+    std.debug.print("\n[FINGERPRINT] Collecting baseline fingerprint diagnostic...\n", .{});
+
+    const fingerprint_opt: ?browser_bridge.FingerprintDiagnostic = bridge.collectFingerprint() catch |err| blk: {
+        std.debug.print("[FINGERPRINT] Failed to collect fingerprint: {}\n", .{err});
+        break :blk null;
+    };
+
+    // Write to NDJSON file if we have data
+    if (fingerprint_opt) |fingerprint| {
+        var fp = fingerprint;
+        defer fp.deinit(allocator);
+
+        browser_bridge.writeFingerprintNDJSON(allocator, &fp, "before-arkose") catch |err| {
+            std.debug.print("[FINGERPRINT] Failed to write NDJSON: {}\n", .{err});
+        };
+
+        // Log key suspicious signals to console for immediate visibility
+        std.debug.print("\n[FINGERPRINT] === KEY SIGNALS ===\n", .{});
+        std.debug.print("[FINGERPRINT] navigator.webdriver: {?}\n", .{fp.navigator_webdriver});
+        std.debug.print("[FINGERPRINT] window.chrome exists: {}\n", .{fp.window_chrome_exists});
+        std.debug.print("[FINGERPRINT] chrome.runtime.connect: {}\n", .{fp.chrome_runtime_connect});
+        std.debug.print("[FINGERPRINT] WebGL vendor: {s}\n", .{fp.webgl_vendor});
+        std.debug.print("[FINGERPRINT] WebGL renderer: {s}\n", .{fp.webgl_renderer});
+        std.debug.print("[FINGERPRINT] CDP side-effect: {}\n", .{fp.cdp_runtime_enable_side_effect});
+        std.debug.print("[FINGERPRINT] SourceURL leak: {}\n", .{fp.sourceurl_leak});
+        std.debug.print("[FINGERPRINT] Console side-effects: {}\n", .{fp.console_debug_side_effects});
+        std.debug.print("[FINGERPRINT] NDJSON: browser-fingerprint.ndjson\n", .{});
+        std.debug.print("[FINGERPRINT] =====================\n\n", .{});
+    } else {
+        std.debug.print("[FINGERPRINT] Skipping diagnostic — fingerprint not available\n", .{});
+    }
+
+    // =========================================================================
     // ADIM 11.5: Final Signup Submission
     // =========================================================================
     std.debug.print("\n[SIGNUP] Preparing random credentials via digistallone...\n", .{});

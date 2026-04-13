@@ -90,6 +90,12 @@ pub const MAX_HARVEST_SIZE: usize = 65536;
 /// Maximum buffer size for browser_session_bridge.js source file
 pub const MAX_BRIDGE_SCRIPT_SIZE: usize = 32768;
 
+/// Maximum buffer size for fingerprint_diagnostic.js source file
+pub const MAX_DIAGNOSTIC_JS_SIZE: usize = 65536;
+
+/// Maximum buffer size for stealth_evasion.js source file
+pub const MAX_STEALTH_SCRIPT_SIZE: usize = 16384;
+
 /// WebSocket opcodes
 /// SOURCE: RFC 6455, Section 5.2 — Base Framing Protocol
 const WS_OPCODE_TEXT: u8 = 0x01;
@@ -343,6 +349,20 @@ pub const CdpClient = struct {
         const response = try self.sendCommand("Page.addScriptToEvaluateOnNewDocument", params);
         defer self.allocator.free(response);
         try ensureCdpCommandSucceeded(self.allocator, "Page.addScriptToEvaluateOnNewDocument", response);
+    }
+
+    /// Enable Runtime domain (triggers consoleAPICalled side-effect — use sparingly)
+    /// SOURCE: CDP spec — https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-enable
+    pub fn enableRuntime(self: *CdpClient) !void {
+        const response = try self.sendCommand("Runtime.enable", "{}");
+        defer self.allocator.free(response);
+    }
+
+    /// Disable Runtime domain (stops consoleAPICalled side-effect)
+    /// SOURCE: CDP spec — https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-disable
+    pub fn disableRuntime(self: *CdpClient) !void {
+        const response = try self.sendCommand("Runtime.disable", "{}");
+        defer self.allocator.free(response);
     }
 
     // SOURCE: Chrome DevTools Protocol Page.reload — reload the inspected page.
@@ -832,6 +852,22 @@ fn readBrowserSessionBridgeScript(buf: []u8) ![]u8 {
     return buf[0..total];
 }
 
+/// Read stealth_evasion.js source file from disk
+/// SOURCE: src/stealth_evasion.js — WebGL monkey-patch + chrome.runtime emulation
+fn readStealthEvasionScript(buf: []u8) ![]u8 {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "src/stealth_evasion.js", .{ .ACCMODE = .RDONLY }, 0) catch
+        return error.ReadFailed;
+    defer _ = std.c.close(fd);
+
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.posix.read(fd, buf[total..]) catch return error.ReadFailed;
+        if (n == 0) break;
+        total += n;
+    }
+    return buf[0..total];
+}
+
 fn sanitizeTraceLabel(label: []const u8, buf: []u8) []const u8 {
     var len: usize = 0;
     for (label) |ch| {
@@ -1063,6 +1099,90 @@ pub const HarvestResult = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Fingerprint Diagnostic — Arkose Labs BDA signal collection
+// SOURCE: PRD Diagnostic Signal Specification (prd.md)
+// SOURCE: puppeteer-extra-plugin-stealth evasion techniques
+// ---------------------------------------------------------------------------
+
+/// Fingerprint diagnostic data structure containing 25+ Arkose BDA signals
+/// NOTE: NOT a packed struct — contains variable-length string slices
+pub const FingerprintDiagnostic = struct {
+    stealth_script_loaded: bool,
+    stealth_errors: []const u8,
+    webgl_patched: bool,
+    chrome_runtime_emulated: bool,
+    navigator_webdriver: ?bool,
+    window_chrome_exists: bool,
+    chrome_runtime_connect: bool,
+    chrome_runtime_sendMessage: bool,
+    navigator_plugins_length: u32,
+    navigator_plugins_names: []const u8,
+    navigator_languages: []const u8,
+    navigator_platform: []const u8,
+    navigator_userAgent: []const u8,
+    screen_width: u32,
+    screen_height: u32,
+    screen_inner_width: u32,
+    screen_inner_height: u32,
+    webgl_vendor: []const u8,
+    webgl_renderer: []const u8,
+    canvas_hash: []const u8,
+    timezone_offset: i32,
+    language: []const u8,
+    notification_permission: []const u8,
+    permissions_notifications: []const u8,
+    permissions_geolocation: []const u8,
+    cdp_runtime_enable_side_effect: bool,
+    iframe_contentWindow_exists: bool,
+    console_debug_side_effects: bool,
+    sourceurl_leak: bool,
+
+    /// Free all allocator-owned string fields
+    pub fn deinit(self: *FingerprintDiagnostic, allocator: mem.Allocator) void {
+        allocator.free(self.navigator_plugins_names);
+        allocator.free(self.navigator_languages);
+        allocator.free(self.navigator_platform);
+        allocator.free(self.navigator_userAgent);
+        allocator.free(self.webgl_vendor);
+        allocator.free(self.webgl_renderer);
+        allocator.free(self.canvas_hash);
+        allocator.free(self.language);
+        allocator.free(self.notification_permission);
+        allocator.free(self.permissions_notifications);
+        allocator.free(self.permissions_geolocation);
+    }
+
+    comptime {
+        // Verify all 25 fields exist (AGENTS.md Section 2.2)
+        std.debug.assert(@hasField(@This(), "navigator_webdriver"));
+        std.debug.assert(@hasField(@This(), "window_chrome_exists"));
+        std.debug.assert(@hasField(@This(), "chrome_runtime_connect"));
+        std.debug.assert(@hasField(@This(), "chrome_runtime_sendMessage"));
+        std.debug.assert(@hasField(@This(), "navigator_plugins_length"));
+        std.debug.assert(@hasField(@This(), "navigator_plugins_names"));
+        std.debug.assert(@hasField(@This(), "navigator_languages"));
+        std.debug.assert(@hasField(@This(), "navigator_platform"));
+        std.debug.assert(@hasField(@This(), "navigator_userAgent"));
+        std.debug.assert(@hasField(@This(), "screen_width"));
+        std.debug.assert(@hasField(@This(), "screen_height"));
+        std.debug.assert(@hasField(@This(), "screen_inner_width"));
+        std.debug.assert(@hasField(@This(), "screen_inner_height"));
+        std.debug.assert(@hasField(@This(), "webgl_vendor"));
+        std.debug.assert(@hasField(@This(), "webgl_renderer"));
+        std.debug.assert(@hasField(@This(), "canvas_hash"));
+        std.debug.assert(@hasField(@This(), "timezone_offset"));
+        std.debug.assert(@hasField(@This(), "language"));
+        std.debug.assert(@hasField(@This(), "notification_permission"));
+        std.debug.assert(@hasField(@This(), "permissions_notifications"));
+        std.debug.assert(@hasField(@This(), "permissions_geolocation"));
+        std.debug.assert(@hasField(@This(), "cdp_runtime_enable_side_effect"));
+        std.debug.assert(@hasField(@This(), "iframe_contentWindow_exists"));
+        std.debug.assert(@hasField(@This(), "console_debug_side_effects"));
+        std.debug.assert(@hasField(@This(), "sourceurl_leak"));
+    }
+};
+
 const SignupHumanPlan = struct {
     email_key_delays: []u16,
     password_key_delays: []u16,
@@ -1194,6 +1314,17 @@ pub const BrowserBridge = struct {
         };
         errdefer bridge.deinit();
 
+        // STEP 1: Inject stealth script FIRST (runs before any page JS)
+        // SOURCE: scrapfly.io — stealth script must execute before Arkose enforcement.js
+        // The stealth script patches WebGL getParameter and emulates chrome.runtime
+        var stealth_script_buf: [MAX_STEALTH_SCRIPT_SIZE]u8 = undefined;
+        const stealth_script = readStealthEvasionScript(&stealth_script_buf) catch return BridgeError.ReadFailed;
+        bridge.cdp.addScriptOnNewDocument(stealth_script) catch |err| {
+            std.debug.print("[BRIDGE] stealth script addScriptOnNewDocument failed: {}\n", .{err});
+            // Non-fatal: continue without stealth (will be detected but functional)
+        };
+
+        // STEP 2: Inject bridge script (runs after stealth script)
         var bridge_script_buf: [MAX_BRIDGE_SCRIPT_SIZE]u8 = undefined;
         const bridge_script = readBrowserSessionBridgeScript(&bridge_script_buf) catch return BridgeError.ReadFailed;
         _ = blk: {
@@ -1310,12 +1441,85 @@ pub const BrowserBridge = struct {
                 self.parseCdpValue(identity_resp, "identity") catch {};
             }
 
-            // Sleep between polls
+            // Sleep briefly before next poll
             const sleep_req = std.os.linux.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_ms };
             _ = std.os.linux.nanosleep(&sleep_req, null);
         }
 
         return self.result;
+    }
+
+    /// Collect browser fingerprint diagnostic signals via CDP Runtime.evaluate
+    ///
+    /// Executes fingerprint_diagnostic.js which collects 25+ Arkose Labs BDA signals,
+    /// parses the JSON response, and returns a populated FingerprintDiagnostic struct.
+    /// Caller owns the returned struct and MUST call deinit() when done.
+    ///
+    /// SOURCE: PRD Diagnostic Signal Specification (prd.md)
+    /// SOURCE: CDP Runtime.evaluate — execute JavaScript in page context
+    pub fn collectFingerprint(self: *BrowserBridge) BridgeError!FingerprintDiagnostic {
+        // Step 0: Inject stealth script into CURRENT page (it was only registered for NEW documents)
+        var stealth_buf: [MAX_STEALTH_SCRIPT_SIZE]u8 = undefined;
+        const stealth_js = readStealthEvasionScript(&stealth_buf) catch |err| {
+            std.debug.print("[BRIDGE] Failed to read stealth_evasion.js: {}\n", .{err});
+            return BridgeError.ReadFailed;
+        };
+        const stealth_result = self.cdp.evaluate(stealth_js) catch |err| blk: {
+            std.debug.print("[BRIDGE] Failed to inject stealth script into current page: {}\n", .{err});
+            // Non-fatal: continue without stealth
+            break :blk &[0]u8{};
+        };
+        defer self.allocator.free(stealth_result);
+
+        // Step 1: Read diagnostic JS source
+        var diagnostic_buf: [MAX_DIAGNOSTIC_JS_SIZE]u8 = undefined;
+        const diagnostic_js = readFingerprintDiagnostic(&diagnostic_buf) catch |err| {
+            std.debug.print("[BRIDGE] Failed to read fingerprint_diagnostic.js: {}\n", .{err});
+            return BridgeError.ReadFailed;
+        };
+
+        // Step 2: Execute via CDP Runtime.evaluate
+        std.debug.print("[BRIDGE] Collecting fingerprint diagnostic ({d} bytes)...\n", .{diagnostic_js.len});
+        const response = self.cdp.evaluate(diagnostic_js) catch |err| {
+            std.debug.print("[BRIDGE] Failed to execute fingerprint diagnostic: {}\n", .{err});
+            return BridgeError.CdpError;
+        };
+        defer self.allocator.free(response);
+        std.debug.print("[BRIDGE] Fingerprint diagnostic response received ({d} bytes)\n", .{response.len});
+
+        // Step 3: Extract inner JSON from CDP response
+        const inner_json = extractDiagnosticJson(self.allocator, response) catch |err| {
+            std.debug.print("[BRIDGE] Failed to parse fingerprint diagnostic response: {}\n", .{err});
+            return BridgeError.ParseFailed;
+        };
+        defer self.allocator.free(inner_json);
+
+        // Step 4: Parse JSON into FingerprintDiagnostic struct
+        var parsed = std.json.parseFromSlice(FingerprintDiagnostic, self.allocator, inner_json, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            std.debug.print("[BRIDGE] Failed to parse fingerprint diagnostic JSON: {}\n", .{err});
+            return BridgeError.ParseFailed;
+        };
+        defer parsed.deinit();
+
+        // Step 5: Duplicate strings into allocator-owned memory
+        // (parsed struct fields point to temporary JSON buffer memory)
+        var diagnostic = parsed.value;
+        diagnostic.navigator_plugins_names = self.allocator.dupe(u8, diagnostic.navigator_plugins_names) catch return BridgeError.OutOfMemory;
+        diagnostic.navigator_languages = self.allocator.dupe(u8, diagnostic.navigator_languages) catch return BridgeError.OutOfMemory;
+        diagnostic.navigator_platform = self.allocator.dupe(u8, diagnostic.navigator_platform) catch return BridgeError.OutOfMemory;
+        diagnostic.navigator_userAgent = self.allocator.dupe(u8, diagnostic.navigator_userAgent) catch return BridgeError.OutOfMemory;
+        diagnostic.webgl_vendor = self.allocator.dupe(u8, diagnostic.webgl_vendor) catch return BridgeError.OutOfMemory;
+        diagnostic.webgl_renderer = self.allocator.dupe(u8, diagnostic.webgl_renderer) catch return BridgeError.OutOfMemory;
+        diagnostic.canvas_hash = self.allocator.dupe(u8, diagnostic.canvas_hash) catch return BridgeError.OutOfMemory;
+        diagnostic.language = self.allocator.dupe(u8, diagnostic.language) catch return BridgeError.OutOfMemory;
+        diagnostic.notification_permission = self.allocator.dupe(u8, diagnostic.notification_permission) catch return BridgeError.OutOfMemory;
+        diagnostic.permissions_notifications = self.allocator.dupe(u8, diagnostic.permissions_notifications) catch return BridgeError.OutOfMemory;
+        diagnostic.permissions_geolocation = self.allocator.dupe(u8, diagnostic.permissions_geolocation) catch return BridgeError.OutOfMemory;
+
+        std.debug.print("[BRIDGE] Fingerprint diagnostic complete\n", .{});
+        return diagnostic;
     }
 
     pub fn captureSignupBundle(
@@ -2249,6 +2453,23 @@ fn readHarvestJs(buf: []u8) ![]u8 {
     return buf[0..total];
 }
 
+/// Read fingerprint_diagnostic.js source file from disk
+/// SOURCE: man 2 openat — open file relative to cwd
+/// SOURCE: man 2 read — read from file descriptor
+fn readFingerprintDiagnostic(buf: []u8) ![]u8 {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "src/fingerprint_diagnostic.js", .{ .ACCMODE = .RDONLY }, 0) catch
+        return error.ReadFailed;
+    defer _ = std.c.close(fd);
+
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.posix.read(fd, buf[total..]) catch return error.ReadFailed;
+        if (n == 0) break;
+        total += n;
+    }
+    return buf[0..total];
+}
+
 fn buildJitterDelaySequence(
     allocator: std.mem.Allocator,
     len: usize,
@@ -2477,6 +2698,20 @@ fn extractRuntimeEvaluateStringValue(allocator: std.mem.Allocator, response: []c
         return error.ParseFailed;
     }
     return allocator.dupe(u8, raw_value.string);
+}
+
+/// Extract JSON string from CDP Runtime.evaluate diagnostic response
+/// CDP returns: {"id":N,"result":{"result":{"type":"string","value":"{...JSON...}"}}}
+/// The value field is a JSON-escaped string containing another JSON object.
+/// This function extracts and unescapes that inner JSON string.
+fn extractDiagnosticJson(allocator: std.mem.Allocator, cdp_response: []const u8) ![]u8 {
+    // Step 1: Extract the string value from CDP response (already unescaped by extractRuntimeEvaluateStringValue)
+    const escaped_json = try extractRuntimeEvaluateStringValue(allocator, cdp_response);
+    defer allocator.free(escaped_json);
+
+    // Step 2: The extracted string IS the inner JSON — parse it as FingerprintDiagnostic
+    // No additional unescaping needed since extractRuntimeEvaluateStringValue already handles \\, \", etc.
+    return allocator.dupe(u8, escaped_json);
 }
 
 fn extractTopLevelMessageId(allocator: std.mem.Allocator, response: []const u8) ?u32 {
@@ -2823,4 +3058,185 @@ test "parseFetchRequestPaused: extracts ordered headers and postData" {
     try std.testing.expectEqualStrings("user-agent", paused.bundle.headers[0].name);
     try std.testing.expectEqualStrings("sec-fetch-mode", paused.bundle.headers[1].name);
     try std.testing.expectEqualStrings("cookie", paused.bundle.headers[2].name);
+}
+
+test "FingerprintDiagnostic: round-trip JSON parsing with all 25 fields" {
+    const allocator = std.testing.allocator;
+
+    // Mock CDP response with all 25 fields populated
+    // NOTE: navigator_plugins_names and navigator_languages are JSON strings (arrays stringified)
+    const mock_cdp_response =
+        \\{"id":1,"result":{"result":{"type":"string","value":"{\"stealth_script_loaded\":true,\"stealth_errors\":\"[]\",\"webgl_patched\":true,\"chrome_runtime_emulated\":true,\"navigator_webdriver\":false,\"window_chrome_exists\":true,\"chrome_runtime_connect\":true,\"chrome_runtime_sendMessage\":true,\"navigator_plugins_length\":3,\"navigator_plugins_names\":\"[\\\"Chrome PDF Plugin\\\",\\\"Chrome PDF Viewer\\\",\\\"Native Client\\\"]\",\"navigator_languages\":\"[\\\"en-US\\\",\\\"en\\\"]\",\"navigator_platform\":\"Linux x86_64\",\"navigator_userAgent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\",\"screen_width\":1920,\"screen_height\":1080,\"screen_inner_width\":1920,\"screen_inner_height\":1040,\"webgl_vendor\":\"Google Inc. (NVIDIA)\",\"webgl_renderer\":\"ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)\",\"canvas_hash\":\"a1b2c3d4e5f6g7h8\",\"timezone_offset\":-180,\"language\":\"en-US\",\"notification_permission\":\"default\",\"permissions_notifications\":\"query_supported\",\"permissions_geolocation\":\"query_supported\",\"cdp_runtime_enable_side_effect\":false,\"iframe_contentWindow_exists\":true,\"console_debug_side_effects\":false,\"sourceurl_leak\":false}"}}}
+    ;
+
+    // Extract inner JSON from CDP response
+    const inner_json = try extractDiagnosticJson(allocator, mock_cdp_response);
+    defer allocator.free(inner_json);
+
+    // Parse into FingerprintDiagnostic struct
+    var parsed = try std.json.parseFromSlice(FingerprintDiagnostic, allocator, inner_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    // Verify all 29 fields are present and correct
+    const diag = parsed.value;
+    try std.testing.expect(diag.stealth_script_loaded == true);
+    try std.testing.expectEqualStrings("[]", diag.stealth_errors);
+    try std.testing.expect(diag.webgl_patched == true);
+    try std.testing.expect(diag.chrome_runtime_emulated == true);
+    try std.testing.expect(diag.navigator_webdriver == false);
+    try std.testing.expect(diag.window_chrome_exists == true);
+    try std.testing.expect(diag.chrome_runtime_connect == true);
+    try std.testing.expect(diag.chrome_runtime_sendMessage == true);
+    try std.testing.expectEqual(@as(u32, 3), diag.navigator_plugins_length);
+    try std.testing.expectEqualStrings(
+        "[\"Chrome PDF Plugin\",\"Chrome PDF Viewer\",\"Native Client\"]",
+        diag.navigator_plugins_names,
+    );
+    try std.testing.expectEqualStrings("[\"en-US\",\"en\"]", diag.navigator_languages);
+    try std.testing.expectEqualStrings("Linux x86_64", diag.navigator_platform);
+    try std.testing.expectEqualStrings(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        diag.navigator_userAgent,
+    );
+    try std.testing.expectEqual(@as(u32, 1920), diag.screen_width);
+    try std.testing.expectEqual(@as(u32, 1080), diag.screen_height);
+    try std.testing.expectEqual(@as(u32, 1920), diag.screen_inner_width);
+    try std.testing.expectEqual(@as(u32, 1040), diag.screen_inner_height);
+    try std.testing.expectEqualStrings("Google Inc. (NVIDIA)", diag.webgl_vendor);
+    try std.testing.expectEqualStrings(
+        "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        diag.webgl_renderer,
+    );
+    try std.testing.expectEqualStrings("a1b2c3d4e5f6g7h8", diag.canvas_hash);
+    try std.testing.expectEqual(@as(i32, -180), diag.timezone_offset);
+    try std.testing.expectEqualStrings("en-US", diag.language);
+    try std.testing.expectEqualStrings("default", diag.notification_permission);
+    try std.testing.expectEqualStrings("query_supported", diag.permissions_notifications);
+    try std.testing.expectEqualStrings("query_supported", diag.permissions_geolocation);
+    try std.testing.expect(diag.cdp_runtime_enable_side_effect == false);
+    try std.testing.expect(diag.iframe_contentWindow_exists == true);
+    try std.testing.expect(diag.console_debug_side_effects == false);
+    try std.testing.expect(diag.sourceurl_leak == false);
+}
+
+// ---------------------------------------------------------------------------
+// NDJSON Output
+// ---------------------------------------------------------------------------
+
+/// Write fingerprint diagnostic result to NDJSON file
+/// Each line is a complete JSON object with timestamp, tag, and all diagnostic values
+/// SOURCE: NDJSON spec (https://ndjson.org/)
+/// Uses same pattern as existing NDJSON writers: line_buf.appendSlice + writeAll(fd)
+pub fn writeFingerprintNDJSON(
+    allocator: std.mem.Allocator,
+    diagnostic: *const FingerprintDiagnostic,
+    tag: []const u8,
+) !void {
+    // Get current timestamp
+    var ts: std.posix.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    const now_ns: i64 = @intCast(@as(i128, @intCast(ts.sec)) * std.time.ns_per_s + @as(i128, @intCast(ts.nsec)));
+
+    // Build NDJSON line using appendSlice pattern (same as writeAuditLogNDJSON)
+    var line_buf = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    defer line_buf.deinit(allocator);
+
+    var num_buf: [32]u8 = undefined;
+
+    try line_buf.appendSlice(allocator, "{\"timestamp_ns\":");
+    const ts_len = try std.fmt.bufPrint(&num_buf, "{d}", .{now_ns});
+    try line_buf.appendSlice(allocator, ts_len);
+    try line_buf.appendSlice(allocator, ",\"tag\":\"");
+    try line_buf.appendSlice(allocator, tag);
+    try line_buf.appendSlice(allocator, "\",\"stealth_script_loaded\":");
+    try line_buf.appendSlice(allocator, fmtBool(diagnostic.stealth_script_loaded));
+    try line_buf.appendSlice(allocator, ",\"stealth_errors\":");
+    try line_buf.appendSlice(allocator, diagnostic.stealth_errors);
+    try line_buf.appendSlice(allocator, ",\"webgl_patched\":");
+    try line_buf.appendSlice(allocator, fmtBool(diagnostic.webgl_patched));
+    try line_buf.appendSlice(allocator, ",\"chrome_runtime_emulated\":");
+    try line_buf.appendSlice(allocator, fmtBool(diagnostic.chrome_runtime_emulated));
+    try line_buf.appendSlice(allocator, ",\"navigator_webdriver\":");
+    try line_buf.appendSlice(allocator, fmtBoolOptional(diagnostic.navigator_webdriver));
+    try line_buf.appendSlice(allocator, ",\"window_chrome_exists\":");
+    try line_buf.appendSlice(allocator, fmtBool(diagnostic.window_chrome_exists));
+    try line_buf.appendSlice(allocator, ",\"chrome_runtime_connect\":");
+    try line_buf.appendSlice(allocator, fmtBool(diagnostic.chrome_runtime_connect));
+    try line_buf.appendSlice(allocator, ",\"chrome_runtime_sendMessage\":");
+    try line_buf.appendSlice(allocator, fmtBool(diagnostic.chrome_runtime_sendMessage));
+    try line_buf.appendSlice(allocator, ",\"navigator_plugins_length\":");
+    const npl_len = try std.fmt.bufPrint(&num_buf, "{d}", .{diagnostic.navigator_plugins_length});
+    try line_buf.appendSlice(allocator, npl_len);
+    try line_buf.appendSlice(allocator, ",\"navigator_plugins_names\":\"");
+    try line_buf.appendSlice(allocator, diagnostic.navigator_plugins_names);
+    try line_buf.appendSlice(allocator, "\",\"navigator_languages\":\"");
+    try line_buf.appendSlice(allocator, diagnostic.navigator_languages);
+    try line_buf.appendSlice(allocator, "\",\"navigator_platform\":\"");
+    try line_buf.appendSlice(allocator, diagnostic.navigator_platform);
+    try line_buf.appendSlice(allocator, "\",\"navigator_userAgent\":\"");
+    try line_buf.appendSlice(allocator, diagnostic.navigator_userAgent);
+    try line_buf.appendSlice(allocator, "\",\"screen_width\":");
+    const sw_len = try std.fmt.bufPrint(&num_buf, "{d}", .{diagnostic.screen_width});
+    try line_buf.appendSlice(allocator, sw_len);
+    try line_buf.appendSlice(allocator, ",\"screen_height\":");
+    const sh_len = try std.fmt.bufPrint(&num_buf, "{d}", .{diagnostic.screen_height});
+    try line_buf.appendSlice(allocator, sh_len);
+    try line_buf.appendSlice(allocator, ",\"screen_inner_width\":");
+    const siw_len = try std.fmt.bufPrint(&num_buf, "{d}", .{diagnostic.screen_inner_width});
+    try line_buf.appendSlice(allocator, siw_len);
+    try line_buf.appendSlice(allocator, ",\"screen_inner_height\":");
+    const sih_len = try std.fmt.bufPrint(&num_buf, "{d}", .{diagnostic.screen_inner_height});
+    try line_buf.appendSlice(allocator, sih_len);
+    try line_buf.appendSlice(allocator, ",\"webgl_vendor\":\"");
+    try line_buf.appendSlice(allocator, diagnostic.webgl_vendor);
+    try line_buf.appendSlice(allocator, "\",\"webgl_renderer\":\"");
+    try line_buf.appendSlice(allocator, diagnostic.webgl_renderer);
+    try line_buf.appendSlice(allocator, "\",\"canvas_hash\":\"");
+    try line_buf.appendSlice(allocator, diagnostic.canvas_hash);
+    try line_buf.appendSlice(allocator, "\",\"timezone_offset\":");
+    const tz_len = try std.fmt.bufPrint(&num_buf, "{d}", .{diagnostic.timezone_offset});
+    try line_buf.appendSlice(allocator, tz_len);
+    try line_buf.appendSlice(allocator, ",\"language\":\"");
+    try line_buf.appendSlice(allocator, diagnostic.language);
+    try line_buf.appendSlice(allocator, "\",\"notification_permission\":\"");
+    try line_buf.appendSlice(allocator, diagnostic.notification_permission);
+    try line_buf.appendSlice(allocator, "\",\"permissions_notifications\":\"");
+    try line_buf.appendSlice(allocator, diagnostic.permissions_notifications);
+    try line_buf.appendSlice(allocator, "\",\"permissions_geolocation\":\"");
+    try line_buf.appendSlice(allocator, diagnostic.permissions_geolocation);
+    try line_buf.appendSlice(allocator, "\",\"cdp_runtime_enable_side_effect\":");
+    try line_buf.appendSlice(allocator, fmtBool(diagnostic.cdp_runtime_enable_side_effect));
+    try line_buf.appendSlice(allocator, ",\"iframe_contentWindow_exists\":");
+    try line_buf.appendSlice(allocator, fmtBool(diagnostic.iframe_contentWindow_exists));
+    try line_buf.appendSlice(allocator, ",\"console_debug_side_effects\":");
+    try line_buf.appendSlice(allocator, fmtBool(diagnostic.console_debug_side_effects));
+    try line_buf.appendSlice(allocator, ",\"sourceurl_leak\":");
+    try line_buf.appendSlice(allocator, fmtBool(diagnostic.sourceurl_leak));
+    try line_buf.appendSlice(allocator, "}\n");
+
+    // Write to NDJSON file using open+writeAll pattern (same as writeAuditLogNDJSON)
+    // Try to open existing file for append, or create new
+    var open_flags = std.posix.O{};
+    open_flags.ACCMODE = .WRONLY;
+    open_flags.CREAT = true;
+    open_flags.APPEND = true;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "browser-fingerprint.ndjson", open_flags, 0o644) catch |err| {
+        std.debug.print("[BRIDGE] Failed to open NDJSON file: {}\n", .{err});
+        return err;
+    };
+    defer _ = std.c.close(fd);
+
+    try writeAll(fd, line_buf.items.ptr, line_buf.items.len);
+    std.debug.print("[BRIDGE] Wrote fingerprint diagnostic to NDJSON (tag={s})\n", .{tag});
+}
+
+// NDJSON formatting helpers
+fn fmtBoolOptional(value: ?bool) []const u8 {
+    if (value) |v| return if (v) "true" else "false";
+    return "null";
+}
+fn fmtBool(value: bool) []const u8 {
+    return if (value) "true" else "false";
 }

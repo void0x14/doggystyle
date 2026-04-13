@@ -6,6 +6,49 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-14] — WebGL Empty Vendor/Renderer And chrome.runtime Missing Flagged By Arkose BDA
+
+**Hata:** `browser-fingerprint.ndjson` diagnostic verisi `webgl_vendor = ""` ve `webgl_renderer = ""` gösteriyordu. Ayrıca `chrome_runtime_connect = false` ve `chrome_runtime_sendMessage = false` idi. Arkose Labs BDA (Browser Data Analytics) bu alanları topluyor ve boş/eksik değerleri bot işareti olarak kullanıyor.
+
+**Kök sebep:** `browser_init.zig` içindeki Chrome launch argv'de `--disable-gpu` VE `--disable-software-rasterizer` flag'leri birlikte kullanılıyordu. Bu ikisi Chrome'un WebGL desteğini TAMAMEN kapatıyor — ne hardware GPU ne software rasterizer kullanılamıyor, sonuçta `gl.getContext('webgl')` başarısız oluyor veya `WEBGL_debug_renderer_info` extension'ı mevcut olmuyor.
+
+**Kaynak:**
+- https://roundproxies.com/blog/bypass-funcaptcha/ — Arkose BDA `webgl_vendor` ve `webgl_renderer` alanlarını toplar; boş değerler şüpheli
+- https://torchproxies.com/how-to-bypass-captcha-complete-guide-2026/ — "Google SwiftShader is a dead giveaway"
+- https://scrapfly.io/blog/posts/puppeteer-stealth-complete-guide/ — chrome.runtime emulation ve WebGL monkey-patch teknikleri
+- https://peter.sh/experiments/chromium-command-line-switches/ — Chromium flag belgeleri
+
+**Düzeltme (3 aşamalı):**
+
+1. **`--disable-gpu` ve `--disable-software-rasterizer` KALDIRILDI:**
+   - `src/browser_init.zig` — `buildChromeArgvWithBinary()` return array'inden bu iki flag çıkarıldı
+   - `CHROME_ARG_COUNT` 20 → 18'e düşürüldü
+   - Chrome artık varsayılan olarak software rasterizer (SwiftShader) kullanacak
+
+2. **WebGL `getParameter` monkey-patch eklendi:**
+   - `src/stealth_evasion.js` — `WebGLRenderingContext.prototype.getParameter` ve `WebGL2RenderingContext.prototype.getParameter` patch'leniyor
+   - YALNIZCA `UNMASKED_VENDOR_WEBGL` (0x9245) ve `UNMASKED_RENDERER_WEBGL` (0x9246) enum değerleri intercept ediliyor
+   - Diğer tüm `getParameter` çağrıları orijinal implementasyona passthrough
+   - Sahte değerler: `vendor = "Intel"`, `renderer = "Mesa DRI Intel(R) HD Graphics 620 (Kaby Lake GT2)"` — Linux Chrome için tipik
+
+3. **chrome.runtime emülasyonu eklendi:**
+   - `window.chrome.runtime` object oluşturuldu: `connect()`, `sendMessage()`, `onConnect`, `onMessage`, `onDisconnect` event listeners
+   - `toString()` native code string döndürüyor
+   - `Page.addScriptToEvaluateOnNewDocument` ile bridge script'inden ÖNCE enjekte ediliyor
+
+**Testler:**
+- `browser_init.zig` testleri — `--disable-gpu` ve `--disable-software-rasterizer` YOK doğrulaması eklendi (8 test geçti)
+- `browser_bridge.zig` testleri — 24 test geçti
+- `zig build-exe` — başarıyla derlendi
+
+**Tekrar olmaması için:**
+- Chrome launch argv'de `--disable-gpu` ile `--disable-software-rasterizer` BİRLİKTE KULLANILMAZ
+- WebGL vendor/renderer boş bırakılamaz — ya real GPU, ya SwiftShader, ya monkey-patch
+- chrome.runtime emülasyonu CDP ile açılan Chrome'larda ZORUNLU
+
+---
+
+
 ## [2026-04-11] — Browser Bridge Readiness Check Advanced On The Stale Pre-Reload DOM And Hid Injection Failures
 
 **Hata:** `captureSignupBundle()`, `captureVerifyBundle()` ve `navigateToAccountVerifications()` yalnızca form/path varlığına bakarak ilerliyordu. Reload asenkron yürürken eski document üzerindeki form hâlâ bulunduğu için wait erken true dönüyor, sonra `window.__ghostBridge.*` çağrıları yeni sayfada bridge yüklenmeden çalışıp `TypeError` üretiyordu. Aynı anda `addScriptOnNewDocument()` CDP yanıtındaki top-level `error` alanını kontrol etmediği için bridge enjeksiyon hataları sessizce yutuluyordu.

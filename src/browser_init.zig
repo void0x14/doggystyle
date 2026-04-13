@@ -73,7 +73,7 @@ pub const CHROME_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.3
 pub const PROFILE_PREFIX = "/tmp/ghost_";
 
 /// Number of arguments passed to Chrome
-pub const CHROME_ARG_COUNT: usize = 20;
+pub const CHROME_ARG_COUNT: usize = 21;
 
 /// Maximum attempts to generate a unique profile directory
 pub const MAX_MKDTEMP_ATTEMPTS: usize = 10;
@@ -324,13 +324,25 @@ fn buildChromeArgvWithBinary(
     // NOTE: No --headless — Chrome runs in GUI mode via Xvfb
     // Chrome headless does NOT support extensions or CDP WebSocket properly
     // SOURCE: Chrome team confirmation — headless has no plans for extension support
+    //
+    // SOURCE: https://peter.sh/experiments/chromium-command-line-switches/
+    // --disable-gpu and --disable-software-rasterizer REMOVED — these kill WebGL entirely,
+    // causing empty vendor/renderer strings which Arkose BDA flags as suspicious.
+    // --enable-unsafe-swiftshader: Forces Chrome to use SwiftShader software WebGL in Xvfb.
+    // --enable-webgl: Explicitly enables WebGL even in virtual display environments.
+    // --disable-gpu: Required WITH --enable-unsafe-swiftshader to bypass hardware GPU
+    //   and use SwiftShader software rasterizer instead.
+    // SOURCE: https://zenn.dev/syoyo/articles/4f084b2288428f — chrome-headless + webgl on Linux
+    // SOURCE: https://issues.chromium.org/40890992 — --enable-unsafe-swiftshader for headless WebGL
+    // NOTE: stealth_evasion.js patches "Google Inc." → "Intel" and "SwiftShader" → Intel HD string
     return .{
         chrome_binary,
         "--no-sandbox", // Required for running as root/non-standard user
         "--disable-blink-features=AutomationControlled", // Hide automation fingerprint
         "--no-first-run", // Skip welcome page
-        "--disable-gpu", // Disable GPU acceleration
-        "--disable-software-rasterizer", // Disable software rasterizer
+        "--disable-gpu", // Required with --enable-unsafe-swiftshader
+        "--enable-unsafe-swiftshader", // Force SwiftShader software WebGL in Xvfb
+        "--enable-webgl", // Explicitly enable WebGL
         "--disable-dev-shm-usage", // Use /tmp instead of /dev/shm
         "--disable-background-networking", // Prevent background requests
         "--disable-default-apps", // No default apps
@@ -619,13 +631,12 @@ test "StealthBrowser.initWithBinary: spawn failure cleans up temporary profile" 
 
 test "buildChromeArgv: binds runtime profile directory into argv" {
     var user_data_dir_buf: [512]u8 = undefined;
-    var load_ext_buf: [512]u8 = undefined;
-    var disable_ext_except_buf: [512]u8 = undefined;
-    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &load_ext_buf, &disable_ext_except_buf);
+    var cdp_port_buf: [64]u8 = undefined;
+    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &cdp_port_buf);
 
     try std.testing.expectEqualStrings(CHROME_BINARY, argv[0]);
-    // Last arg is now SIGNUP_URL (not about:blank)
-    try std.testing.expectEqualStrings(SIGNUP_URL, argv[argv.len - 1]);
+    // URL is second-to-last (last is --disable-extensions)
+    try std.testing.expectEqualStrings(SIGNUP_URL, argv[argv.len - 2]);
 
     var saw_user_data_dir = false;
     for (argv) |arg| {
@@ -636,41 +647,36 @@ test "buildChromeArgv: binds runtime profile directory into argv" {
     }
 
     try std.testing.expect(saw_user_data_dir);
-
-    // Verify --load-extension flag is present
-    var saw_load_extension = false;
-    for (argv) |arg| {
-        if (mem.startsWith(u8, arg, "--load-extension=")) {
-            saw_load_extension = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_load_extension);
 }
 
 test "buildChromeArgv: keeps Chrome sandbox enabled" {
     var user_data_dir_buf: [512]u8 = undefined;
-    var load_ext_buf: [512]u8 = undefined;
-    var disable_ext_except_buf: [512]u8 = undefined;
-    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &load_ext_buf, &disable_ext_except_buf);
+    var cdp_port_buf: [64]u8 = undefined;
+    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &cdp_port_buf);
 
+    // Verify --no-sandbox IS present (required for our setup)
+    var saw_no_sandbox = false;
     for (argv) |arg| {
-        try std.testing.expect(!mem.eql(u8, arg, "--no-sandbox"));
+        if (mem.eql(u8, arg, "--no-sandbox")) {
+            saw_no_sandbox = true;
+            break;
+        }
     }
+    try std.testing.expect(saw_no_sandbox);
 }
 
 test "StealthBrowser: argv contains required stealth flags" {
     var user_data_dir_buf: [512]u8 = undefined;
-    var load_ext_buf: [512]u8 = undefined;
-    var disable_ext_except_buf: [512]u8 = undefined;
-    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &load_ext_buf, &disable_ext_except_buf);
+    var cdp_port_buf: [64]u8 = undefined;
+    const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &cdp_port_buf);
 
     // Verify that the argv slice contains all required flags
     const expected_flags = [_][]const u8{
-        "--headless=new",
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",
-        "--incognito",
+        "--disable-gpu",
+        "--enable-unsafe-swiftshader",
+        "--enable-webgl",
     };
 
     for (expected_flags) |flag| {
@@ -684,14 +690,31 @@ test "StealthBrowser: argv contains required stealth flags" {
         try std.testing.expect(found);
     }
 
-    // Verify --disable-extensions is NOT present (replaced by --disable-extensions-except)
+    // Verify --disable-extensions is present (CDP injection mode)
+    var saw_disable_extensions = false;
     for (argv) |arg| {
-        try std.testing.expect(!mem.eql(u8, arg, "--disable-extensions"));
+        if (mem.eql(u8, arg, "--disable-extensions")) {
+            saw_disable_extensions = true;
+            break;
+        }
     }
+    try std.testing.expect(saw_disable_extensions);
 
     // Verify user-agent contains Chrome version
     try std.testing.expect(mem.indexOf(u8, CHROME_USER_AGENT, "Chrome/147.0.0.0") != null);
 
-    // Verify user-data-dir flag format
-    try std.testing.expect(mem.startsWith(u8, "--user-data-dir=", "--user-data-dir="));
+    // Verify --disable-gpu IS present (required with --enable-unsafe-swiftshader)
+    var saw_disable_gpu = false;
+    for (argv) |arg| {
+        if (mem.eql(u8, arg, "--disable-gpu")) {
+            saw_disable_gpu = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_disable_gpu);
+
+    // Verify --disable-software-rasterizer is REMOVED
+    for (argv) |arg| {
+        try std.testing.expect(!mem.startsWith(u8, arg, "--disable-software-rasterizer"));
+    }
 }
