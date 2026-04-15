@@ -73,7 +73,7 @@ pub const CHROME_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.3
 pub const PROFILE_PREFIX = "/tmp/ghost_";
 
 /// Number of arguments passed to Chrome
-pub const CHROME_ARG_COUNT: usize = 21;
+pub const CHROME_ARG_COUNT: usize = 18;
 
 /// Maximum attempts to generate a unique profile directory
 pub const MAX_MKDTEMP_ATTEMPTS: usize = 10;
@@ -326,23 +326,16 @@ fn buildChromeArgvWithBinary(
     // SOURCE: Chrome team confirmation — headless has no plans for extension support
     //
     // SOURCE: https://peter.sh/experiments/chromium-command-line-switches/
-    // --disable-gpu and --disable-software-rasterizer REMOVED — these kill WebGL entirely,
-    // causing empty vendor/renderer strings which Arkose BDA flags as suspicious.
-    // --enable-unsafe-swiftshader: Forces Chrome to use SwiftShader software WebGL in Xvfb.
-    // --enable-webgl: Explicitly enables WebGL even in virtual display environments.
-    // --disable-gpu: Required WITH --enable-unsafe-swiftshader to bypass hardware GPU
-    //   and use SwiftShader software rasterizer instead.
+    // GPU-related overrides (--disable-gpu, --enable-unsafe-swiftshader, --enable-webgl)
+    // are REMOVED to ensure Chrome uses the hardware/Xvfb GPU by default.
+    // This prevents "Google Inc. / SwiftShader" from appearing in WebGL fingerprint.
     // SOURCE: https://zenn.dev/syoyo/articles/4f084b2288428f — chrome-headless + webgl on Linux
-    // SOURCE: https://issues.chromium.org/40890992 — --enable-unsafe-swiftshader for headless WebGL
     // NOTE: stealth_evasion.js patches "Google Inc." → "Intel" and "SwiftShader" → Intel HD string
     return .{
         chrome_binary,
         "--no-sandbox", // Required for running as root/non-standard user
         "--disable-blink-features=AutomationControlled", // Hide automation fingerprint
         "--no-first-run", // Skip welcome page
-        "--disable-gpu", // Required with --enable-unsafe-swiftshader
-        "--enable-unsafe-swiftshader", // Force SwiftShader software WebGL in Xvfb
-        "--enable-webgl", // Explicitly enable WebGL
         "--disable-dev-shm-usage", // Use /tmp instead of /dev/shm
         "--disable-background-networking", // Prevent background requests
         "--disable-default-apps", // No default apps
@@ -674,9 +667,6 @@ test "StealthBrowser: argv contains required stealth flags" {
     const expected_flags = [_][]const u8{
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",
-        "--disable-gpu",
-        "--enable-unsafe-swiftshader",
-        "--enable-webgl",
     };
 
     for (expected_flags) |flag| {
@@ -703,18 +693,11 @@ test "StealthBrowser: argv contains required stealth flags" {
     // Verify user-agent contains Chrome version
     try std.testing.expect(mem.indexOf(u8, CHROME_USER_AGENT, "Chrome/147.0.0.0") != null);
 
-    // Verify --disable-gpu IS present (required with --enable-unsafe-swiftshader)
-    var saw_disable_gpu = false;
+    // Verify GPU-killing flags are REMOVED
     for (argv) |arg| {
-        if (mem.eql(u8, arg, "--disable-gpu")) {
-            saw_disable_gpu = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_disable_gpu);
-
-    // Verify --disable-software-rasterizer is REMOVED
-    for (argv) |arg| {
+        try std.testing.expect(!mem.startsWith(u8, arg, "--disable-gpu"));
+        try std.testing.expect(!mem.startsWith(u8, arg, "--enable-unsafe-swiftshader"));
+        try std.testing.expect(!mem.startsWith(u8, arg, "--enable-webgl"));
         try std.testing.expect(!mem.startsWith(u8, arg, "--disable-software-rasterizer"));
     }
 }
