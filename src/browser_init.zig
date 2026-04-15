@@ -10,6 +10,13 @@
 // - --remote-debugging-port=9222 exposes CDP for WebSocket communication
 // - --remote-allow-origins=* allows WebSocket connections from any origin
 //
+// GPU ACCESS ANALYSIS (2026-04-15):
+// - Xvfb is a PURE SOFTWARE X server. It does NOT support hardware GPU passthrough/DRI by default.
+// - Even with GLX extensions, Xvfb uses Mesa software rasterizers (llvmpipe/swrast).
+// - Chrome defaults to SwiftShader in Xvfb. --use-gl=desktop forces Chrome to attempt
+//   desktop GLX, but in Xvfb this still maps to software Mesa.
+// - FOR REAL GPU ACCESS: Use Xorg with 'dummy' driver + GPU passthrough, or VirtualGL (vglrun).
+//
 // SOURCE: Chrome headless does NOT support extensions — https://groups.google.com/a/chromium.org/g/headless-dev/c/nEoeUkoNI0o
 // SOURCE: Chrome DevTools Protocol — https://chromedevtools.github.io/devtools-protocol/
 // SOURCE: Xvfb — X Virtual Framebuffer (provides X11 display without physical screen)
@@ -73,7 +80,7 @@ pub const CHROME_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.3
 pub const PROFILE_PREFIX = "/tmp/ghost_";
 
 /// Number of arguments passed to Chrome
-pub const CHROME_ARG_COUNT: usize = 18;
+pub const CHROME_ARG_COUNT: usize = 19;
 
 /// Maximum attempts to generate a unique profile directory
 pub const MAX_MKDTEMP_ATTEMPTS: usize = 10;
@@ -350,6 +357,7 @@ fn buildChromeArgvWithBinary(
         user_data_dir_arg,
         actual_start_url, // Start page (github.com/signup or custom)
         "--disable-extensions", // No extensions — CDP injects JS instead
+        "--use-gl=desktop", // Force desktop OpenGL (GLX) instead of EGL/SwiftShader
     };
 }
 
@@ -628,8 +636,8 @@ test "buildChromeArgv: binds runtime profile directory into argv" {
     const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &cdp_port_buf);
 
     try std.testing.expectEqualStrings(CHROME_BINARY, argv[0]);
-    // URL is second-to-last (last is --disable-extensions)
-    try std.testing.expectEqualStrings(SIGNUP_URL, argv[argv.len - 2]);
+    // URL is at index len-3 (last is --use-gl=desktop, second-to-last is --disable-extensions)
+    try std.testing.expectEqualStrings(SIGNUP_URL, argv[argv.len - 3]);
 
     var saw_user_data_dir = false;
     for (argv) |arg| {
@@ -667,6 +675,7 @@ test "StealthBrowser: argv contains required stealth flags" {
     const expected_flags = [_][]const u8{
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",
+        "--use-gl=desktop",
     };
 
     for (expected_flags) |flag| {
