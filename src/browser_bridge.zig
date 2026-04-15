@@ -3066,7 +3066,7 @@ test "FingerprintDiagnostic: round-trip JSON parsing with all 25 fields" {
     // Mock CDP response with all 25 fields populated
     // NOTE: navigator_plugins_names and navigator_languages are JSON strings (arrays stringified)
     const mock_cdp_response =
-        \\{"id":1,"result":{"result":{"type":"string","value":"{\"stealth_script_loaded\":true,\"stealth_errors\":\"[]\",\"webgl_patched\":true,\"chrome_runtime_emulated\":true,\"navigator_webdriver\":false,\"window_chrome_exists\":true,\"chrome_runtime_connect\":true,\"chrome_runtime_sendMessage\":true,\"navigator_plugins_length\":3,\"navigator_plugins_names\":\"[\\\"Chrome PDF Plugin\\\",\\\"Chrome PDF Viewer\\\",\\\"Native Client\\\"]\",\"navigator_languages\":\"[\\\"en-US\\\",\\\"en\\\"]\",\"navigator_platform\":\"Linux x86_64\",\"navigator_userAgent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\",\"screen_width\":1920,\"screen_height\":1080,\"screen_inner_width\":1920,\"screen_inner_height\":1040,\"webgl_vendor\":\"Google Inc. (NVIDIA)\",\"webgl_renderer\":\"ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)\",\"canvas_hash\":\"a1b2c3d4e5f6g7h8\",\"timezone_offset\":-180,\"language\":\"en-US\",\"notification_permission\":\"default\",\"permissions_notifications\":\"query_supported\",\"permissions_geolocation\":\"query_supported\",\"cdp_runtime_enable_side_effect\":false,\"iframe_contentWindow_exists\":true,\"console_debug_side_effects\":false,\"sourceurl_leak\":false}"}}}
+        \\{"id":1,"result":{"result":{"type":"string","value":"{\"stealth_script_loaded\":true,\"stealth_errors\":\"[]\",\"webgl_patched\":true,\"chrome_runtime_emulated\":true,\"navigator_webdriver\":false,\"window_chrome_exists\":true,\"chrome_runtime_connect\":true,\"chrome_runtime_sendMessage\":true,\"navigator_plugins_length\":3,\"navigator_plugins_names\":\"[\\\"Chrome PDF Plugin\\\",\\\"Chrome PDF Viewer\\\",\\\"Native Client\\\"]\",\"navigator_languages\":\"[\\\"en-US\\\",\\\"en\\\"]\",\"navigator_platform\":\"Linux x86_64\",\"navigator_userAgent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\",\"screen_width\":1920,\"screen_height\":1080,\"screen_inner_width\":1920,\"screen_inner_height\":1040,\"webgl_vendor\":\"\",\"webgl_renderer\":\"\",\"canvas_hash\":\"a1b2c3d4e5f6g7h8\",\"timezone_offset\":-180,\"language\":\"en-US\",\"notification_permission\":\"default\",\"permissions_notifications\":\"query_supported\",\"permissions_geolocation\":\"query_supported\",\"cdp_runtime_enable_side_effect\":false,\"iframe_contentWindow_exists\":true,\"console_debug_side_effects\":false,\"sourceurl_leak\":false}"}}}
     ;
 
     // Extract inner JSON from CDP response
@@ -3104,11 +3104,8 @@ test "FingerprintDiagnostic: round-trip JSON parsing with all 25 fields" {
     try std.testing.expectEqual(@as(u32, 1080), diag.screen_height);
     try std.testing.expectEqual(@as(u32, 1920), diag.screen_inner_width);
     try std.testing.expectEqual(@as(u32, 1040), diag.screen_inner_height);
-    try std.testing.expectEqualStrings("Google Inc. (NVIDIA)", diag.webgl_vendor);
-    try std.testing.expectEqualStrings(
-        "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-        diag.webgl_renderer,
-    );
+    try std.testing.expectEqualStrings("", diag.webgl_vendor);
+    try std.testing.expectEqualStrings("", diag.webgl_renderer);
     try std.testing.expectEqualStrings("a1b2c3d4e5f6g7h8", diag.canvas_hash);
     try std.testing.expectEqual(@as(i32, -180), diag.timezone_offset);
     try std.testing.expectEqualStrings("en-US", diag.language);
