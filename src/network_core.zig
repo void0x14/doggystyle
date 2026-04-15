@@ -5913,10 +5913,10 @@ pub const standardLinuxPlugins: []const PluginInfo = &[_]PluginInfo{
 /// SOURCE: WebGL 1.0.3 spec — renderer strings are implementation-defined
 /// SOURCE: AMD Radeon RX 460 — typical renderer string on Linux (Mesa/RADV)
 pub const WebGLInfo = struct {
-    vendor: []const u8 = "AMD", // Mesa project
-    renderer: []const u8 = "AMD Radeon (TM) RX 460 Graphics (RADV POLARIS11, LLVM 18.1.8, DRM 3.57, 6.9.3-arch1-1)",
-    version: []const u8 = "4.6 (Core Profile) Mesa 24.1.1-arch1.1",
-    shadingLanguageVersion: []const u8 = "4.60",
+    vendor: []const u8 = "",
+    renderer: []const u8 = "",
+    version: []const u8 = "",
+    shadingLanguageVersion: []const u8 = "",
     maxTextureSize: u32 = 16384,
     maxViewportDims: [2]u32 = .{ 32768, 32768 },
     aliasedLineWidthRange: [2]f32 = .{ 1.0, 1.0 },
@@ -6477,8 +6477,10 @@ test "BrowserEnvironment: default values for Chrome v146 Linux" {
     try std.testing.expectEqual(@as(u8, 24), env.screen.colorDepth);
 
     // WebGL checks
-    try std.testing.expectEqualStrings("AMD", env.webgl.vendor);
-    try std.testing.expect(env.webgl.renderer.len > 0);
+    try std.testing.expectEqualStrings("", env.webgl.vendor);
+    try std.testing.expectEqualStrings("", env.webgl.renderer);
+    try std.testing.expectEqualStrings("", env.webgl.version);
+    try std.testing.expectEqualStrings("", env.webgl.shadingLanguageVersion);
 
     // Plugin checks
     try std.testing.expect(env.plugins.len > 0);
