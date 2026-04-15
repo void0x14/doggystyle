@@ -4,6 +4,10 @@
 // - std.heap.GeneralPurposeAllocator with safety enabled detects leaks
 // - This is equivalent to ASAN/UBSan in Rust/C++ debug builds
 //
+// BUILD FIX (2026-04-15): Force ZIG_LIB_DIR to vendor/zig-std to prevent
+// the compiler from using the system /lib/zig stdlib (older, incompatible).
+// SOURCE: vendor/zig/zig env — .lib_dir = "/lib/zig" (system, not vendor)
+//
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
