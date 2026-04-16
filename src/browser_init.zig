@@ -1,39 +1,40 @@
 // =============================================================================
 // Module — Stealth Browser Initialization (Chrome 2026 Process)
-// Target: google-chrome-stable (Xvfb + CDP, NOT headless — extensions don't work in headless)
+// Target: google-chrome-stable (headless=new + ANGLE Vulkan GPU rendering + CDP)
 // =============================================================================
 //
 // WIRE-TRUTH ANALYSIS (Chrome DevTools + Process Monitor, 2026-04-10):
-// - Chrome headless=new does NOT support extensions (confirmed by Chrome team)
 // - CDP Runtime.evaluate is the ONLY reliable way to inject JS and read results
-// - Xvfb provides a virtual display so Chrome runs in GUI mode (extensions work)
 // - --remote-debugging-port=9222 exposes CDP for WebSocket communication
 // - --remote-allow-origins=* allows WebSocket connections from any origin
 //
-// GPU ACCESS ANALYSIS (2026-04-15):
-// - Xvfb is a PURE SOFTWARE X server. It does NOT support hardware GPU passthrough/DRI by default.
-// - Even with GLX extensions, Xvfb uses Mesa software rasterizers (llvmpipe/swrast).
-// - Chrome defaults to SwiftShader in Xvfb. --use-gl=desktop forces Chrome to attempt
-//   desktop GLX, but in Xvfb this still maps to software Mesa.
-// - FOR REAL GPU ACCESS: Use Xorg with 'dummy' driver + GPU passthrough, or VirtualGL (vglrun).
+// GPU RENDERING STRATEGY (2026-04-16):
+// - PREVIOUS: Xvfb + --use-gl=desktop → Mesa software rasterizer (no real GPU)
+// - CURRENT: --headless=new + --use-gl=angle + --use-angle=vulkan
+//   headless=new uses the SAME rendering pipeline as headed Chrome (not old headless).
+//   ANGLE Vulkan backend talks directly to the host Vulkan driver, bypassing X11/Xvfb.
+// - --disable-vulkan-surface: headless has no swapchain; rendering to offscreen VkImage
+// - --enable-unsafe-webgpu: WebGPU via Dawn/Vulkan backend
+// - --ignore-gpu-blocklist: force GPU even on "unsupported" configs
+// - Result: WebGL vendor/renderer will show the REAL GPU, not SwiftShader/llvmpipe
 //
-// SOURCE: Chrome headless does NOT support extensions — https://groups.google.com/a/chromium.org/g/headless-dev/c/nEoeUkoNI0o
+// SOURCE: Chrome headless=new — https://developer.chrome.com/docs/chromium/new-headless
+// SOURCE: ANGLE Vulkan backend — https://chromium.googlesource.com/angle/angle/+/HEAD/doc/Implementation.md
 // SOURCE: Chrome DevTools Protocol — https://chromedevtools.github.io/devtools-protocol/
-// SOURCE: Xvfb — X Virtual Framebuffer (provides X11 display without physical screen)
 // SOURCE: man 2 mkdtemp — temporary directory creation (libc)
 // SOURCE: man 7 environ — environment variable inheritance in child processes
 //
 // NETWORK STACK ANALYSIS:
-// [1] Process spawning: Xvfb + Chrome with CDP on localhost:9222
-// [2] Environment: DISPLAY=:99 set for Xvfb, other GUI vars purged
+// [1] Process spawning: Chrome headless=new with CDP on localhost:9222
+// [2] Environment: DISPLAY no longer required (headless=new), GPU via Vulkan
 // [3] CDP: WebSocket on localhost:9222 for Runtime.evaluate JS injection
 // [4] Filesystem: /tmp/ghost_XXXXXX isolated profile dir
 // [5] UFW/iptables: No firewall rules needed — Chrome makes outbound HTTPS only
 // [6] conntrack: Standard OUTPUT chain → ESTABLISHED tracking for HTTPS
 //
 // ENVIRONMENT CONFIGURATION:
-// - DISPLAY=:99 — Xvfb virtual display (must NOT be purged)
-// - XAUTHORITY: Purged (no X11 auth needed for Xvfb)
+// - DISPLAY: Kept for backward compat but NOT required by --headless=new
+// - XAUTHORITY: Purged (no X11 auth needed)
 // - XDG_RUNTIME_DIR: Purged (prevents user session bus access)
 // - TERM=xterm-256color: Mimics standard terminal for any child shell processes
 //
@@ -80,7 +81,7 @@ pub const CHROME_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.3
 pub const PROFILE_PREFIX = "/tmp/ghost_";
 
 /// Number of arguments passed to Chrome
-pub const CHROME_ARG_COUNT: usize = 19;
+pub const CHROME_ARG_COUNT: usize = 24;
 
 /// Maximum attempts to generate a unique profile directory
 pub const MAX_MKDTEMP_ATTEMPTS: usize = 10;
@@ -328,36 +329,48 @@ fn buildChromeArgvWithBinary(
     // Use SIGNUP_URL as default start page
     const actual_start_url = if (start_url) |url| url else SIGNUP_URL;
 
-    // NOTE: No --headless — Chrome runs in GUI mode via Xvfb
-    // Chrome headless does NOT support extensions or CDP WebSocket properly
-    // SOURCE: Chrome team confirmation — headless has no plans for extension support
+    // GPU RENDERING STRATEGY (2026-04-16):
+    // Xvfb provides NO GPU — --use-gl=desktop still maps to Mesa software rasterizer.
+    // SOLUTION: Use --headless=new (same rendering pipeline as headed Chrome) + ANGLE Vulkan
+    // to get real GPU rendering via the host's Vulkan driver, bypassing Xvfb entirely.
     //
-    // SOURCE: https://peter.sh/experiments/chromium-command-line-switches/
-    // GPU-related overrides (--disable-gpu, --enable-unsafe-swiftshader, --enable-webgl)
-    // are REMOVED to ensure Chrome uses the hardware/Xvfb GPU by default.
-    // This prevents "Google Inc. / SwiftShader" from appearing in WebGL fingerprint.
-    // SOURCE: https://zenn.dev/syoyo/articles/4f084b2288428f — chrome-headless + webgl on Linux
-    // NOTE: stealth_evasion.js patches "Google Inc." → "Intel" and "SwiftShader" → Intel HD string
+    // SOURCE: Chrome --headless=new uses the full rendering pipeline (not old headless)
+    //   https://developer.chrome.com/docs/chromium/new-headless
+    // SOURCE: --use-gl=angle routes OpenGL ES calls through ANGLE
+    //   https://chromium.googlesource.com/angle/angle/+/HEAD/doc/Implementation.md
+    // SOURCE: --use-angle=vulkan selects ANGLE's Vulkan backend for real GPU access
+    // SOURCE: --disable-vulkan-surface — headless mode has no swapchain; rendering goes to
+    //   offscreen buffers (reads back via VkImage → readPixels)
+    // SOURCE: --enable-unsafe-webgpu — enables WebGPU via Dawn backend (Vulkan)
+    // SOURCE: --ignore-gpu-blocklist — forces GPU acceleration even on "unsupported" configs
+    //
+    // NOTE: CDP is still via --remote-debugging-port=9222 (WebSocket). Pipe transport
+    // will replace this in a future change to reduce detectability.
     return .{
         chrome_binary,
-        "--no-sandbox", // Required for running as root/non-standard user
-        "--disable-blink-features=AutomationControlled", // Hide automation fingerprint
-        "--no-first-run", // Skip welcome page
-        "--disable-dev-shm-usage", // Use /tmp instead of /dev/shm
-        "--disable-background-networking", // Prevent background requests
-        "--disable-default-apps", // No default apps
-        "--disable-hang-monitor", // Disable hang monitor
-        "--disable-prompt-on-repost", // No repost prompt
-        "--disable-sync", // Disable sync
-        "--metrics-recording-only", // Disable metrics
-        "--safebrowsing-disable-auto-update", // No safebrowsing updates
-        "--user-agent=" ++ CHROME_USER_AGENT, // Hardcoded UA
-        cdp_port_arg, // CDP remote debugging port
-        "--remote-allow-origins=*", // Allow WebSocket connections from any origin
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--disable-dev-shm-usage",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-hang-monitor",
+        "--disable-prompt-on-repost",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--safebrowsing-disable-auto-update",
+        "--user-agent=" ++ CHROME_USER_AGENT,
+        cdp_port_arg,
+        "--remote-allow-origins=*",
         user_data_dir_arg,
-        actual_start_url, // Start page (github.com/signup or custom)
-        "--disable-extensions", // No extensions — CDP injects JS instead
-        "--use-gl=desktop", // Force desktop OpenGL (GLX) instead of EGL/SwiftShader
+        actual_start_url,
+        "--disable-extensions",
+        "--use-gl=angle",
+        "--use-angle=vulkan",
+        "--headless=new",
+        "--disable-vulkan-surface",
+        "--enable-unsafe-webgpu",
+        "--ignore-gpu-blocklist",
     };
 }
 
@@ -636,8 +649,7 @@ test "buildChromeArgv: binds runtime profile directory into argv" {
     const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &cdp_port_buf);
 
     try std.testing.expectEqualStrings(CHROME_BINARY, argv[0]);
-    // URL is at index len-3 (last is --use-gl=desktop, second-to-last is --disable-extensions)
-    try std.testing.expectEqualStrings(SIGNUP_URL, argv[argv.len - 3]);
+    try std.testing.expectEqualStrings(SIGNUP_URL, argv[argv.len - 8]);
 
     var saw_user_data_dir = false;
     for (argv) |arg| {
@@ -671,11 +683,15 @@ test "StealthBrowser: argv contains required stealth flags" {
     var cdp_port_buf: [64]u8 = undefined;
     const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &cdp_port_buf);
 
-    // Verify that the argv slice contains all required flags
     const expected_flags = [_][]const u8{
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",
-        "--use-gl=desktop",
+        "--use-gl=angle",
+        "--use-angle=vulkan",
+        "--headless=new",
+        "--disable-vulkan-surface",
+        "--enable-unsafe-webgpu",
+        "--ignore-gpu-blocklist",
     };
 
     for (expected_flags) |flag| {
@@ -689,7 +705,6 @@ test "StealthBrowser: argv contains required stealth flags" {
         try std.testing.expect(found);
     }
 
-    // Verify --disable-extensions is present (CDP injection mode)
     var saw_disable_extensions = false;
     for (argv) |arg| {
         if (mem.eql(u8, arg, "--disable-extensions")) {
@@ -699,7 +714,6 @@ test "StealthBrowser: argv contains required stealth flags" {
     }
     try std.testing.expect(saw_disable_extensions);
 
-    // Verify user-agent contains Chrome version
     try std.testing.expect(mem.indexOf(u8, CHROME_USER_AGENT, "Chrome/147.0.0.0") != null);
 
     // Verify GPU-killing flags are REMOVED
@@ -708,5 +722,6 @@ test "StealthBrowser: argv contains required stealth flags" {
         try std.testing.expect(!mem.startsWith(u8, arg, "--enable-unsafe-swiftshader"));
         try std.testing.expect(!mem.startsWith(u8, arg, "--enable-webgl"));
         try std.testing.expect(!mem.startsWith(u8, arg, "--disable-software-rasterizer"));
+        try std.testing.expect(!mem.startsWith(u8, arg, "--use-gl=desktop"));
     }
 }

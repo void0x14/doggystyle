@@ -6,6 +6,43 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-16] — CDP Events Silently Dropped By sendCommand Causing waitForPausedRequest Timeout
+
+**Ne oldu:** `Fetch.requestPaused` ve `Network.*` CDP event'leri hiçbir zaman yakalanmıyordu. `waitForPausedRequest` sürekli timeout veriyordu ve `browser-network.ndjson` dosyası boş kalıyordu.
+
+**Gerçek:** `CdpClient.sendCommand()` CDP mesajlarını okurken ID'si eşleşmeyen mesajları `self.allocator.free(response)` ile serbest bırakıyordu. CDP event'leri (Fetch.requestPaused, Network.requestWillBeSent vb.) JSON'da `"id"` alanı taşımaz — bu yüzden `extractTopLevelMessageId()` null dönüyordu ve event'ler sessizce drop edilip free ediliyordu. Sonuç: `waitForPausedRequest` içindeki `dismissPageBlockers()` ve `emitDiagnosticState()` çağrıları evaluate → sendCommand zinciri tetiklediğinde, bu sırada gelen Fetch.requestPaused event'i kayboluyordu.
+
+**Kök sebep:** WebSocket CDP protokolünde iki tür mesaj vardır:
+1. **Command response** — `{"id":N,"result":{...}}` — eşleşen ID ile bulunur
+2. **Event** — `{"method":"Fetch.requestPaused","params":{...}}` — `"id"` alanı YOKTUR
+
+`sendCommand` her iki türü de aynı döngüde okuyordu ama sadece ID eşleşmesini return ediyordu; event'leri nil olarak free ediyordu.
+
+**Kaynak:**
+- Chrome DevTools Protocol spec — command responses carry `"id"` field matching the request; events carry `"method"` field with no `"id"`
+- RFC 6455, Section 5.4 — WebSocket message boundaries and multiplexing
+
+**Düzeltme:**
+1. `CdpClient.pending_events: std.array_list.Managed([]u8)` alanı eklendi — events için buffer
+2. `sendCommand` içinde `"id"` alanı olmayan mesajlar artık free edilmeyip `pending_events` dizisine append ediliyor
+3. `hasPendingEvents()` ve `nextPendingEvent()` metodları eklendi — buffered event'ler sıralı okunuyor
+4. `waitForPausedRequest` artık her döngü başında `pending_events`'i kontrol ediyor — Fetch.requestPaused ve Network.* event'ler korunuyor
+5. `waitForTruthyExpression` aynı şekilde pending event'leri draining ediyor
+6. `CdpClient.close()` pending event'lerin hepsini free ediyor
+7. `Network.enable` CDP komutu eklendi — `enableNetworkMonitoring()` metodu ile
+8. `BrowserBridge.init()` içinde `cdp.enableNetworkMonitoring()` çağrısı eklendi
+9. `processCdpEvent()` — buffered event'leri parse edip Network.requestWillBeSent/responseReceived event'lerini browser-network.ndjson'a logluyor
+10. `computeRiskAndLogTelemetry()` — observeUiState + risk level hesaplayıp browser-network.ndjson'a telemetry NDJSON satırı yazıyor
+
+**Tekrar olmaması için:**
+- CDP WebSocket okuma her zaman event buffering yapmalı; command response olmayan mesajlar drop EDİLEMEZ
+- waitForPausedRequest ve benzeri döngüler önce pending_events'i check etmeli, sonra yeni mesaj okumalı
+- Ağaç: src/browser_bridge.zig — CdpClient.sendCommand, CdpClient.pending_events, BrowserBridge.waitForPausedRequest
+
+---
+
+---
+
 ## [2026-04-14] — WebGL Empty Vendor/Renderer And chrome.runtime Missing Flagged By Arkose BDA
 
 **Hata:** `browser-fingerprint.ndjson` diagnostic verisi `webgl_vendor = ""` ve `webgl_renderer = ""` gösteriyordu. Ayrıca `chrome_runtime_connect = false` ve `chrome_runtime_sendMessage = false` idi. Arkose Labs BDA (Browser Data Analytics) bu alanları topluyor ve boş/eksik değerleri bot işareti olarak kullanıyor.

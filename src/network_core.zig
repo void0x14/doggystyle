@@ -5864,6 +5864,7 @@ pub const NavigatorInfo = struct {
     platform: []const u8 = "Linux x86_64",
     vendor: []const u8 = "Google Inc.",
     languages: []const []const u8 = &[_][]const u8{ "en-US", "en", "tr" },
+    languages_json: []const u8 = "",
     doNotTrack: ?[]const u8 = null, // Not set by default in Chrome
 
     pub fn userAgentLen(self: *const NavigatorInfo) usize {
@@ -6028,11 +6029,15 @@ pub const BrowserEnvironment = struct {
         writer.writeSlice(self.navigator.vendor);
         writer.writeSlice("\",");
         writer.writeSlice("\"languages\":[");
-        for (self.navigator.languages, 0..) |lang, i| {
-            if (i > 0) writer.writeByte(',');
-            writer.writeByte('"');
-            writer.writeSlice(lang);
-            writer.writeByte('"');
+        if (self.navigator.languages_json.len > 0) {
+            writer.writeSlice(self.navigator.languages_json);
+        } else {
+            for (self.navigator.languages, 0..) |lang, i| {
+                if (i > 0) writer.writeByte(',');
+                writer.writeByte('"');
+                writer.writeSlice(lang);
+                writer.writeByte('"');
+            }
         }
         writer.writeSlice("]");
         writer.writeSlice("},");
@@ -6132,10 +6137,12 @@ pub const BrowserEnvironment = struct {
         }
         writer.writeSlice("],");
 
-        // timestamp
+        // timestamp (rounded to 6-hour boundary per Arkose Labs BDA format)
+        const ts_seconds = self.timestamp / 1000;
+        const rounded_ts = ts_seconds - (ts_seconds % 21600);
         writer.writeSlice("\"timestamp\":");
         var ts_buf: [20]u8 = undefined;
-        const ts_len = std.fmt.printInt(&ts_buf, self.timestamp, 10, .lower, .{});
+        const ts_len = std.fmt.printInt(&ts_buf, rounded_ts, 10, .lower, .{});
         writer.writeSlice(ts_buf[0..ts_len]);
         writer.writeByte(',');
 
@@ -6172,43 +6179,86 @@ fn bytesToHexLower(bytes: []const u8, output: []u8) !usize {
 // ------------------------------------------------------------
 
 /// SOURCE: Arkose Labs BDA encryption — reverse engineered from client JS
-/// Encryption: AES-128-CBC with PKCS#7 padding, then Base64 encode
-/// Key: SHA256(user_agent + timestamp)[:16]
-/// IV: MD5(user_agent + timestamp)
+/// SOURCE: unfuncaptcha/bda (GitHub), AzureFlow/arkose-fp-docs
 ///
-/// NOTE: This is a simplified implementation. The actual Arkose encryption
-/// may include additional parameters (e.g., "n" parameter for multi-pass XOR).
-/// Updates may be required as Arkose changes their client-side JavaScript.
+/// Encryption format (Arkose Labs real format):
+///   1. Timestamp rounded to 6-hour boundary: rounded_ts = ts_seconds - (ts_seconds % 21600)
+///   2. Key string: userAgent + str(rounded_ts)
+///   3. Random 16-byte salt → hex string for JSON output, raw bytes for key derivation
+///   4. Salted key: key_string.encode() + salt_bytes
+///   5. Key expansion: MD5 chain (4 iterations) → 64 bytes, first 32 bytes = AES-256 key
+///   6. Random 16-byte IV (independent of key derivation)
+///   7. AES-256-CBC encryption with PKCS#7 padding
+///   8. Output: JSON {"ct":"<base64_ciphertext>","s":"<hex_salt>","iv":"<hex_iv>"}
 pub fn encryptBda(allocator: std.mem.Allocator, env: *const BrowserEnvironment) ![]u8 {
-    // Step 1: Serialize to JSON
+    // Step 1: Round timestamp to 6-hour boundary (21600 seconds)
+    // SOURCE: Arkose Labs BDA — timestamp rounded to 6-hour windows
+    const ts_seconds = env.timestamp / 1000;
+    const rounded_ts = ts_seconds - (ts_seconds % 21600);
+
+    // Step 2: Serialize BDA to JSON
     const json = try env.toJsonAlloc(allocator);
     defer allocator.free(json);
 
-    // Step 2: Build key_material = user_agent + timestamp
-    // NOTE: UA max ~150 bytes, timestamp max ~20 bytes. 256 is safe but assert.
-    var key_material: [256]u8 = undefined;
+    // Step 3: Build key_string = userAgent + str(rounded_ts)
+    var key_buf: [256]u8 = undefined;
     const ua_len = env.navigator.userAgent.len;
-    std.debug.assert(ua_len < 200); // Safety margin for timestamp
-    @memcpy(key_material[0..ua_len], env.navigator.userAgent);
+    std.debug.assert(ua_len < 200);
+    @memcpy(key_buf[0..ua_len], env.navigator.userAgent);
 
-    var ts_buf: [20]u8 = undefined;
-    const ts_len = std.fmt.printInt(&ts_buf, env.timestamp, 10, .lower, .{});
-    std.debug.assert(ua_len + ts_len <= key_material.len);
-    @memcpy(key_material[ua_len .. ua_len + ts_len], ts_buf[0..ts_len]);
+    var ts_str_buf: [20]u8 = undefined;
+    const ts_str_len = std.fmt.printInt(&ts_str_buf, rounded_ts, 10, .lower, .{});
+    const key_str_len = ua_len + ts_str_len;
+    std.debug.assert(key_str_len <= key_buf.len);
+    @memcpy(key_buf[ua_len..key_str_len], ts_str_buf[0..ts_str_len]);
 
-    const km_total = ua_len + ts_len;
+    // Step 4: Generate random 16-byte salt
+    var salt_bytes: [16]u8 = undefined;
+    try fillEntropy(&salt_bytes);
+    var salt_hex: [32]u8 = undefined;
+    _ = try bytesToHexLower(&salt_bytes, &salt_hex);
 
-    // Step 3: key = SHA256(key_material)[:16]
-    var sha256_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(key_material[0..km_total], &sha256_hash, .{});
-    const key: [16]u8 = sha256_hash[0..16].*;
+    // Step 5: Generate random 16-byte IV (independent of salt)
+    var iv_bytes: [16]u8 = undefined;
+    try fillEntropy(&iv_bytes);
+    var iv_hex: [32]u8 = undefined;
+    _ = try bytesToHexLower(&iv_bytes, &iv_hex);
 
-    // Step 4: iv = MD5(key_material)
-    var md5_hash: [std.crypto.hash.Md5.digest_length]u8 = undefined;
-    std.crypto.hash.Md5.hash(key_material[0..km_total], &md5_hash, .{});
-    const iv: [16]u8 = md5_hash;
+    // Step 6: Salted key = key_string_bytes + salt_bytes
+    var salted_key_buf: [272]u8 = undefined;
+    @memcpy(salted_key_buf[0..key_str_len], key_buf[0..key_str_len]);
+    @memcpy(salted_key_buf[key_str_len .. key_str_len + 16], &salt_bytes);
+    const salted_key_len = key_str_len + 16;
 
-    // Step 5: PKCS#7 padding
+    // Step 7: MD5 chain key derivation (4 iterations → 64 bytes, use first 32)
+    // SOURCE: Arkose Labs BDA — MD5 hash chain for key expansion
+    var md5_chain: [4][16]u8 = undefined;
+
+    // chain[0] = MD5(salted_key)
+    std.crypto.hash.Md5.hash(salted_key_buf[0..salted_key_len], &md5_chain[0], .{});
+
+    // chain[1] = MD5(chain[0] ++ salted_key)
+    var chain_buf: [288]u8 = undefined;
+    chain_buf[0..16].* = md5_chain[0];
+    @memcpy(chain_buf[16 .. 16 + salted_key_len], salted_key_buf[0..salted_key_len]);
+    std.crypto.hash.Md5.hash(chain_buf[0 .. 16 + salted_key_len], &md5_chain[1], .{});
+
+    // chain[2] = MD5(chain[1] ++ salted_key)
+    chain_buf[0..16].* = md5_chain[1];
+    @memcpy(chain_buf[16 .. 16 + salted_key_len], salted_key_buf[0..salted_key_len]);
+    std.crypto.hash.Md5.hash(chain_buf[0 .. 16 + salted_key_len], &md5_chain[2], .{});
+
+    // chain[3] = MD5(chain[2] ++ salted_key)
+    chain_buf[0..16].* = md5_chain[2];
+    @memcpy(chain_buf[16 .. 16 + salted_key_len], salted_key_buf[0..salted_key_len]);
+    std.crypto.hash.Md5.hash(chain_buf[0 .. 16 + salted_key_len], &md5_chain[3], .{});
+
+    // AES-256 key: first 32 bytes of final_key (chain[0] ++ chain[1])
+    var aes_key: [32]u8 = undefined;
+    @memcpy(aes_key[0..16], &md5_chain[0]);
+    @memcpy(aes_key[16..32], &md5_chain[1]);
+
+    // Step 8: PKCS#7 padding
     // SOURCE: RFC 5652, Section 6.3 — CMS padding
     const block_size: usize = 16;
     const pad_len = block_size - (json.len % block_size);
@@ -6218,18 +6268,18 @@ pub fn encryptBda(allocator: std.mem.Allocator, env: *const BrowserEnvironment) 
     defer allocator.free(padded);
 
     @memcpy(padded[0..json.len], json);
-    // PKCS#7: fill with pad_len value
     for (padded[json.len..]) |*b| {
         b.* = @intCast(pad_len);
     }
 
-    // Step 6: AES-128-CBC encrypt
+    // Step 9: AES-256-CBC encrypt
+    // SOURCE: RFC 5652, Section 6.2 — CBC mode
     const encrypted = try allocator.alloc(u8, padded_len);
     errdefer allocator.free(encrypted);
 
-    try aes128CbcEncrypt(key, iv, padded, encrypted);
+    try aes256CbcEncrypt(aes_key, iv_bytes, padded, encrypted);
 
-    // Step 7: Base64 encode
+    // Step 10: Base64 encode ciphertext
     // SOURCE: RFC 4648, Section 4 — Base64 encoding
     const base64_encoder = std.base64.standard.Encoder;
     const base64_len = base64_encoder.calcSize(encrypted.len);
@@ -6238,7 +6288,16 @@ pub fn encryptBda(allocator: std.mem.Allocator, env: *const BrowserEnvironment) 
     _ = base64_encoder.encode(base64_output, encrypted);
     allocator.free(encrypted);
 
-    return base64_output;
+    // Step 11: Build JSON output
+    // {"ct":"<base64_ciphertext>","s":"<hex_salt>","iv":"<hex_iv>"}
+    const result = try std.fmt.allocPrint(
+        allocator,
+        "{{\"ct\":\"{s}\",\"s\":\"{s}\",\"iv\":\"{s}\"}}",
+        .{ base64_output, salt_hex[0..32], iv_hex[0..32] },
+    );
+    allocator.free(base64_output);
+
+    return result;
 }
 
 /// AES-128-CBC encryption (manual implementation using Zig std.crypto.aes)
@@ -6270,52 +6329,99 @@ fn aes128CbcEncrypt(key: [16]u8, iv: [16]u8, plaintext: []const u8, ciphertext: 
 }
 
 /// Decrypt BDA payload (for testing round-trip)
-pub fn decryptBda(allocator: std.mem.Allocator, env: *const BrowserEnvironment, base64_input: []const u8) ![]u8 {
-    // Step 1: Base64 decode
+/// Input: JSON string {"ct":"<base64>","s":"<hex_salt>","iv":"<hex_iv>"}
+/// SOURCE: Arkose Labs BDA encryption — reverse engineered from client JS
+pub fn decryptBda(allocator: std.mem.Allocator, env: *const BrowserEnvironment, json_input: []const u8) ![]u8 {
+    // Step 1: Parse JSON to extract "ct", "s", "iv" fields
+    const ct_marker = "\"ct\":\"";
+    const s_marker = "\"s\":\"";
+    const iv_marker = "\"iv\":\"";
+
+    const ct_start = std.mem.indexOf(u8, json_input, ct_marker) orelse return error.InvalidFormat;
+    const ct_value_start = ct_start + ct_marker.len;
+    const ct_value_end = std.mem.indexOf(u8, json_input[ct_value_start..], "\"") orelse return error.InvalidFormat;
+    const ct_b64 = json_input[ct_value_start .. ct_value_start + ct_value_end];
+
+    const s_start = std.mem.indexOf(u8, json_input, s_marker) orelse return error.InvalidFormat;
+    const s_value_start = s_start + s_marker.len;
+    const s_value_end = std.mem.indexOf(u8, json_input[s_value_start..], "\"") orelse return error.InvalidFormat;
+    const s_hex = json_input[s_value_start .. s_value_start + s_value_end];
+
+    const iv_start = std.mem.indexOf(u8, json_input, iv_marker) orelse return error.InvalidFormat;
+    const iv_value_start = iv_start + iv_marker.len;
+    const iv_value_end = std.mem.indexOf(u8, json_input[iv_value_start..], "\"") orelse return error.InvalidFormat;
+    const iv_hex = json_input[iv_value_start .. iv_value_start + iv_value_end];
+
+    // Step 2: Decode base64 ciphertext
     const base64_decoder = std.base64.standard.Decoder;
-    const decoded_len = try base64_decoder.calcSizeForSlice(base64_input);
+    const decoded_len = try base64_decoder.calcSizeForSlice(ct_b64);
     const encrypted = try allocator.alloc(u8, decoded_len);
     defer allocator.free(encrypted);
 
-    _ = try base64_decoder.decode(encrypted, base64_input);
+    _ = try base64_decoder.decode(encrypted, ct_b64);
 
-    // Step 2: Build key_material (same as encrypt)
-    // NOTE: UA max ~150 bytes, timestamp max ~20 bytes. 256 is safe but assert.
-    var key_material: [256]u8 = undefined;
+    // Step 3: Decode hex salt and IV
+    var salt_bytes: [16]u8 = undefined;
+    try hexToBytes(s_hex, &salt_bytes);
+    var iv_bytes: [16]u8 = undefined;
+    try hexToBytes(iv_hex, &iv_bytes);
+
+    // Step 4: Build key_string using rounded timestamp (same as encrypt)
+    const ts_seconds = env.timestamp / 1000;
+    const rounded_ts = ts_seconds - (ts_seconds % 21600);
+
+    var key_buf: [256]u8 = undefined;
     const ua_len = env.navigator.userAgent.len;
-    std.debug.assert(ua_len < 200); // Safety margin for timestamp
-    @memcpy(key_material[0..ua_len], env.navigator.userAgent);
+    std.debug.assert(ua_len < 200);
+    @memcpy(key_buf[0..ua_len], env.navigator.userAgent);
 
-    var ts_buf: [20]u8 = undefined;
-    const ts_len = std.fmt.printInt(&ts_buf, env.timestamp, 10, .lower, .{});
-    std.debug.assert(ua_len + ts_len <= key_material.len);
-    @memcpy(key_material[ua_len .. ua_len + ts_len], ts_buf[0..ts_len]);
+    var ts_str_buf: [20]u8 = undefined;
+    const ts_str_len = std.fmt.printInt(&ts_str_buf, rounded_ts, 10, .lower, .{});
+    const key_str_len = ua_len + ts_str_len;
+    std.debug.assert(key_str_len <= key_buf.len);
+    @memcpy(key_buf[ua_len..key_str_len], ts_str_buf[0..ts_str_len]);
 
-    const km_total = ua_len + ts_len;
+    // Step 5: Salted key = key_string_bytes + salt_bytes
+    var salted_key_buf: [272]u8 = undefined;
+    @memcpy(salted_key_buf[0..key_str_len], key_buf[0..key_str_len]);
+    @memcpy(salted_key_buf[key_str_len .. key_str_len + 16], &salt_bytes);
+    const salted_key_len = key_str_len + 16;
 
-    // Step 3: key = SHA256(key_material)[:16]
-    var sha256_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(key_material[0..km_total], &sha256_hash, .{});
-    const key: [16]u8 = sha256_hash[0..16].*;
+    // Step 6: MD5 chain key derivation (same as encrypt)
+    var md5_chain: [4][16]u8 = undefined;
 
-    // Step 4: iv = MD5(key_material)
-    var md5_hash: [std.crypto.hash.Md5.digest_length]u8 = undefined;
-    std.crypto.hash.Md5.hash(key_material[0..km_total], &md5_hash, .{});
-    const iv: [16]u8 = md5_hash;
+    std.crypto.hash.Md5.hash(salted_key_buf[0..salted_key_len], &md5_chain[0], .{});
 
-    // Step 5: AES-128-CBC decrypt
+    var chain_buf: [288]u8 = undefined;
+
+    chain_buf[0..16].* = md5_chain[0];
+    @memcpy(chain_buf[16 .. 16 + salted_key_len], salted_key_buf[0..salted_key_len]);
+    std.crypto.hash.Md5.hash(chain_buf[0 .. 16 + salted_key_len], &md5_chain[1], .{});
+
+    chain_buf[0..16].* = md5_chain[1];
+    @memcpy(chain_buf[16 .. 16 + salted_key_len], salted_key_buf[0..salted_key_len]);
+    std.crypto.hash.Md5.hash(chain_buf[0 .. 16 + salted_key_len], &md5_chain[2], .{});
+
+    chain_buf[0..16].* = md5_chain[2];
+    @memcpy(chain_buf[16 .. 16 + salted_key_len], salted_key_buf[0..salted_key_len]);
+    std.crypto.hash.Md5.hash(chain_buf[0 .. 16 + salted_key_len], &md5_chain[3], .{});
+
+    var aes_key: [32]u8 = undefined;
+    @memcpy(aes_key[0..16], &md5_chain[0]);
+    @memcpy(aes_key[16..32], &md5_chain[1]);
+
+    // Step 7: AES-256-CBC decrypt
     var decrypted = try allocator.alloc(u8, encrypted.len);
     errdefer allocator.free(decrypted);
 
-    try aes128CbcDecrypt(key, iv, encrypted, decrypted);
+    try aes256CbcDecrypt(aes_key, iv_bytes, encrypted, decrypted);
 
-    // Step 6: Remove PKCS#7 padding
+    // Step 8: Remove PKCS#7 padding
     const pad_len = decrypted[decrypted.len - 1];
     if (pad_len < 1 or pad_len > 16) return error.InvalidPadding;
 
     const unpadded_len = decrypted.len - pad_len;
 
-    // Verify padding
     for (decrypted[unpadded_len..]) |b| {
         if (b != pad_len) return error.InvalidPadding;
     }
@@ -6351,6 +6457,71 @@ fn aes128CbcDecrypt(key: [16]u8, iv: [16]u8, ciphertext: []const u8, plaintext: 
 
         // Update prev_block for next iteration
         prev_block = ciphertext[i .. i + 16][0..16].*;
+    }
+}
+
+/// AES-256-CBC encryption using Zig std.crypto.core.aes.Aes256
+/// SOURCE: RFC 5652, Section 6.2 — CBC mode
+fn aes256CbcEncrypt(key: [32]u8, iv: [16]u8, plaintext: []const u8, ciphertext: []u8) !void {
+    if (ciphertext.len != plaintext.len) return error.BufferSizeMismatch;
+    if (plaintext.len % 16 != 0) return error.NotBlockAligned;
+
+    const Aes = std.crypto.core.aes.Aes256;
+    var aes_ctx = Aes.initEnc(key);
+
+    var prev_block = iv;
+    var i: usize = 0;
+
+    while (i < plaintext.len) : (i += 16) {
+        var block: [16]u8 = undefined;
+
+        for (&block, 0..) |_, j| {
+            block[j] = plaintext[i + j] ^ prev_block[j];
+        }
+
+        aes_ctx.encrypt(ciphertext[i .. i + 16][0..16], &block);
+
+        prev_block = ciphertext[i .. i + 16][0..16].*;
+    }
+}
+
+/// AES-256-CBC decryption using Zig std.crypto.core.aes.Aes256
+/// SOURCE: RFC 5652, Section 6.2 — CBC mode
+fn aes256CbcDecrypt(key: [32]u8, iv: [16]u8, ciphertext: []const u8, plaintext: []u8) !void {
+    if (plaintext.len != ciphertext.len) return error.BufferSizeMismatch;
+    if (ciphertext.len % 16 != 0) return error.NotBlockAligned;
+
+    const Aes = std.crypto.core.aes.Aes256;
+    var aes_ctx = Aes.initDec(key);
+
+    var i: usize = 0;
+    var prev_block = iv;
+
+    while (i < ciphertext.len) : (i += 16) {
+        var block: [16]u8 = undefined;
+
+        aes_ctx.decrypt(&block, ciphertext[i .. i + 16][0..16]);
+
+        for (plaintext[i .. i + 16], 0..) |_, j| {
+            plaintext[i + j] = block[j] ^ prev_block[j];
+        }
+
+        prev_block = ciphertext[i .. i + 16][0..16].*;
+    }
+}
+
+/// Decode a hex string into raw bytes
+/// SOURCE: RFC 4648, Section 8 — Base16 (hex) encoding
+fn hexToBytes(hex: []const u8, output: []u8) !void {
+    if (hex.len % 2 != 0) return error.InvalidFormat;
+    if (output.len < hex.len / 2) return error.BufferTooSmall;
+
+    const hex_chars = "0123456789abcdef";
+    var i: usize = 0;
+    while (i < hex.len) : (i += 2) {
+        const hi = std.mem.indexOfScalar(u8, hex_chars, ascii.toLower(hex[i])) orelse return error.InvalidFormat;
+        const lo = std.mem.indexOfScalar(u8, hex_chars, ascii.toLower(hex[i + 1])) orelse return error.InvalidFormat;
+        output[i / 2] = @intCast(hi * 16 + lo);
     }
 }
 
@@ -6517,12 +6688,15 @@ test "encryptBda then decryptBda: round-trip" {
     env.timestamp = 1712345678000; // Fixed timestamp for reproducibility
     @memset(&env.nonce, 0x42);
 
-    // Encrypt
+    // Encrypt — output is now JSON format
     const encrypted = try encryptBda(allocator, &env);
     defer allocator.free(encrypted);
 
-    // Verify it's valid Base64
+    // Verify JSON structure: {"ct":"...","s":"...","iv":"..."}
     try std.testing.expect(encrypted.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, encrypted, "\"ct\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encrypted, "\"s\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encrypted, "\"iv\":\"") != null);
 
     // Decrypt
     const decrypted = try decryptBda(allocator, &env, encrypted);
@@ -6536,17 +6710,43 @@ test "encryptBda then decryptBda: round-trip" {
     try std.testing.expectEqualStrings(original_json, decrypted);
 }
 
-test "encryptBda: output is valid Base64" {
+test "encryptBda: output is valid JSON with BDA fields" {
     const allocator = std.testing.allocator;
 
-    const env = BrowserEnvironment{};
+    var env = BrowserEnvironment{};
+    env.timestamp = 1712345678000;
     const encrypted = try encryptBda(allocator, &env);
     defer allocator.free(encrypted);
 
-    // Verify all characters are valid Base64
-    const base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
-    for (encrypted) |c| {
-        try std.testing.expect(std.mem.indexOf(u8, base64_chars, &[_]u8{c}) != null);
+    // Verify JSON structure
+    try std.testing.expect(encrypted[0] == '{');
+    try std.testing.expect(encrypted[encrypted.len - 1] == '}');
+    try std.testing.expect(std.mem.indexOf(u8, encrypted, "\"ct\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encrypted, "\"s\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encrypted, "\"iv\":\"") != null);
+
+    // Verify hex fields (salt and IV) are 32 hex chars each
+    const s_marker = "\"s\":\"";
+    const s_pos = std.mem.indexOf(u8, encrypted, s_marker).?;
+    const s_val_start = s_pos + s_marker.len;
+    const s_val_end = std.mem.indexOf(u8, encrypted[s_val_start..], "\"").?;
+    const s_hex = encrypted[s_val_start .. s_val_start + s_val_end];
+    try std.testing.expectEqual(@as(usize, 32), s_hex.len);
+
+    const iv_marker = "\"iv\":\"";
+    const iv_pos = std.mem.indexOf(u8, encrypted, iv_marker).?;
+    const iv_val_start = iv_pos + iv_marker.len;
+    const iv_val_end = std.mem.indexOf(u8, encrypted[iv_val_start..], "\"").?;
+    const iv_hex = encrypted[iv_val_start .. iv_val_start + iv_val_end];
+    try std.testing.expectEqual(@as(usize, 32), iv_hex.len);
+
+    // Verify hex chars are valid
+    const hex_chars = "0123456789abcdef";
+    for (s_hex) |c| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, hex_chars, c) != null);
+    }
+    for (iv_hex) |c| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, hex_chars, c) != null);
     }
 }
 
@@ -6642,9 +6842,9 @@ test "BrowserEnvironment: nonce uniqueness" {
     @memset(&env1.nonce, 0xAA);
     @memset(&env2.nonce, 0xBB);
 
-    // Timestamps same
-    env1.timestamp = 12345;
-    env2.timestamp = 12345;
+    // Timestamps same (in same 6-hour window)
+    env1.timestamp = 1712345678000;
+    env2.timestamp = 1712345678000;
 
     // Encrypt both
     const allocator = std.testing.allocator;
@@ -6654,21 +6854,23 @@ test "BrowserEnvironment: nonce uniqueness" {
     const enc2 = try encryptBda(allocator, &env2);
     defer allocator.free(enc2);
 
-    // Different nonces should produce different ciphertexts
+    // Different nonces (and random salt/IV) should produce different ciphertexts
     try std.testing.expect(!std.mem.eql(u8, enc1, enc2));
 }
 
-test "encryptBda: timestamp affects encryption output" {
+test "encryptBda: different 6-hour windows produce different keys" {
     const allocator = std.testing.allocator;
 
     var env1 = BrowserEnvironment{};
     var env2 = BrowserEnvironment{};
 
-    // Same nonce, different timestamps
+    // Same nonce, different timestamps in different 6-hour windows
     @memset(&env1.nonce, 0x42);
     @memset(&env2.nonce, 0x42);
+    // 1000ms = 1s → rounds to 0 seconds
+    // 21600000ms = 21600s → different 6-hour window
     env1.timestamp = 1000;
-    env2.timestamp = 2000;
+    env2.timestamp = 21600000;
 
     const enc1 = try encryptBda(allocator, &env1);
     defer allocator.free(enc1);
@@ -6676,8 +6878,66 @@ test "encryptBda: timestamp affects encryption output" {
     const enc2 = try encryptBda(allocator, &env2);
     defer allocator.free(enc2);
 
-    // Different timestamps should produce different encryption keys
+    // Different 6-hour windows should produce different encryption keys
     try std.testing.expect(!std.mem.eql(u8, enc1, enc2));
+}
+
+test "encryptBda: same 6-hour window produces different ciphertext due to random salt/IV" {
+    const allocator = std.testing.allocator;
+
+    var env = BrowserEnvironment{};
+    env.timestamp = 1712345678000;
+    @memset(&env.nonce, 0x42);
+
+    // Two encryptions of the same data should differ (random salt and IV)
+    const enc1 = try encryptBda(allocator, &env);
+    defer allocator.free(enc1);
+
+    const enc2 = try encryptBda(allocator, &env);
+    defer allocator.free(enc2);
+
+    // Random salt and IV make each encryption unique
+    try std.testing.expect(!std.mem.eql(u8, enc1, enc2));
+}
+
+test "aes256CbcEncrypt/Decrypt: round-trip" {
+    const allocator = std.testing.allocator;
+
+    const key: [32]u8 = [_]u8{0x00} ** 32;
+    const iv: [16]u8 = [_]u8{0x01} ** 16;
+    const plaintext = "Hello, AES-256-CBC! This is a test message for encryption.";
+
+    // PKCS#7 padding
+    const block_size: usize = 16;
+    const pad_len = block_size - (plaintext.len % block_size);
+    const padded_len = plaintext.len + pad_len;
+
+    var padded = try allocator.alloc(u8, padded_len);
+    defer allocator.free(padded);
+
+    @memcpy(padded[0..plaintext.len], plaintext);
+    for (padded[plaintext.len..]) |*b| {
+        b.* = @intCast(pad_len);
+    }
+
+    // Encrypt
+    const ciphertext = try allocator.alloc(u8, padded_len);
+    defer allocator.free(ciphertext);
+
+    try aes256CbcEncrypt(key, iv, padded, ciphertext);
+
+    // Decrypt
+    var decrypted = try allocator.alloc(u8, padded_len);
+    defer allocator.free(decrypted);
+
+    try aes256CbcDecrypt(key, iv, ciphertext, decrypted);
+
+    // Remove padding
+    const dec_pad_len = decrypted[decrypted.len - 1];
+    const dec_unpadded_len = decrypted.len - dec_pad_len;
+
+    // Verify
+    try std.testing.expectEqualStrings(plaintext, decrypted[0..dec_unpadded_len]);
 }
 
 // =============================================================================
@@ -7543,6 +7803,10 @@ pub const GitHubHttpClient = struct {
         std.debug.print("[Layer 4 (Logic)] Preparing HTTP/2 POST request to /signup_check/usage\n", .{});
         const path = "/signup_check/usage";
 
+        std.debug.print("[RISK CHECK] BDA payload size: {d} bytes\n", .{bda_data.len});
+        std.debug.print("[RISK CHECK] BDA payload (first 200 chars): {s}\n", .{bda_data[0..@min(bda_data.len, 200)]});
+        std.debug.print("[RISK CHECK] Token (first 40 chars): {s}\n", .{token[0..@min(token.len, 40)]});
+
         // url-encoding: just do a simple allocation for the payload
         // payload: authenticity_token=<token>&bda=<bda>
         // the token and bda_data needs to be URL encoded if it has special characters,
@@ -7569,7 +7833,16 @@ pub const GitHubHttpClient = struct {
 
         try self.ensureHttp2ConnectionReady(allocator, sock, dst_ip);
 
-        const hpack_block = try http2_core.buildGitHubPostHeaders(allocator, path, self.host, payload.len);
+        var cookie_buf: [4096]u8 = undefined;
+        const cookie_str = self.cookie_jar.cookieHeader(&cookie_buf) catch "";
+
+        const hpack_block = try http2_core.buildGitHubRiskCheckHeaders(
+            allocator,
+            path,
+            self.host,
+            payload.len,
+            cookie_str,
+        );
         defer allocator.free(hpack_block);
 
         const stream_id = try self.nextClientStreamId();
@@ -7615,9 +7888,28 @@ pub const GitHubHttpClient = struct {
         defer response_parser.deinit();
 
         const timeout_start = currentTimestampMs();
-        while (currentTimestampMs() - timeout_start < 5000) {
-            const remaining_timeout = 5000 - (currentTimestampMs() - timeout_start);
-            const plaintext = try receiveTlsApplicationData(self, allocator, sock, remaining_timeout);
+        while (currentTimestampMs() - timeout_start < 10000) {
+            const remaining_timeout = 10000 - (currentTimestampMs() - timeout_start);
+            const plaintext = receiveTlsApplicationData(self, allocator, sock, remaining_timeout) catch |err| switch (err) {
+                error.ConnectionClosed => {
+                    // SOURCE: RFC 8446, Section 6.1 — close_notify means server will not send more data.
+                    // The server gracefully closed the TLS connection after sending the response.
+                    // If we already have partial response data, break and try to parse; otherwise fail.
+                    std.debug.print("[RISK CHECK] TLS close_notify received — server closed connection\n", .{});
+                    if (response_parser.saw_headers) {
+                        break;
+                    }
+                    return error.ConnectionClosed;
+                },
+                error.ReadTimeout => {
+                    std.debug.print("[RISK CHECK] ReadTimeout while waiting for risk check response\n", .{});
+                    if (response_parser.saw_headers) {
+                        break;
+                    }
+                    return error.ReadTimeout;
+                },
+                else => return err,
+            };
             defer allocator.free(plaintext);
 
             try response_parser.processApplicationData(plaintext);

@@ -2153,6 +2153,231 @@ pub fn buildGitHubPostHeaders(
     return result;
 }
 
+// SOURCE: Live GitHub signup_check/usage browser observation (2026-04-16)
+// SOURCE: RFC 7541, Appendix A — Static Table Definitions
+// The risk check POST at /signup_check/usage requires:
+//   - accept: application/json
+//   - content-type: application/x-www-form-urlencoded
+//   - origin: https://github.com (same-origin CSRF)
+//   - referer: https://github.com/signup
+//   - cookie: session cookies (_gh_sess, _octo, logged_in, user_session)
+//   - accept-language: en-US,en;q=0.9,tr;q=0.8
+//   - sec-ch-ua: Chrome Client Hints
+//   - sec-ch-ua-mobile: ?0
+//   - sec-ch-ua-platform: "Linux"
+//   - sec-fetch-site: same-origin
+//   - sec-fetch-mode: cors
+//   - sec-fetch-dest: empty
+pub fn buildGitHubRiskCheckHeaders(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    authority: []const u8,
+    content_length: usize,
+    cookie_string: []const u8,
+) ![]u8 {
+    const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+    const accept_value = "application/json";
+    const content_type = "application/x-www-form-urlencoded";
+    const accept_language = "en-US,en;q=0.9,tr;q=0.8";
+    const origin = "https://github.com";
+    const referer = "https://github.com/signup";
+    const sec_ch_ua = "\"Chromium\";v=\"146\", \"Google Chrome\";v=\"146\", \"Not:A-Brand\";v=\"99\"";
+    const sec_ch_ua_mobile = "?0";
+    const sec_ch_ua_platform = "\"Linux\"";
+    const sec_fetch_site = "same-origin";
+    const sec_fetch_mode = "cors";
+    const sec_fetch_dest = "empty";
+
+    const indexed_method = IndexedHeaderField{ .index = 3 };
+    const encoded_method = try indexed_method.encode(allocator);
+    defer allocator.free(encoded_method);
+
+    const indexed_scheme = IndexedHeaderField{ .index = 7 };
+    const encoded_scheme = try indexed_scheme.encode(allocator);
+    defer allocator.free(encoded_scheme);
+
+    const literal_path = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 4,
+        .name = null,
+        .value = path,
+    };
+    const encoded_path = try literal_path.encode(allocator);
+    defer allocator.free(encoded_path);
+
+    const literal_authority = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 1,
+        .name = null,
+        .value = authority,
+    };
+    const encoded_authority = try literal_authority.encode(allocator);
+    defer allocator.free(encoded_authority);
+
+    const literal_ua = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 58,
+        .name = null,
+        .value = user_agent,
+    };
+    const encoded_ua = try literal_ua.encode(allocator);
+    defer allocator.free(encoded_ua);
+
+    const literal_accept = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 19,
+        .name = null,
+        .value = accept_value,
+    };
+    const encoded_accept = try literal_accept.encode(allocator);
+    defer allocator.free(encoded_accept);
+
+    const literal_accept_language = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "accept-language",
+        .value = accept_language,
+    };
+    const encoded_accept_language = try literal_accept_language.encode(allocator);
+    defer allocator.free(encoded_accept_language);
+
+    const literal_ct = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 31,
+        .name = null,
+        .value = content_type,
+    };
+    const encoded_ct = try literal_ct.encode(allocator);
+    defer allocator.free(encoded_ct);
+
+    var cl_buf: [32]u8 = undefined;
+    const cl_str = try std.fmt.bufPrint(&cl_buf, "{d}", .{content_length});
+    const literal_cl = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 28,
+        .name = null,
+        .value = cl_str,
+    };
+    const encoded_cl = try literal_cl.encode(allocator);
+    defer allocator.free(encoded_cl);
+
+    const literal_origin = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "origin",
+        .value = origin,
+    };
+    const encoded_origin = try literal_origin.encode(allocator);
+    defer allocator.free(encoded_origin);
+
+    const literal_referer = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "referer",
+        .value = referer,
+    };
+    const encoded_referer = try literal_referer.encode(allocator);
+    defer allocator.free(encoded_referer);
+
+    const literal_cookie = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 32,
+        .name = null,
+        .value = cookie_string,
+    };
+    const encoded_cookie = try literal_cookie.encode(allocator);
+    defer allocator.free(encoded_cookie);
+
+    const literal_sec_ch_ua = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "sec-ch-ua",
+        .value = sec_ch_ua,
+    };
+    const encoded_sec_ch_ua = try literal_sec_ch_ua.encode(allocator);
+    defer allocator.free(encoded_sec_ch_ua);
+
+    const literal_sec_ch_ua_mobile = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "sec-ch-ua-mobile",
+        .value = sec_ch_ua_mobile,
+    };
+    const encoded_sec_ch_ua_mobile = try literal_sec_ch_ua_mobile.encode(allocator);
+    defer allocator.free(encoded_sec_ch_ua_mobile);
+
+    const literal_sec_ch_ua_platform = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "sec-ch-ua-platform",
+        .value = sec_ch_ua_platform,
+    };
+    const encoded_sec_ch_ua_platform = try literal_sec_ch_ua_platform.encode(allocator);
+    defer allocator.free(encoded_sec_ch_ua_platform);
+
+    const literal_sec_fetch_site = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "sec-fetch-site",
+        .value = sec_fetch_site,
+    };
+    const encoded_sec_fetch_site = try literal_sec_fetch_site.encode(allocator);
+    defer allocator.free(encoded_sec_fetch_site);
+
+    const literal_sec_fetch_mode = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "sec-fetch-mode",
+        .value = sec_fetch_mode,
+    };
+    const encoded_sec_fetch_mode = try literal_sec_fetch_mode.encode(allocator);
+    defer allocator.free(encoded_sec_fetch_mode);
+
+    const literal_sec_fetch_dest = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "sec-fetch-dest",
+        .value = sec_fetch_dest,
+    };
+    const encoded_sec_fetch_dest = try literal_sec_fetch_dest.encode(allocator);
+    defer allocator.free(encoded_sec_fetch_dest);
+
+    const total_len = encoded_method.len + encoded_scheme.len +
+        encoded_path.len + encoded_authority.len +
+        encoded_ua.len + encoded_accept.len + encoded_accept_language.len +
+        encoded_ct.len + encoded_cl.len +
+        encoded_origin.len + encoded_referer.len + encoded_cookie.len +
+        encoded_sec_ch_ua.len + encoded_sec_ch_ua_mobile.len + encoded_sec_ch_ua_platform.len +
+        encoded_sec_fetch_site.len + encoded_sec_fetch_mode.len + encoded_sec_fetch_dest.len;
+
+    const result = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+
+    @memcpy(result[offset .. offset + encoded_method.len], encoded_method);
+    offset += encoded_method.len;
+    @memcpy(result[offset .. offset + encoded_scheme.len], encoded_scheme);
+    offset += encoded_scheme.len;
+    @memcpy(result[offset .. offset + encoded_path.len], encoded_path);
+    offset += encoded_path.len;
+    @memcpy(result[offset .. offset + encoded_authority.len], encoded_authority);
+    offset += encoded_authority.len;
+    @memcpy(result[offset .. offset + encoded_ua.len], encoded_ua);
+    offset += encoded_ua.len;
+    @memcpy(result[offset .. offset + encoded_accept.len], encoded_accept);
+    offset += encoded_accept.len;
+    @memcpy(result[offset .. offset + encoded_accept_language.len], encoded_accept_language);
+    offset += encoded_accept_language.len;
+    @memcpy(result[offset .. offset + encoded_ct.len], encoded_ct);
+    offset += encoded_ct.len;
+    @memcpy(result[offset .. offset + encoded_cl.len], encoded_cl);
+    offset += encoded_cl.len;
+    @memcpy(result[offset .. offset + encoded_origin.len], encoded_origin);
+    offset += encoded_origin.len;
+    @memcpy(result[offset .. offset + encoded_referer.len], encoded_referer);
+    offset += encoded_referer.len;
+    @memcpy(result[offset .. offset + encoded_cookie.len], encoded_cookie);
+    offset += encoded_cookie.len;
+    @memcpy(result[offset .. offset + encoded_sec_ch_ua.len], encoded_sec_ch_ua);
+    offset += encoded_sec_ch_ua.len;
+    @memcpy(result[offset .. offset + encoded_sec_ch_ua_mobile.len], encoded_sec_ch_ua_mobile);
+    offset += encoded_sec_ch_ua_mobile.len;
+    @memcpy(result[offset .. offset + encoded_sec_ch_ua_platform.len], encoded_sec_ch_ua_platform);
+    offset += encoded_sec_ch_ua_platform.len;
+    @memcpy(result[offset .. offset + encoded_sec_fetch_site.len], encoded_sec_fetch_site);
+    offset += encoded_sec_fetch_site.len;
+    @memcpy(result[offset .. offset + encoded_sec_fetch_mode.len], encoded_sec_fetch_mode);
+    offset += encoded_sec_fetch_mode.len;
+    @memcpy(result[offset .. offset + encoded_sec_fetch_dest.len], encoded_sec_fetch_dest);
+    offset += encoded_sec_fetch_dest.len;
+
+    std.debug.assert(offset == total_len);
+    return result;
+}
+
 test "buildGitHubPostHeaders: round-trip" {
     const allocator = std.testing.allocator;
     const block = try buildGitHubPostHeaders(allocator, "/test", "github.com", 123);

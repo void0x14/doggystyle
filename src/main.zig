@@ -43,60 +43,16 @@ fn currentMonotonicMs() u32 {
     return @intCast((@as(u64, @intCast(ts.sec)) * 1000) + (@as(u64, @intCast(ts.nsec)) / 1000000));
 }
 
-fn buildBrowserTraceDirPath(allocator: std.mem.Allocator, cwd: []const u8, monotonic_ms: u32) ![]u8 {
-    // SOURCE: POSIX path semantics — relative artifact directories should be rooted at the current working directory.
-    return std.fmt.allocPrint(allocator, "{s}/artifacts/browser-trace-{d}", .{ cwd, monotonic_ms });
-}
-
-fn createBrowserTraceDir(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+fn createArtifactDir(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     var cwd_buf: [std.posix.PATH_MAX]u8 = undefined;
     const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.TraceDirCreateFailed;
     const cwd = std.mem.sliceTo(@as([*:0]u8, @ptrCast(cwd_ptr)), 0);
 
-    const trace_dir = try buildBrowserTraceDirPath(allocator, cwd, currentMonotonicMs());
+    const trace_dir = try std.fmt.allocPrint(allocator, "{s}/artifacts/browser-trace-{d}", .{ cwd, currentMonotonicMs() });
     errdefer allocator.free(trace_dir);
 
     std.Io.Dir.cwd().createDirPath(io, trace_dir) catch return error.TraceDirCreateFailed;
     return trace_dir;
-}
-
-fn startBrowserRecorder(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    trace_dir: []const u8,
-) !?process.Child {
-    var output_buf: [1024]u8 = undefined;
-    const output = try std.fmt.bufPrint(&output_buf, "{s}/browser.mp4", .{trace_dir});
-    var env_map = try browser_init.buildSafeEnvironment(allocator, trace_dir);
-    defer env_map.deinit();
-
-    const argv = [_][]const u8{
-        "ffmpeg",
-        "-y",
-        "-video_size",
-        "1280x720",
-        "-framerate",
-        "5",
-        "-f",
-        "x11grab",
-        "-i",
-        browser_init.XVFB_DISPLAY,
-        "-codec:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-pix_fmt",
-        "yuv420p",
-        output,
-    };
-
-    return process.spawn(io, .{
-        .argv = &argv,
-        .environ_map = &env_map,
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch null;
 }
 
 fn refreshGitHubTransport(
@@ -142,14 +98,6 @@ fn refreshGitHubTransport(
     );
     try github_client.adoptHandshake(allocator, handshake);
     std.debug.print("[GITHUB] Transport refresh complete; HTTP/2 state reset\n", .{});
-}
-
-test "buildBrowserTraceDirPath: roots artifacts under current working directory" {
-    const allocator = std.testing.allocator;
-    const path = try buildBrowserTraceDirPath(allocator, "/repo/project", 12345);
-    defer allocator.free(path);
-
-    try std.testing.expectEqualStrings("/repo/project/artifacts/browser-trace-12345", path);
 }
 
 /// Ghost Engine — Master Orchestrator (PRODUCTION)
@@ -386,86 +334,27 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("[SUCCESS] Extracted Token: {s}\n", .{auth_token});
 
     // =========================================================================
-    // ADIM 11: BDA Telemetry Packaging & Risk Check Submission
-    // =========================================================================
-    std.debug.print("\n[BDA] Preparing Browser Data Analytics (BDA) payload...\n", .{});
-    var env = try network.BrowserEnvironment.init(allocator, io);
-    // Using realistic CachyOS/Ryzen specs to enforce "Low Risk"
-    env.navigator.hardwareConcurrency = 16; // e.g., Ryzen 7
-    env.navigator.deviceMemory = 32; // 32 GB RAM
-    env.webgl.renderer = "AMD Radeon RX 7900 XTX (RADV NAVI31, LLVM 18.1.8, DRM 3.57, CachyOS)";
-
-    const bda_payload = try network.encryptBda(allocator, &env);
-    defer allocator.free(bda_payload);
-
-    std.debug.print("[BDA] Encrypted payload generated ({d} bytes)\n", .{bda_payload.len});
-    std.debug.print("[RISK CHECK] Sending POST to /signup_check/usage...\n", .{});
-
-    const risk_status = try github_client.performRiskCheck(
-        allocator,
-        auth_token,
-        bda_payload,
-        &sock,
-        dst_ip,
-    );
-
-    if (!risk_status.challenge_required) {
-        std.debug.print("[SUCCESS] Arkose Bypassed via Low-Risk Signature\n", .{});
-    } else {
-        std.debug.print("[WARN] Challenge required! Risk score might be too high.\n", .{});
-    }
-
-    // =========================================================================
-    // ADIM 11.4: Xvfb + CDP Browser + Token Harvest
+    // ADIM 11.4: headless=new + CDP Browser + Token Harvest
     // =========================================================================
     // SOURCE: src/browser_bridge.zig — CdpClient connects to Chrome CDP WebSocket
     // SOURCE: src/browser_bridge.zig — BrowserBridge injects harvest.js via Runtime.evaluate
     // SOURCE: src/harvest.js — Sets window.__ghost_token / window.__ghost_identity globals
     //
-    // IMPORTANT: Chrome headless does NOT support extensions (confirmed by Chrome team).
+    // IMPORTANT: Chrome headless=new does NOT support extensions (confirmed by Chrome team).
     // CDP Runtime.evaluate is the ONLY reliable way to inject JS and read results.
-    // Xvfb provides a virtual display so Chrome runs in GUI mode (not headless).
+    //
+    // NOTE: Browser + fingerprint collection moved before BDA creation so that
+    // real browser fingerprint data can populate the BDA payload (lowers Arkose risk score).
     //
     // Flow:
-    //   1. Start Xvfb on display :99
-    //   2. Spawn Chrome with --remote-debugging-port=9222 + DISPLAY=:99
-    //   3. BrowserBridge connects to CDP WebSocket for the signup tab
-    //   4. Inject harvest.js via Runtime.evaluate
-    //   5. Poll window.__ghost_token / window.__ghost_identity globals
-    //   6. Parse harvested data into HarvestResult
-    // Step 1: Start Xvfb BEFORE Chrome
-    // SOURCE: Xvfb — X Virtual Framebuffer provides X11 display without physical screen
-    std.debug.print("\n[XVFB] Starting Xvfb on display {s}...\n", .{browser_init.XVFB_DISPLAY});
-    const xvfb_argv = [_][]const u8{ "Xvfb", browser_init.XVFB_DISPLAY, "-screen", "0", "1280x720x24" };
-    const xvfb_child = process.spawn(io, .{
-        .argv = &xvfb_argv,
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch |err| {
-        std.debug.print("[XVFB] Failed to start Xvfb: {}\n", .{err});
-        return err;
-    };
-    _ = xvfb_child;
+    //   1. Spawn Chrome with --remote-debugging-port=9222 in headless=new mode
+    //   2. BrowserBridge connects to CDP WebSocket for the signup tab
+    //   3. Collect fingerprint BEFORE any Arkose interaction
+    //   4. Use fingerprint to build BDA payload with real values
+    //   5. Inject harvest.js via Runtime.evaluate for later token harvesting
 
-    // Give Xvfb time to start
-    const xvfb_sleep = std.os.linux.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_ms };
-    _ = std.os.linux.nanosleep(&xvfb_sleep, null);
-
-    const browser_trace_dir = try createBrowserTraceDir(allocator, io);
-    defer allocator.free(browser_trace_dir);
-    std.debug.print("[BROWSER] Trace dir: {s}\n", .{browser_trace_dir});
-
-    var browser_recorder = try startBrowserRecorder(allocator, io, browser_trace_dir);
-    defer if (browser_recorder) |*recorder| recorder.kill(io);
-    if (browser_recorder != null) {
-        std.debug.print("[BROWSER] Xvfb video recorder started\n", .{});
-    } else {
-        std.debug.print("[BROWSER] Xvfb video recorder unavailable; continuing with CDP screenshots/state logs\n", .{});
-    }
-
-    // Step 2: Spawn Chrome with CDP on display :99
-    std.debug.print("[BROWSER] Launching stealth Chrome for token harvest (Xvfb + CDP)...\n", .{});
+    // Step 1: Spawn Chrome with CDP in headless=new mode
+    std.debug.print("[BROWSER] Launching stealth Chrome for token harvest (headless=new + CDP)...\n", .{});
     var stealth_browser = try browser_init.StealthBrowser.init(allocator, io);
     defer stealth_browser.deinit();
 
@@ -483,8 +372,24 @@ pub fn main(init: std.process.Init) !void {
     // Step 3: Connect to Chrome CDP and install the browser session bridge.
     std.debug.print("[CDP] Connecting to Chrome CDP on localhost:{d}...\n", .{browser_bridge.CDP_PORT});
     var bridge = try browser_bridge.BrowserBridge.init(allocator, "https://github.com/signup");
-    defer bridge.deinit();
-    try bridge.enableDiagnostics(browser_trace_dir);
+    defer {
+        bridge.verifyArtifacts();
+        bridge.deinit();
+    }
+
+    // Create artifact directory for browser diagnostics (no Xvfb needed)
+    const artifact_dir = createArtifactDir(allocator, io) catch |err| blk: {
+        std.debug.print("[ARTIFACTS] ⚠ Could not create artifact dir: {} — continuing without diagnostics\n", .{err});
+        break :blk null;
+    };
+    defer if (artifact_dir) |dir| allocator.free(dir);
+
+    if (artifact_dir) |dir| {
+        bridge.enableDiagnostics(dir) catch |err| {
+            std.debug.print("[ARTIFACTS] ⚠ Could not enable diagnostics: {}\n", .{err});
+        };
+        std.debug.print("[ARTIFACTS] Diagnostics enabled: {s}\n", .{dir});
+    }
 
     // =========================================================================
     // FINGERPRINT DIAGNOSTIC — Collect baseline BEFORE any Arkose interaction
@@ -497,11 +402,17 @@ pub fn main(init: std.process.Init) !void {
         break :blk null;
     };
 
+    // Keep fingerprint slices alive through BDA creation — deinit after BDA is encrypted
+    defer {
+        if (fingerprint_opt) |fp| {
+            var fp_mut = fp;
+            fp_mut.deinit(allocator);
+        }
+    }
+
     // Write to NDJSON file if we have data
     if (fingerprint_opt) |fingerprint| {
         var fp = fingerprint;
-        defer fp.deinit(allocator);
-
         browser_bridge.writeFingerprintNDJSON(allocator, &fp, "before-arkose") catch |err| {
             std.debug.print("[FINGERPRINT] Failed to write NDJSON: {}\n", .{err});
         };
@@ -520,6 +431,85 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("[FINGERPRINT] =====================\n\n", .{});
     } else {
         std.debug.print("[FINGERPRINT] Skipping diagnostic — fingerprint not available\n", .{});
+    }
+
+    // =========================================================================
+    // ADIM 11: BDA Telemetry Packaging & Risk Check Submission
+    // =========================================================================
+    // SOURCE: FingerprintDiagnostic → BrowserEnvironment field mapping
+    //   webgl_renderer        → env.webgl.renderer
+    //   webgl_vendor          → env.webgl.vendor
+    //   screen_width          → env.screen.width             (u32 → u16)
+    //   screen_height         → env.screen.height            (u32 → u16)
+    //   screen_avail_width    → env.screen.availWidth        (u32 → u16)
+    //   screen_avail_height   → env.screen.availHeight       (u32 → u16)
+    //   canvas_hash           → env.canvas.hash
+    //   navigator_userAgent   → env.navigator.userAgent
+    //   navigator_platform   → env.navigator.platform
+    //   navigator_languages   → env.navigator.languages_json  (JSON array string)
+    //   navigator_hardware_concurrency → env.navigator.hardwareConcurrency (u8)
+    //   navigator_device_memory        → env.navigator.deviceMemory        (u8)
+    //   timezone_offset       → env.timezone.offset
+    std.debug.print("\n[BDA] Preparing Browser Data Analytics (BDA) payload...\n", .{});
+    var env = try network.BrowserEnvironment.init(allocator, io);
+
+    // Round timestamp to 6-hour boundary per Arkose Labs BDA format
+    // SOURCE: Arkose Labs BDA — timestamp rounded to 21600-second windows
+    env.timestamp = env.timestamp - (env.timestamp % 21600000); // 21600s * 1000ms
+
+    if (fingerprint_opt) |fp| {
+        env.navigator.userAgent = fp.navigator_userAgent;
+        env.navigator.platform = fp.navigator_platform;
+        env.navigator.languages_json = fp.navigator_languages;
+        env.navigator.hardwareConcurrency = fp.navigator_hardware_concurrency;
+        env.navigator.deviceMemory = fp.navigator_device_memory;
+        env.webgl.renderer = fp.webgl_renderer;
+        env.webgl.vendor = fp.webgl_vendor;
+        env.screen.width = @intCast(fp.screen_width);
+        env.screen.height = @intCast(fp.screen_height);
+        env.screen.availWidth = @intCast(fp.screen_avail_width);
+        env.screen.availHeight = @intCast(fp.screen_avail_height);
+        env.canvas.hash = fp.canvas_hash;
+        env.timezone.offset = fp.timezone_offset;
+        std.debug.print("[BDA] Populated from real browser fingerprint\n", .{});
+    } else {
+        env.navigator.hardwareConcurrency = 16;
+        env.navigator.deviceMemory = 32;
+        env.webgl.renderer = "AMD Radeon RX 7900 XTX (RADV NAVI31, LLVM 18.1.8, DRM 3.57, CachyOS)";
+        std.debug.print("[BDA] Fingerprint unavailable — using hardcoded fallback values\n", .{});
+    }
+
+    const bda_payload = try network.encryptBda(allocator, &env);
+    defer allocator.free(bda_payload);
+
+    const bda_json = try env.toJsonAlloc(allocator);
+    defer allocator.free(bda_json);
+    std.debug.print("[BDA] JSON payload ({d} bytes): {s}\n", .{ bda_json.len, bda_json[0..@min(bda_json.len, 500)] });
+    std.debug.print("[BDA] Encrypted payload generated ({d} bytes)\n", .{bda_payload.len});
+    std.debug.print("[RISK CHECK] Sending POST to /signup_check/usage...\n", .{});
+
+    const risk_status = blk: {
+        break :blk github_client.performRiskCheck(
+            allocator,
+            auth_token,
+            bda_payload,
+            &sock,
+            dst_ip,
+        ) catch |err| blk2: {
+            std.debug.print("[RISK CHECK] FAILED with error: {}\n", .{err});
+            std.debug.print("[RISK CHECK] This usually means:\n", .{});
+            std.debug.print("[RISK CHECK]   1. BDA payload format is wrong (check JSON above)\n", .{});
+            std.debug.print("[RISK CHECK]   2. GitHub closed the connection (TLS close_notify)\n", .{});
+            std.debug.print("[RISK CHECK]   3. HTTP/2 framing error\n", .{});
+            std.debug.print("[RISK CHECK] Continuing with challenge_required=true as fallback\n", .{});
+            break :blk2 network.RiskStatus{ .challenge_required = true };
+        };
+    };
+
+    if (!risk_status.challenge_required) {
+        std.debug.print("[SUCCESS] Arkose Bypassed via Low-Risk Signature\n", .{});
+    } else {
+        std.debug.print("[WARN] Challenge required! Risk score might be too high.\n", .{});
     }
 
     // =========================================================================
@@ -557,6 +547,14 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("[SIGNUP] Generated Username: {s}\n", .{username});
     std.debug.print("[SIGNUP] Using Email: {s} (TEST MODE - Digistallone bypassed)\n", .{email});
     std.debug.print("[SIGNUP] Submitting POST to /signup...\n", .{});
+
+    // =========================================================================
+    // OBSERVABILITY POLL — Capture initial state before signup form interaction
+    // Drains CDP events and writes risk-level telemetry to browser-network.ndjson
+    // =========================================================================
+    bridge.computeRiskAndLogTelemetry("pre-signup") catch |err| {
+        std.debug.print("[OBSERVE] ⚠️ Pre-signup telemetry poll failed: {}\n", .{err});
+    };
 
     std.debug.print("[BROWSER] Capturing exact browser-owned signup bundle...\n", .{});
     var signup_bundle = bridge.captureSignupBundle(username, email, password, "") catch |err| {
@@ -659,6 +657,13 @@ pub fn main(init: std.process.Init) !void {
     const post_signup_grace = std.os.linux.timespec{ .sec = 1, .nsec = 500 * std.time.ns_per_ms };
     _ = std.os.linux.nanosleep(&post_signup_grace, null);
     try bridge.navigateToAccountVerifications();
+    // =========================================================================
+    // OBSERVABILITY POLL — Capture state before verification form interaction
+    // =========================================================================
+    bridge.computeRiskAndLogTelemetry("pre-verify") catch |err| {
+        std.debug.print("[OBSERVE] ⚠️ Pre-verify telemetry poll failed: {}\n", .{err});
+    };
+
     std.debug.print("[BROWSER] Capturing exact browser-owned verify bundle...\n", .{});
     var verify_bundle = bridge.captureVerifyBundle(github_code) catch |err| {
         std.debug.print("[BROWSER] FAILED: Could not capture verify bundle: {}\n", .{err});

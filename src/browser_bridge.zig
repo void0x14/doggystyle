@@ -117,6 +117,7 @@ pub const CdpClient = struct {
     fd: i32,
     allocator: std.mem.Allocator,
     msg_id: u32 = 0,
+    pending_events: std.array_list.Managed([]u8),
 
     /// Connect to Chrome's CDP WebSocket for a specific tab.
     /// Steps:
@@ -251,13 +252,17 @@ pub const CdpClient = struct {
             .fd = fd,
             .allocator = allocator,
             .msg_id = 0,
+            .pending_events = std.array_list.Managed([]u8).init(allocator),
         };
     }
 
     /// Close the CDP WebSocket connection
     /// SOURCE: RFC 6455, Section 5.5.1 — Close frame
     pub fn close(self: *CdpClient) void {
-        // Send WebSocket close frame
+        for (self.pending_events.items) |event| {
+            self.allocator.free(event);
+        }
+        self.pending_events.deinit();
         self.sendWsFrame(&[_]u8{ 0x88, 0x00 }) catch {};
         _ = std.c.close(self.fd);
         std.debug.print("[CDP] WebSocket closed\n", .{});
@@ -279,14 +284,20 @@ pub const CdpClient = struct {
         try self.sendWsText(msg);
 
         // Read response (match message id)
+        // CRITICAL FIX: CDP events (no "id" field) are buffered for later processing
+        // instead of being dropped. Previously, Fetch.requestPaused and Network.*
+        // events were silently freed here, causing waitForPausedRequest to always
+        // time out.
         while (true) {
             const response = try self.recvWsTextAlloc();
             if (extractTopLevelMessageId(self.allocator, response)) |resp_id| {
                 if (resp_id == self.msg_id) {
                     return response;
                 }
+                self.allocator.free(response);
+            } else {
+                try self.pending_events.append(response);
             }
-            self.allocator.free(response);
         }
     }
 
@@ -351,20 +362,6 @@ pub const CdpClient = struct {
         try ensureCdpCommandSucceeded(self.allocator, "Page.addScriptToEvaluateOnNewDocument", response);
     }
 
-    /// Enable Runtime domain (triggers consoleAPICalled side-effect — use sparingly)
-    /// SOURCE: CDP spec — https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-enable
-    pub fn enableRuntime(self: *CdpClient) !void {
-        const response = try self.sendCommand("Runtime.enable", "{}");
-        defer self.allocator.free(response);
-    }
-
-    /// Disable Runtime domain (stops consoleAPICalled side-effect)
-    /// SOURCE: CDP spec — https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-disable
-    pub fn disableRuntime(self: *CdpClient) !void {
-        const response = try self.sendCommand("Runtime.disable", "{}");
-        defer self.allocator.free(response);
-    }
-
     // SOURCE: Chrome DevTools Protocol Page.reload — reload the inspected page.
     pub fn reloadPage(self: *CdpClient) !void {
         const response = try self.sendCommand("Page.reload", "{}");
@@ -397,11 +394,44 @@ pub const CdpClient = struct {
         ) catch return error.OutOfMemory;
         const response = try self.sendCommand("Fetch.enable", params);
         defer self.allocator.free(response);
+        try ensureCdpCommandSucceeded(self.allocator, "Fetch.enable", response);
+        std.debug.print("[CDP] Fetch.enable — intercepting pattern: {s}\n", .{url_pattern});
     }
 
     pub fn disableFetchInterception(self: *CdpClient) !void {
         const response = try self.sendCommand("Fetch.disable", "{}");
         defer self.allocator.free(response);
+    }
+
+    // SOURCE: Chrome DevTools Protocol Network.enable — enables network tracking,
+    // sends Network.requestWillBeSent and Network.responseReceived events.
+    pub fn enableNetworkMonitoring(self: *CdpClient) !void {
+        const response = try self.sendCommand("Network.enable", "{}");
+        defer self.allocator.free(response);
+        try ensureCdpCommandSucceeded(self.allocator, "Network.enable", response);
+        std.debug.print("[CDP] Network.enable — CDP network monitoring active\n", .{});
+    }
+
+    pub fn hasPendingEvents(self: *const CdpClient) bool {
+        return self.pending_events.items.len > 0;
+    }
+
+    pub fn nextPendingEvent(self: *CdpClient) ?[]u8 {
+        if (self.pending_events.items.len == 0) return null;
+        return self.pending_events.orderedRemove(0);
+    }
+
+    // SOURCE: CDP Network.getResponseBody — retrieve response body for a network request
+    pub fn getNetworkResponseBody(self: *CdpClient, request_id: []const u8) ![]u8 {
+        var id_esc: [1024]u8 = undefined;
+        const id_len = escapeJsonString(request_id, &id_esc);
+        var params_buf: [2048]u8 = undefined;
+        const params = std.fmt.bufPrint(
+            &params_buf,
+            "{{\"requestId\":\"{s}\"}}",
+            .{id_esc[0..id_len]},
+        ) catch return error.OutOfMemory;
+        return self.sendCommand("Network.getResponseBody", params);
     }
 
     // SOURCE: Chrome DevTools Protocol Fetch.failRequest — abort paused browser request.
@@ -916,6 +946,23 @@ const BrowserUiState = struct {
     text_snippet: []const u8 = "",
 };
 
+const RiskLevel = enum {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL,
+};
+
+fn computeRiskLevel(state: BrowserUiState) RiskLevel {
+    if (state.octocaptcha_length == 0 and state.has_captcha_frame) return .CRITICAL;
+    if (state.submit_hidden == true and state.submit_disabled == true) return .CRITICAL;
+    if (state.has_captcha_frame) return .HIGH;
+    if (state.submit_hidden == true or state.submit_disabled == true) return .HIGH;
+    if (state.load_button_hidden == true) return .MEDIUM;
+    if (state.has_cookie_banner) return .MEDIUM;
+    return .LOW;
+}
+
 // ---------------------------------------------------------------------------
 // Browser Audit Result — structured observability for every bridge action
 // SOURCE: PRD "Full Real-Time Browser Observability System", ticket 446647de
@@ -1125,6 +1172,10 @@ pub const FingerprintDiagnostic = struct {
     screen_height: u32,
     screen_inner_width: u32,
     screen_inner_height: u32,
+    screen_avail_width: u32,
+    screen_avail_height: u32,
+    navigator_hardware_concurrency: u8,
+    navigator_device_memory: u8,
     webgl_vendor: []const u8,
     webgl_renderer: []const u8,
     canvas_hash: []const u8,
@@ -1151,6 +1202,7 @@ pub const FingerprintDiagnostic = struct {
         allocator.free(self.notification_permission);
         allocator.free(self.permissions_notifications);
         allocator.free(self.permissions_geolocation);
+        allocator.free(self.stealth_errors);
     }
 
     comptime {
@@ -1168,6 +1220,10 @@ pub const FingerprintDiagnostic = struct {
         std.debug.assert(@hasField(@This(), "screen_height"));
         std.debug.assert(@hasField(@This(), "screen_inner_width"));
         std.debug.assert(@hasField(@This(), "screen_inner_height"));
+        std.debug.assert(@hasField(@This(), "screen_avail_width"));
+        std.debug.assert(@hasField(@This(), "screen_avail_height"));
+        std.debug.assert(@hasField(@This(), "navigator_hardware_concurrency"));
+        std.debug.assert(@hasField(@This(), "navigator_device_memory"));
         std.debug.assert(@hasField(@This(), "webgl_vendor"));
         std.debug.assert(@hasField(@This(), "webgl_renderer"));
         std.debug.assert(@hasField(@This(), "canvas_hash"));
@@ -1313,6 +1369,12 @@ pub const BrowserBridge = struct {
             .start_time_ns = now_ns,
         };
         errdefer bridge.deinit();
+
+        // STEP 0: Enable CDP Network domain for real-time observability
+        // SOURCE: Chrome DevTools Protocol Network.enable — enables network event tracking
+        bridge.cdp.enableNetworkMonitoring() catch |err| {
+            std.debug.print("[BRIDGE] ⚠️ Network.enable failed: {} — network events won't be logged\n", .{err});
+        };
 
         // STEP 1: Inject stealth script FIRST (runs before any page JS)
         // SOURCE: scrapfly.io — stealth script must execute before Arkose enforcement.js
@@ -1517,6 +1579,7 @@ pub const BrowserBridge = struct {
         diagnostic.notification_permission = self.allocator.dupe(u8, diagnostic.notification_permission) catch return BridgeError.OutOfMemory;
         diagnostic.permissions_notifications = self.allocator.dupe(u8, diagnostic.permissions_notifications) catch return BridgeError.OutOfMemory;
         diagnostic.permissions_geolocation = self.allocator.dupe(u8, diagnostic.permissions_geolocation) catch return BridgeError.OutOfMemory;
+        diagnostic.stealth_errors = self.allocator.dupe(u8, diagnostic.stealth_errors) catch return BridgeError.OutOfMemory;
 
         std.debug.print("[BRIDGE] Fingerprint diagnostic complete\n", .{});
         return diagnostic;
@@ -1875,18 +1938,60 @@ pub const BrowserBridge = struct {
         const start_ns = currentTimestampNs();
         while (@as(u64, @intCast(@divTrunc(currentTimestampNs() - start_ns, std.time.ns_per_ms))) < timeout_ms) {
             _ = self.dismissPageBlockers() catch {};
+
+            // Process ALL pending CDP events buffered during previous sendCommand calls.
+            // CRITICAL: Previously these events were silently discarded by sendCommand,
+            // causing Fetch.requestPaused to always time out.
+            while (self.cdp.hasPendingEvents()) {
+                const event = self.cdp.nextPendingEvent() orelse break;
+                defer self.allocator.free(event);
+
+                const paused = parseFetchRequestPaused(self.allocator, event) catch {
+                    self.processCdpEvent(event) catch {};
+                    continue;
+                };
+                if (mem.indexOf(u8, paused.bundle.url, url_substring) != null) {
+                    const phase_label = if (mem.indexOf(u8, url_substring, "signup") != null)
+                        "signup-capture"
+                    else if (mem.indexOf(u8, url_substring, "account_verifications") != null)
+                        "verify-capture"
+                    else
+                        "unknown";
+                    try self.logNetworkEvent(
+                        "request_paused",
+                        paused.bundle.url,
+                        paused.bundle.method,
+                        paused.bundle.post_data.len > 0,
+                        paused.bundle.post_data.len,
+                        phase_label,
+                    );
+                    return paused;
+                }
+                paused.deinit(self.allocator);
+            }
+
+            // Emit telemetry + diagnostic state every poll cycle (rate-limited internally)
+            self.computeRiskAndLogTelemetry("request-wait") catch {};
             self.emitDiagnosticState("request-wait", false) catch {};
+
+            // Read next WebSocket message with short timeout for responsive polling
+            self.cdp.setReceiveTimeoutMs(500);
             const message = self.cdp.recvMessage() catch |err| switch (err) {
                 error.ReadFailed => continue,
                 else => return err,
             };
             defer self.allocator.free(message);
+
+            // Check if message is a Fetch.requestPaused event
             const paused = parseFetchRequestPaused(self.allocator, message) catch |err| switch (err) {
-                error.ParseFailed => continue,
+                error.ParseFailed => {
+                    // Not a Fetch.requestPaused event — process as network event
+                    self.processCdpEvent(message) catch {};
+                    continue;
+                },
                 else => return err,
             };
             if (mem.indexOf(u8, paused.bundle.url, url_substring) != null) {
-                // Log matched network event to browser-network.ndjson
                 const phase_label = if (mem.indexOf(u8, url_substring, "signup") != null)
                     "signup-capture"
                 else if (mem.indexOf(u8, url_substring, "account_verifications") != null)
@@ -1912,6 +2017,12 @@ pub const BrowserBridge = struct {
     fn waitForTruthyExpression(self: *BrowserBridge, expression: []const u8, timeout_ms: u64) BridgeError!void {
         const start_ns = currentTimestampNs();
         while (@as(u64, @intCast(@divTrunc(currentTimestampNs() - start_ns, std.time.ns_per_ms))) < timeout_ms) {
+            // Drain any CDP events buffered during previous evaluate calls
+            while (self.cdp.hasPendingEvents()) {
+                const event = self.cdp.nextPendingEvent() orelse break;
+                defer self.allocator.free(event);
+                self.processCdpEvent(event) catch {};
+            }
             try self.emitDiagnosticState("wait-loop", false);
             const response = self.cdp.evaluate(expression) catch {
                 const sleep_req = std.os.linux.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
@@ -1930,6 +2041,232 @@ pub const BrowserBridge = struct {
 
     fn logSignupBrowserState(self: *BrowserBridge) BridgeError!void {
         try self.emitDiagnosticState("timeout", true);
+    }
+
+    // Process a buffered CDP event: log Network.* events to browser-network.ndjson
+    // and check for Fetch.requestPaused events.
+    // SOURCE: Chrome DevTools Protocol — Network.requestWillBeSent, Network.responseReceived
+    fn processCdpEvent(self: *BrowserBridge, event_json: []const u8) BridgeError!void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, event_json, .{}) catch return error.ParseFailed;
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) return;
+
+        const method_value = root.object.get("method") orelse return;
+        if (method_value != .string) return;
+        const method = method_value.string;
+
+        if (mem.eql(u8, method, "Network.requestWillBeSent")) {
+            const params = root.object.get("params") orelse return;
+            if (params != .object) return;
+            const request = params.object.get("request") orelse return;
+            if (request != .object) return;
+
+            const url_value = request.object.get("url") orelse return;
+            const req_method_value = request.object.get("method") orelse return;
+            if (url_value != .string or req_method_value != .string) return;
+
+            const has_post_data = request.object.get("postData") != null;
+            const post_data_len: usize = if (request.object.get("postData")) |pd| blk: {
+                if (pd == .string) break :blk pd.string.len;
+                break :blk 0;
+            } else 0;
+
+            try self.logNetworkEvent(
+                "request_will_be_sent",
+                url_value.string,
+                req_method_value.string,
+                has_post_data,
+                post_data_len,
+                "network-observe",
+            );
+            std.debug.print("[CDP-OBSERVE] Network.requestWillBeSent: {s} {s}\n", .{ req_method_value.string, url_value.string });
+        } else if (mem.eql(u8, method, "Network.responseReceived")) {
+            const params = root.object.get("params") orelse return;
+            if (params != .object) return;
+            const response_obj = params.object.get("response") orelse return;
+            if (response_obj != .object) return;
+
+            const url_value = response_obj.object.get("url") orelse return;
+            if (url_value != .string) return;
+
+            const status_value = response_obj.object.get("status") orelse return;
+            const status: i64 = if (status_value == .integer) status_value.integer else 0;
+
+            var tmp: [64]u8 = undefined;
+            const status_str = std.fmt.bufPrint(&tmp, "{d}", .{status}) catch "0";
+
+            var url_esc: [2048]u8 = undefined;
+            const url_esc_len = escapeJsonString(url_value.string, &url_esc);
+
+            const trace_dir = self.diagnostics_dir orelse return;
+            var path_buf: [1024]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/browser-network.ndjson", .{trace_dir}) catch return error.OutOfMemory;
+            const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+                .ACCMODE = .WRONLY,
+                .CREAT = true,
+                .APPEND = true,
+                .CLOEXEC = true,
+            }, 0o644) catch return error.WriteFailed;
+            defer _ = std.c.close(fd);
+
+            var line_buf = std.array_list.Managed(u8).init(self.allocator);
+            defer line_buf.deinit();
+            var ts_buf: [32]u8 = undefined;
+            try line_buf.appendSlice("{\"timestamp_ms\":");
+            try line_buf.appendSlice(std.fmt.bufPrint(&ts_buf, "{d}", .{currentUnixMs()}) catch return error.OutOfMemory);
+            try line_buf.appendSlice(",\"event_type\":\"network_response_received\"");
+            try line_buf.appendSlice(",\"url\":\"");
+            try line_buf.appendSlice(url_esc[0..url_esc_len]);
+            try line_buf.appendSlice("\",\"status\":");
+            try line_buf.appendSlice(status_str);
+            try line_buf.appendSlice("}\n");
+            try writeAll(fd, line_buf.items.ptr, line_buf.items.len);
+
+            // Optionally fetch first 500 chars of response body
+            if (params.object.get("requestId")) |req_id| {
+                if (req_id == .string) {
+                    self.fetchAndLogResponseBody(req_id.string, url_value.string) catch {};
+                }
+            }
+
+            std.debug.print("[CDP-OBSERVE] Network.responseReceived: {d} {s}\n", .{ @as(i64, status), url_value.string });
+        } else {
+            std.debug.print("[CDP-OBSERVE] Unhandled CDP event: {s}\n", .{method});
+        }
+    }
+
+    fn fetchAndLogResponseBody(self: *BrowserBridge, request_id: []const u8, url: []const u8) BridgeError!void {
+        const response = self.cdp.getNetworkResponseBody(request_id) catch |err| {
+            std.debug.print("[CDP-OBSERVE] Network.getResponseBody failed for {s}: {}\n", .{ url, err });
+            return err;
+        };
+        defer self.allocator.free(response);
+
+        const body_value = extractRuntimeEvaluateStringValue(self.allocator, response) catch |err| {
+            std.debug.print("[CDP-OBSERVE] Network.getResponseBody parse failed: {}\n", .{err});
+            return err;
+        };
+        defer self.allocator.free(body_value);
+
+        const body_preview = body_value[0..@min(body_value.len, 500)];
+
+        const trace_dir = self.diagnostics_dir orelse return;
+        var path_buf: [1024]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/browser-network.ndjson", .{trace_dir}) catch return error.OutOfMemory;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .APPEND = true,
+            .CLOEXEC = true,
+        }, 0o644) catch return error.WriteFailed;
+        defer _ = std.c.close(fd);
+
+        var line_buf = std.array_list.Managed(u8).init(self.allocator);
+        defer line_buf.deinit();
+        var tmp: [64]u8 = undefined;
+        try line_buf.appendSlice("{\"timestamp_ms\":");
+        try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{currentUnixMs()}) catch return error.OutOfMemory);
+        try line_buf.appendSlice(",\"event_type\":\"response_body_preview\"");
+        try line_buf.appendSlice(",\"url\":\"");
+        var url_esc: [2048]u8 = undefined;
+        const url_esc_len = escapeJsonString(url, &url_esc);
+        try line_buf.appendSlice(url_esc[0..url_esc_len]);
+        try line_buf.appendSlice("\",\"body_preview\":\"");
+        var body_esc: [1024]u8 = undefined;
+        const body_esc_len = escapeJsonString(body_preview, &body_esc);
+        try line_buf.appendSlice(body_esc[0..body_esc_len]);
+        try line_buf.appendSlice("\"}\n");
+        try writeAll(fd, line_buf.items.ptr, line_buf.items.len);
+    }
+
+    // Real-time telemetry: compute risk level and write NDJSON line on every observeUiState poll.
+    // SOURCE: PRD "Full Real-Time Browser Observability System" — risk-level telemetry
+    pub fn computeRiskAndLogTelemetry(self: *BrowserBridge, label: []const u8) BridgeError!void {
+        const state: BrowserUiState = self.observeUiState() catch |err| blk: {
+            std.debug.print("[BRIDGE] ⚠️ observeUiState failed in telemetry ({}) — using fallback\n", .{err});
+            break :blk BrowserUiState{
+                .url = try self.allocator.dupe(u8, "about:blank"),
+                .title = try self.allocator.dupe(u8, "CDP connected"),
+                .octocaptcha_length = 0,
+                .email_length = 0,
+                .password_length = 0,
+                .login_length = 0,
+                .submit_hidden = null,
+                .submit_disabled = null,
+                .load_button_hidden = null,
+                .load_button_disabled = null,
+                .has_captcha_frame = false,
+                .has_verify_completed = false,
+                .has_account_verif_text = false,
+                .has_cookie_banner = false,
+                .iframe_src = null,
+                .text_snippet = try self.allocator.dupe(u8, "observeUiState failed"),
+            };
+        };
+        defer self.freeUiState(state);
+
+        const risk = computeRiskLevel(state);
+        const trace_dir = self.diagnostics_dir orelse return;
+
+        var path_buf: [1024]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/browser-network.ndjson", .{trace_dir}) catch return error.OutOfMemory;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .APPEND = true,
+            .CLOEXEC = true,
+        }, 0o644) catch return error.WriteFailed;
+        defer _ = std.c.close(fd);
+
+        var line_buf = std.array_list.Managed(u8).init(self.allocator);
+        defer line_buf.deinit();
+        var tmp: [64]u8 = undefined;
+        var url_esc: [2048]u8 = undefined;
+        var title_esc: [512]u8 = undefined;
+        const url_esc_len = escapeJsonString(state.url, &url_esc);
+        const title_esc_len = escapeJsonString(state.title, &title_esc);
+
+        try line_buf.appendSlice("{\"ts\":");
+        try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{currentUnixMs()}) catch return error.OutOfMemory);
+        try line_buf.appendSlice(",\"type\":\"poll\"");
+        try line_buf.appendSlice(",\"label\":\"");
+        try line_buf.appendSlice(label);
+        try line_buf.appendSlice("\",\"url\":\"");
+        try line_buf.appendSlice(url_esc[0..url_esc_len]);
+        try line_buf.appendSlice("\",\"title\":\"");
+        try line_buf.appendSlice(title_esc[0..title_esc_len]);
+        try line_buf.appendSlice("\",\"captcha_frame\":");
+        try line_buf.appendSlice(if (state.has_captcha_frame) "true" else "false");
+        try line_buf.appendSlice(",\"submit_hidden\":");
+        if (state.submit_hidden) |sh| {
+            try line_buf.appendSlice(if (sh) "true" else "false");
+        } else {
+            try line_buf.appendSlice("null");
+        }
+        try line_buf.appendSlice(",\"submit_disabled\":");
+        if (state.submit_disabled) |sd| {
+            try line_buf.appendSlice(if (sd) "true" else "false");
+        } else {
+            try line_buf.appendSlice("null");
+        }
+        try line_buf.appendSlice(",\"token_len\":");
+        try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{state.octocaptcha_length}) catch return error.OutOfMemory);
+        try line_buf.appendSlice(",\"risk\":\"");
+        try line_buf.appendSlice(@tagName(risk));
+        try line_buf.appendSlice("\"}\n");
+
+        try writeAll(fd, line_buf.items.ptr, line_buf.items.len);
+        std.debug.print("[OBSERVE] {s}: risk={s} url={s} token_len={d} captcha={} submit_hidden={any} submit_disabled={any}\n", .{
+            label,
+            @tagName(risk),
+            state.url,
+            state.octocaptcha_length,
+            state.has_captcha_frame,
+            state.submit_hidden,
+            state.submit_disabled,
+        });
     }
 
     fn emitDiagnosticState(self: *BrowserBridge, label: []const u8, force_screenshot: bool) BridgeError!void {
@@ -2372,19 +2709,18 @@ pub const BrowserBridge = struct {
         };
 
         var all_ok = true;
-        var stats_buf: [256]u8 = undefined;
 
         for (required_files) |fname| {
             var path_buf: [1024]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ trace_dir, fname }) catch continue;
+            const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ trace_dir, fname }) catch continue;
 
-            const stat = std.posix.stat(path, &stats_buf);
-            if (stat != 0) {
+            const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
+            if (fd) |file_fd| {
+                _ = std.c.close(file_fd);
+                std.debug.print("[ARTIFACTS] ✅ {s}: exists\n", .{fname});
+            } else |_| {
                 std.debug.print("[ARTIFACTS] ❌ Missing: {s}\n", .{fname});
                 all_ok = false;
-            } else {
-                const size = std.mem.nativeToLittle(u64, @bitCast(stats_buf[48..56].*));
-                std.debug.print("[ARTIFACTS] ✅ {s}: {d} bytes\n", .{ fname, size });
             }
         }
 
@@ -2398,7 +2734,8 @@ pub const BrowserBridge = struct {
 
         var linux_dirent_buf: [1024]u8 = undefined;
         while (true) {
-            const n = std.posix.getdents64(dir, &linux_dirent_buf) catch break;
+            const n = std.os.linux.getdents64(dir, &linux_dirent_buf, linux_dirent_buf.len);
+            if (n == 0) break;
             if (n == 0) break;
             var offset: usize = 0;
             while (offset < n) {
@@ -2883,7 +3220,10 @@ test "addScriptOnNewDocument: rejects CDP error response" {
         .fd = fds[0],
         .allocator = std.testing.allocator,
         .msg_id = 0,
+        .pending_events = std.array_list.Managed([]u8).init(std.testing.allocator),
     };
+    defer client.pending_events.deinit();
+    for (client.pending_events.items) |event| std.testing.allocator.free(event);
 
     const reply_message = "{\"id\":1,\"error\":{\"code\":-32000,\"message\":\"Cannot add script\"}}";
     var reply_header: [2]u8 = .{ WS_FIN_BIT | WS_OPCODE_TEXT, @intCast(reply_message.len) };
@@ -2962,7 +3302,12 @@ test "sendWsText: 16-bit payload length is encoded in network byte order" {
         .fd = fds[0],
         .allocator = std.testing.allocator,
         .msg_id = 0,
+        .pending_events = std.array_list.Managed([]u8).init(std.testing.allocator),
     };
+    defer {
+        for (client.pending_events.items) |event| std.testing.allocator.free(event);
+        client.pending_events.deinit();
+    }
     try client.sendWsText(&payload);
 
     var frame: [2 + 2 + 4 + payload.len]u8 = undefined;
@@ -2999,7 +3344,12 @@ test "recvWsTextAlloc: supports server text frames larger than MAX_CDP_BUF" {
         .fd = fds[0],
         .allocator = allocator,
         .msg_id = 0,
+        .pending_events = std.array_list.Managed([]u8).init(allocator),
     };
+    defer {
+        for (client.pending_events.items) |event| allocator.free(event);
+        client.pending_events.deinit();
+    }
 
     const received = try client.recvWsTextAlloc();
     defer allocator.free(received);
@@ -3021,7 +3371,12 @@ test "sendCommand: ignores event messages with nested id before matching top-lev
         .fd = fds[0],
         .allocator = allocator,
         .msg_id = 0,
+        .pending_events = std.array_list.Managed([]u8).init(allocator),
     };
+    defer {
+        for (client.pending_events.items) |event| allocator.free(event);
+        client.pending_events.deinit();
+    }
 
     const event_message =
         "{\"method\":\"Runtime.executionContextCreated\",\"params\":{\"context\":{\"id\":1,\"origin\":\"https://github.com\"}}}";
@@ -3063,10 +3418,10 @@ test "parseFetchRequestPaused: extracts ordered headers and postData" {
 test "FingerprintDiagnostic: round-trip JSON parsing with all 25 fields" {
     const allocator = std.testing.allocator;
 
-    // Mock CDP response with all 25 fields populated
+    // Mock CDP response with all fields populated (including new fields)
     // NOTE: navigator_plugins_names and navigator_languages are JSON strings (arrays stringified)
     const mock_cdp_response =
-        \\{"id":1,"result":{"result":{"type":"string","value":"{\"stealth_script_loaded\":true,\"stealth_errors\":\"[]\",\"webgl_patched\":true,\"chrome_runtime_emulated\":true,\"navigator_webdriver\":false,\"window_chrome_exists\":true,\"chrome_runtime_connect\":true,\"chrome_runtime_sendMessage\":true,\"navigator_plugins_length\":3,\"navigator_plugins_names\":\"[\\\"Chrome PDF Plugin\\\",\\\"Chrome PDF Viewer\\\",\\\"Native Client\\\"]\",\"navigator_languages\":\"[\\\"en-US\\\",\\\"en\\\"]\",\"navigator_platform\":\"Linux x86_64\",\"navigator_userAgent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\",\"screen_width\":1920,\"screen_height\":1080,\"screen_inner_width\":1920,\"screen_inner_height\":1040,\"webgl_vendor\":\"\",\"webgl_renderer\":\"\",\"canvas_hash\":\"a1b2c3d4e5f6g7h8\",\"timezone_offset\":-180,\"language\":\"en-US\",\"notification_permission\":\"default\",\"permissions_notifications\":\"query_supported\",\"permissions_geolocation\":\"query_supported\",\"cdp_runtime_enable_side_effect\":false,\"iframe_contentWindow_exists\":true,\"console_debug_side_effects\":false,\"sourceurl_leak\":false}"}}}
+        \\{"id":1,"result":{"result":{"type":"string","value":"{\"stealth_script_loaded\":true,\"stealth_errors\":\"[]\",\"webgl_patched\":true,\"chrome_runtime_emulated\":true,\"navigator_webdriver\":false,\"window_chrome_exists\":true,\"chrome_runtime_connect\":true,\"chrome_runtime_sendMessage\":true,\"navigator_plugins_length\":3,\"navigator_plugins_names\":\"[\\\"Chrome PDF Plugin\\\",\\\"Chrome PDF Viewer\\\",\\\"Native Client\\\"]\",\"navigator_languages\":\"[\\\"en-US\\\",\\\"en\\\"]\",\"navigator_platform\":\"Linux x86_64\",\"navigator_userAgent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\",\"screen_width\":1920,\"screen_height\":1080,\"screen_inner_width\":1920,\"screen_inner_height\":1040,\"screen_avail_width\":1920,\"screen_avail_height\":1040,\"navigator_hardware_concurrency\":8,\"navigator_device_memory\":4,\"webgl_vendor\":\"\",\"webgl_renderer\":\"\",\"canvas_hash\":\"a1b2c3d4e5f6g7h8\",\"timezone_offset\":-180,\"language\":\"en-US\",\"notification_permission\":\"default\",\"permissions_notifications\":\"query_supported\",\"permissions_geolocation\":\"query_supported\",\"cdp_runtime_enable_side_effect\":false,\"iframe_contentWindow_exists\":true,\"console_debug_side_effects\":false,\"sourceurl_leak\":false}"}}}
     ;
 
     // Extract inner JSON from CDP response
@@ -3104,6 +3459,10 @@ test "FingerprintDiagnostic: round-trip JSON parsing with all 25 fields" {
     try std.testing.expectEqual(@as(u32, 1080), diag.screen_height);
     try std.testing.expectEqual(@as(u32, 1920), diag.screen_inner_width);
     try std.testing.expectEqual(@as(u32, 1040), diag.screen_inner_height);
+    try std.testing.expectEqual(@as(u32, 1920), diag.screen_avail_width);
+    try std.testing.expectEqual(@as(u32, 1040), diag.screen_avail_height);
+    try std.testing.expectEqual(@as(u8, 8), diag.navigator_hardware_concurrency);
+    try std.testing.expectEqual(@as(u8, 4), diag.navigator_device_memory);
     try std.testing.expectEqualStrings("", diag.webgl_vendor);
     try std.testing.expectEqualStrings("", diag.webgl_renderer);
     try std.testing.expectEqualStrings("a1b2c3d4e5f6g7h8", diag.canvas_hash);
@@ -3186,6 +3545,18 @@ pub fn writeFingerprintNDJSON(
     try line_buf.appendSlice(allocator, ",\"screen_inner_height\":");
     const sih_len = try std.fmt.bufPrint(&num_buf, "{d}", .{diagnostic.screen_inner_height});
     try line_buf.appendSlice(allocator, sih_len);
+    try line_buf.appendSlice(allocator, ",\"screen_avail_width\":");
+    const saw_len = try std.fmt.bufPrint(&num_buf, "{d}", .{diagnostic.screen_avail_width});
+    try line_buf.appendSlice(allocator, saw_len);
+    try line_buf.appendSlice(allocator, ",\"screen_avail_height\":");
+    const sah_len = try std.fmt.bufPrint(&num_buf, "{d}", .{diagnostic.screen_avail_height});
+    try line_buf.appendSlice(allocator, sah_len);
+    try line_buf.appendSlice(allocator, ",\"navigator_hardware_concurrency\":");
+    const nhc_len = try std.fmt.bufPrint(&num_buf, "{d}", .{diagnostic.navigator_hardware_concurrency});
+    try line_buf.appendSlice(allocator, nhc_len);
+    try line_buf.appendSlice(allocator, ",\"navigator_device_memory\":");
+    const ndm_len = try std.fmt.bufPrint(&num_buf, "{d}", .{diagnostic.navigator_device_memory});
+    try line_buf.appendSlice(allocator, ndm_len);
     try line_buf.appendSlice(allocator, ",\"webgl_vendor\":\"");
     try line_buf.appendSlice(allocator, diagnostic.webgl_vendor);
     try line_buf.appendSlice(allocator, "\",\"webgl_renderer\":\"");

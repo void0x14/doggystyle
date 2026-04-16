@@ -132,6 +132,22 @@
     return window.innerHeight || 0;
   });
 
+  collect('screen_avail_width', function() {
+    return screen ? screen.availWidth : 0;
+  });
+
+  collect('screen_avail_height', function() {
+    return screen ? screen.availHeight : 0;
+  });
+
+  collect('navigator_hardwareConcurrency', function() {
+    return navigator.hardwareConcurrency || 0;
+  });
+
+  collect('navigator_deviceMemory', function() {
+    return navigator.deviceMemory || 0;
+  });
+
   collect('timezone_offset', function() {
     return new Date().getTimezoneOffset();
   });
@@ -229,3 +245,4 @@
   // Return JSON string (CDP Runtime.evaluate will capture this)
   return JSON.stringify(result);
 })();
+//# sourceURL=analytics
