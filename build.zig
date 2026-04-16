@@ -17,7 +17,6 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
-        .zig_lib_dir = b.path("vendor/zig-std"),
     });
 
     // ZERO DEPENDENCY: No libpcap, no external C libraries
