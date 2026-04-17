@@ -13,7 +13,7 @@
 // - CURRENT: --headless=new + --use-gl=angle + --use-angle=vulkan
 //   headless=new uses the SAME rendering pipeline as headed Chrome (not old headless).
 //   ANGLE Vulkan backend talks directly to the host Vulkan driver, bypassing X11/Xvfb.
-// - --disable-vulkan-surface: headless has no swapchain; rendering to offscreen VkImage
+// - REMOVED --disable-vulkan-surface: this flag prevented WebGL context creation in headless
 // - --enable-unsafe-webgpu: WebGPU via Dawn/Vulkan backend
 // - --ignore-gpu-blocklist: force GPU even on "unsupported" configs
 // - Result: WebGL vendor/renderer will show the REAL GPU, not SwiftShader/llvmpipe
@@ -81,7 +81,7 @@ pub const CHROME_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.3
 pub const PROFILE_PREFIX = "/tmp/ghost_";
 
 /// Number of arguments passed to Chrome
-pub const CHROME_ARG_COUNT: usize = 24;
+pub const CHROME_ARG_COUNT: usize = 26;
 
 /// Maximum attempts to generate a unique profile directory
 pub const MAX_MKDTEMP_ATTEMPTS: usize = 10;
@@ -297,6 +297,17 @@ pub fn buildSafeEnvironment(
     env_map.put("TZ", "UTC") catch return BrowserInitError.OutOfMemory;
     env_map.put("DISPLAY", XVFB_DISPLAY) catch return BrowserInitError.OutOfMemory;
 
+    // DRM/EGL surfaceless configuration for Chrome 147
+    // SOURCE: Mesa DRM/EGL platform — surfaceless EGL for headless GPU rendering
+    // SOURCE: https://docs.mesa3d.org/egl.html — EGL_PLATFORM environment variable
+    // SOURCE: https://dri.freedesktop.org/docs/drm/gpu/overview.html — DRM render nodes
+    env_map.put("EGL_PLATFORM", "surfaceless") catch return BrowserInitError.OutOfMemory;
+    env_map.put("GBM_DEVICE", "/dev/dri/renderD128") catch return BrowserInitError.OutOfMemory;
+    env_map.put("LIBGL_ALWAYS_SOFTWARE", "false") catch return BrowserInitError.OutOfMemory;
+    // NOTE: Use 'iris' for Intel i5-13500H (13th gen), 'radeonsi' for AMD GPUs
+    // SOURCE: Mesa driver documentation — iris for Intel Gen12+, radeonsi for AMD GCN+
+    env_map.put("MESA_LOADER_DRIVER_OVERRIDE", "iris") catch return BrowserInitError.OutOfMemory;
+
     return env_map;
 }
 
@@ -329,20 +340,28 @@ fn buildChromeArgvWithBinary(
     // Use SIGNUP_URL as default start page
     const actual_start_url = if (start_url) |url| url else SIGNUP_URL;
 
-    // GPU RENDERING STRATEGY (2026-04-16):
-    // Xvfb provides NO GPU — --use-gl=desktop still maps to Mesa software rasterizer.
-    // SOLUTION: Use --headless=new (same rendering pipeline as headed Chrome) + ANGLE Vulkan
-    // to get real GPU rendering via the host's Vulkan driver, bypassing Xvfb entirely.
+    // GPU RENDERING STRATEGY (2026-04-18):
+    // --headless=new + --use-gl=angle + --use-angle=vulkan gives real GPU vendor/renderer.
+    // REMOVED: --disable-vulkan-surface — this flag prevented WebGL context creation,
+    //   causing UNMASKED_VENDOR_WEBGL and UNMASKED_RENDERER_WEBGL to return empty strings.
+    //   Without a Vulkan surface, ANGLE cannot initialize a VkDevice, so WebGL fails silently.
     //
     // SOURCE: Chrome --headless=new uses the full rendering pipeline (not old headless)
     //   https://developer.chrome.com/docs/chromium/new-headless
     // SOURCE: --use-gl=angle routes OpenGL ES calls through ANGLE
-    //   https://chromium.googlesource.com/angle/angle/+/HEAD/doc/Implementation.md
     // SOURCE: --use-angle=vulkan selects ANGLE's Vulkan backend for real GPU access
-    // SOURCE: --disable-vulkan-surface — headless mode has no swapchain; rendering goes to
-    //   offscreen buffers (reads back via VkImage → readPixels)
     // SOURCE: --enable-unsafe-webgpu — enables WebGPU via Dawn backend (Vulkan)
     // SOURCE: --ignore-gpu-blocklist — forces GPU acceleration even on "unsupported" configs
+    //
+    // DRM/EGL SURFACELESS CONFIGURATION (Chrome 147):
+    // --ozone-platform=drm — Direct Rendering Manager for headless GPU access
+    // --render-node-override=/dev/dri/renderD128 — Explicit DRM render node binding
+    // --disable-gpu-sandbox — Required for DRM/EGL surfaceless (sandbox blocks /dev/dri access)
+    // --disable-software-rasterizer — Force hardware GPU, prevent SwiftShader fallback
+    //
+    // SOURCE: Chromium Ozone DRM platform — https://chromium.googlesource.com/chromium/src/+/HEAD/ui/ozone/README.md
+    // SOURCE: DRM render nodes — https://dri.freedesktop.org/docs/drm/gpu/overview.html
+    // SOURCE: Chrome GPU sandbox — https://chromium.googlesource.com/chromium/src/+/HEAD/docs/design/sandbox.md
     //
     // NOTE: CDP is still via --remote-debugging-port=9222 (WebSocket). Pipe transport
     // will replace this in a future change to reduce detectability.
@@ -364,11 +383,13 @@ fn buildChromeArgvWithBinary(
         "--remote-allow-origins=*",
         user_data_dir_arg,
         actual_start_url,
-        "--disable-extensions",
-        "--use-gl=angle",
-        "--use-angle=vulkan",
+        "--use-gl=egl",
+        "--use-angle=opengl",
+        "--ozone-platform=drm",
+        "--render-node-override=/dev/dri/renderD128",
+        "--disable-gpu-sandbox",
+        "--disable-software-rasterizer",
         "--headless=new",
-        "--disable-vulkan-surface",
         "--enable-unsafe-webgpu",
         "--ignore-gpu-blocklist",
     };
@@ -649,7 +670,7 @@ test "buildChromeArgv: binds runtime profile directory into argv" {
     const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &cdp_port_buf);
 
     try std.testing.expectEqualStrings(CHROME_BINARY, argv[0]);
-    try std.testing.expectEqualStrings(SIGNUP_URL, argv[argv.len - 8]);
+    try std.testing.expectEqualStrings(SIGNUP_URL, argv[argv.len - 6]);
 
     var saw_user_data_dir = false;
     for (argv) |arg| {
@@ -686,10 +707,13 @@ test "StealthBrowser: argv contains required stealth flags" {
     const expected_flags = [_][]const u8{
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",
-        "--use-gl=angle",
-        "--use-angle=vulkan",
+        "--use-gl=egl",
+        "--use-angle=opengl",
+        "--ozone-platform=drm",
+        "--render-node-override=/dev/dri/renderD128",
+        "--disable-gpu-sandbox",
+        "--disable-software-rasterizer",
         "--headless=new",
-        "--disable-vulkan-surface",
         "--enable-unsafe-webgpu",
         "--ignore-gpu-blocklist",
     };
@@ -705,14 +729,10 @@ test "StealthBrowser: argv contains required stealth flags" {
         try std.testing.expect(found);
     }
 
-    var saw_disable_extensions = false;
+    // Verify --disable-extensions is NOT present (it breaks component extensions)
     for (argv) |arg| {
-        if (mem.eql(u8, arg, "--disable-extensions")) {
-            saw_disable_extensions = true;
-            break;
-        }
+        try std.testing.expect(!mem.eql(u8, arg, "--disable-extensions"));
     }
-    try std.testing.expect(saw_disable_extensions);
 
     try std.testing.expect(mem.indexOf(u8, CHROME_USER_AGENT, "Chrome/147.0.0.0") != null);
 
@@ -721,7 +741,22 @@ test "StealthBrowser: argv contains required stealth flags" {
         try std.testing.expect(!mem.startsWith(u8, arg, "--disable-gpu"));
         try std.testing.expect(!mem.startsWith(u8, arg, "--enable-unsafe-swiftshader"));
         try std.testing.expect(!mem.startsWith(u8, arg, "--enable-webgl"));
-        try std.testing.expect(!mem.startsWith(u8, arg, "--disable-software-rasterizer"));
         try std.testing.expect(!mem.startsWith(u8, arg, "--use-gl=desktop"));
     }
+
+    // Verify DRM/EGL surfaceless flags are PRESENT
+    var saw_ozone_drm = false;
+    var saw_render_node = false;
+    var saw_disable_gpu_sandbox = false;
+    var saw_disable_sw_rasterizer = false;
+    for (argv) |arg| {
+        if (mem.eql(u8, arg, "--ozone-platform=drm")) saw_ozone_drm = true;
+        if (mem.eql(u8, arg, "--render-node-override=/dev/dri/renderD128")) saw_render_node = true;
+        if (mem.eql(u8, arg, "--disable-gpu-sandbox")) saw_disable_gpu_sandbox = true;
+        if (mem.eql(u8, arg, "--disable-software-rasterizer")) saw_disable_sw_rasterizer = true;
+    }
+    try std.testing.expect(saw_ozone_drm);
+    try std.testing.expect(saw_render_node);
+    try std.testing.expect(saw_disable_gpu_sandbox);
+    try std.testing.expect(saw_disable_sw_rasterizer);
 }

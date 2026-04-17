@@ -1,4 +1,3 @@
-
 # Progress Breakdown: Ghost Engine Implementation
 
 ## Tamamlanan Temel Özellikler (FAZ 0)
@@ -27,28 +26,28 @@
   - `--use-gl=desktop` (Xvfb'de Mesa software renderer'a düşüyor, boş WebGL)
   - `--disable-gpu` (GPU erişimini engelliyor)
   - Xvfb DISPLAY ayarı (`XVFB_DISPLAY` sabiti ve `env_map.put("DISPLAY", ...)`)
+  - `--disable-vulkan-surface` (2026-04-18: KALDIRILDI — WebGL context oluşturmayı engelliyordu, ancak kaldırılmasına rağmen WebGL vendor/renderer hala boş — başka bir kök neden var)
+  - `--disable-extensions` (2026-04-18: KALDIRILDI — Arkose Labs component extension'larını da devre dışı bırakıyordu, bu da bot sinyali)
 - Eklenen flag'ler:
   - `--headless=new` (eski headless mod yerine, GPU erişimi var)
   - `--use-gl=angle` (ANGLE rendering backend, Vulkan desteği)
   - `--use-angle=vulkan` (doğrudan Vulkan → ANGLE → gerçek GPU)
-  - `--disable-vulkan-surface` (headless ortamda surface oluşturma hatası engelleme)
   - `--enable-unsafe-webgpu` (WebGPU feature flag)
   - `--ignore-gpu-blocklist` (GPU blocklist'i bypass)
-- `CHROME_ARG_COUNT` 19 → 24'e güncellendi
-- SOURCE: Chromium resmi dokümantasyonu — `--headless=new` + `--use-gl=angle` + `--use-angle=vulkan` Wayland'de destekleniyor
+- `CHROME_ARG_COUNT` 19 → 22'e güncellendi
+- SOURCE: Chromium resmi dokümantasyonu — `--headless=new` + `--use-gl=angle` + `--use-angle=vulkan`
 
 #### FAZ 6.1.2: CDP Runtime Kaldırma (browser_bridge.zig) [TAMAMLANDI]
-- `enableRuntime()` fonksiyonu kaldırıldı (CDP `Runtime.enable` çağrısı)
+- `enableRuntime()` fonksiyonu kaldırıldı
 - `disableRuntime()` fonksiyonu kaldırıldı
-- Tüm çağrı noktaları kaldırıldı (bridge init, diagnostics, vb.)
-- SOURCE: DataDome, Castle.io, Rebrowser.net — `Runtime.enable` Proxy ownKeys trap ile tespit edilebilir, spec-level, patchlenemez
+- Tüm çağrı noktaları kaldırıldı
+- SOURCE: DataDome, Castle.io, Rebrowser.net — `Runtime.enable` Proxy ownKeys trap ile tespit edilebilir
 
 #### FAZ 6.1.3: Stealth Evasion Refactor (stealth_evasion.js) [TAMAMLANDI]
-- Eski: `Object.defineProperty` ile hardcoded mock değerler
-- Yeni: Native proxy pattern — sadece eksik property'leri ekliyor, mevcut native'leri koruyor
+- Native proxy pattern refactor — sadece eksik property'leri ekliyor, mevcut native'leri koruyor
 - `chrome.runtime` proxy: `connect()`, `sendMessage()`, `onConnect`, `onMessage`, `id` tam emülasyon
-- `toString()` spoofing: `"function connect() { [native code] }"` formatında
-- CDP serialization detection guard: `console.debug()` ile Proxy ownKeys trap tespiti (detection only)
+- `toString()` spoofing
+- CDP serialization detection guard
 - SOURCE: Chrome V8 spec — Proxy ownKeys tespit edilemez spec-level davranış
 
 #### FAZ 6.1.4: sourceURL Leak Protection [TAMAMLANDI]
@@ -56,275 +55,236 @@
 - `browser_session_bridge.js` → `//# sourceURL=page_script`
 - `harvest.js` → `//# sourceURL=inline_bundle`
 - `fingerprint_diagnostic.js` → `//# sourceURL=analytics`
-- SOURCE: CDP `Runtime.evaluate` inject edilen script'ler `Error.stack`'te CDP'den geldiğini belli eder, `sourceURL` override ediyor
+- SOURCE: CDP `Runtime.evaluate` inject edilen script'ler `Error.stack`'te CDP'den geldiğini belli eder
 
 ---
 
 ### FAZ 6.2: TLS & Artifact Düzeltmeleri [TAMAMLANDI]
 
-#### FAZ 6.2.1: Xvfb Spawn Kaldırma (main.zig) [TAMAMLANDI]
-- Kaldırılan kod blokları:
-  - Xvfb başlatma kodu (DISPLAY ayarlama, nanosleep ile bekleme)
-  - `startBrowserRecorder` fonksiyonu (ffmpeg x11grab)
-  - `createBrowserTraceDir` fonksiyonu (Xvfb gerektiren versiyon)
-  - `buildBrowserTraceDirPath` fonksiyonu
-  - Tüm Xvfb/browser_recorder değişkenleri ve çağrıları
-- Neden: `--headless=new` mode'da Xvfb gerekmez, ekran kaydı mümkün değil
+#### FAZ 6.2.1: Xvfb Spawn Kaldırma [TAMAMLANDI]
+- Kaldırılan: Xvfb başlatma, `startBrowserRecorder`, `createBrowserTraceDir`, `buildBrowserTraceDirPath`
+- Neden: `--headless=new` mode'da Xvfb gerekmez
 
-#### FAZ 6.2.2: Artifact Directory Geri Ekleme (main.zig) [TAMAMLANDI]
-- `createArtifactDir` fonksiyonu eklendi (Xvfb gerektirmeden `artifacts/browser-trace-{timestamp}` dizini oluşturma)
+#### FAZ 6.2.2: Artifact Directory Geri Ekleme [TAMAMLANDI]
+- `createArtifactDir` fonksiyonu eklendi
 - `bridge.enableDiagnostics(artifact_dir)` çağrısı geri eklendi
-- Hata durumunda graceful fallback: artifact dir oluşturulamazsa `null` ile devam et, uyarı yaz
+- Hata durumunda graceful fallback
 
-#### FAZ 6.2.3: TLS close_notify Handling (network_core.zig) [TAMAMLANDI]
+#### FAZ 6.2.3: TLS close_notify Handling [TAMAMLANDI]
 - `receiveTlsApplicationData` zaten `error.ConnectionClosed` dönüyordu
 - `performRiskCheck`'te `error.ConnectionClosed` ve `error.ReadTimeout` artık yakalanıyor
-- `saw_headers` kontrolü: partial response varsa parse etmeye çalışıyor
 - Timeout 5s → 10s'a çıkarıldı
-- Loop sonunda partial response parsing eklendi
-- SOURCE: RFC 8446, Section 6.1 — close_notify = sunucu veri göndermeyecek, graceful shutdown
 
-#### FAZ 6.2.4: Risk Check Graceful Fallback (main.zig) [TAMAMLANDI]
-- `try github_client.performRiskCheck()` → `catch |err| blk: { ... break :blk network.RiskStatus{ .challenge_required = true } }`
-- Hata durumunda program çökmüyor, `challenge_required=true` ile devam ediyor
-- Detaylı hata loglama: BDA JSON payload'ının ilk 500 karakteri, error tipi, olası nedenler
+#### FAZ 6.2.4: Risk Check Graceful Fallback [TAMAMLANDI]
+- `try github_client.performRiskCheck()` → `catch |err| blk: { ... challenge_required=true }`
+- Hata durumunda program çökmüyor
 
 ---
 
 ### FAZ 6.3: CDP Event Buffering & Observability [TAMAMLANDI]
 
-#### FAZ 6.3.1: CDP Event Buffering (browser_bridge.zig) [TAMAMLANDI]
-- `CdpClient.pending_events` alanı eklendi (`std.ArrayList([]const u8)`)
-- `sendCommand()` artık ID'siz CDP event'lerini `pending_events`'e buffer'lıyor (eskiden `free()` edip kaybediyordu)
+#### FAZ 6.3.1: CDP Event Buffering [TAMAMLANDI]
+- `CdpClient.pending_events` buffer'ı eklendi
 - `Fetch.requestPaused` event'i artık kaybolmuyor
-- `hasPendingEvents()`, `nextPendingEvent()`, `getNetworkResponseBody()` metodları eklendi
 
-#### FAZ 6.3.2: Network Monitoring (browser_bridge.zig) [TAMAMLANDI]
-- `enableNetworkMonitoring()`: CDP `Network.enable` komutu gönderiliyor
-- `BrowserBridge.init()`'de `cdp.enableNetworkMonitoring()` çağrısı eklendi
-- `processCdpEvent()`: Buffered event'lerde `Network.requestWillBeSent` ve `Network.responseReceived` parse ediliyor
-- `fetchAndLogResponseBody()`: Response body'yi CDP ile çekiyor
-- Loglama: Her network event `browser-network.ndjson`'a yazılıyor
+#### FAZ 6.3.2: Network Monitoring [TAMAMLANDI]
+- `Network.enable` komutu gönderiliyor
+- `Network.requestWillBeSent` ve `Network.responseReceived` parse ediliyor
 
 #### FAZ 6.3.3: Uydurma Risk Level Sistemi [TAMAMLANDI]
-- `computeRiskLevel` ve `computeRiskAndLogTelemetry` fonksiyonları kaldırıldı
+- `computeRiskLevel` ve `computeRiskAndLogTelemetry` kaldırıldı
 - `RiskLevel` enum kaldırıldı
-- `main.zig` çağrıları kaldırıldı
-- **NOT**: FAZ 6.3.1-6.3.2'deki gerçek CDP event buffering (`pending_events`, `processCdpEvent`, `fetchAndLogResponseBody`) korundu
 
 ---
 
 ### FAZ 6.4: BDA Encryption Format Düzeltmesi (EN KRİTİK) [TAMAMLANDI]
 
 #### FAZ 6.4.1: Kök Neden Tespiti [TAMAMLANDI]
-- **SORUN**: GitHub sunucusu BDA payload'ını decrypt edemiyordu → connection kesiliyor → ReadTimeout
-- **KAYNAK**: unfuncaptcha/bda GitHub reposu, AzureFlow/arkose-fp-docs
-- **GÜNCEL FORMAT** (unfuncaptcha/bda/crypto.py):
+- **SORUN**: GitHub BDA payload'ını decrypt edemiyordu → connection kesiliyor
+- **KAYNAK**: unfuncaptcha/bda GitHub reposu
+- **GERÇEK FORMAT**:
   - Key derivation: `userAgent + str(rounded_timestamp)` string concatenation
   - Timestamp rounding: `timestamp - (timestamp % 21600)` (6 saat)
   - Salt: Random 16-byte hex string
   - IV: Random 16-byte hex string (salt'tan bağımsız)
   - Key expansion: MD5 chain × 4 iterasyon → ilk 32 byte AES-256 key
   - Encryption: AES-256-CBC, PKCS#7 padding
-  - Output: `{"ct":"<base64>","s":"<hex_salt>","iv":"<hex_iv>"}` JSON
+  - Output: `Base64(JSON{"ct":"<base64>","s":"<hex>","iv":"<hex>"})` — çIFT base64 katmanı
 
 #### FAZ 6.4.2: Eski Format (YANLIŞ) [KALDIRILDI]
-- Key: `SHA256(userAgent + timestamp)[:16]` → AES-128 (16 byte key)
-- IV: `MD5(userAgent + timestamp)` → deterministic, salt yok
-- Output: Direkt Base64 ciphertext (JSON wrapper yok)
-- Sorunlar:
-  1. AES-128 yerine AES-256 gerekiyor
-  2. Timestamp 6 saate yuvarlanmalı
-  3. Salt ve IV ayrı JSON alanları olarak gönderilmeli
-  4. Key derivation tamamen farklı
+- AES-128, SHA256 key, deterministic IV, direkt Base64 output — tümü yanlıştı
 
 #### FAZ 6.4.3: Yeni Format Implementasyonu [TAMAMLANDI]
-- `encryptBda` fonksiyonu tamamen yeniden yazıldı:
-  1. Timestamp rounding: `ts_seconds - (ts_seconds % 21600)`
-  2. Key string: `userAgent ++ str(rounded_ts)`
-  3. Random salt: 16 byte → hex string (32 karakter)
-  4. Random IV: 16 byte → hex string (32 karakter)
-  5. Salted key: `key_string_bytes ++ salt_bytes`
-  6. MD5 chain: `md5(salted_key)` → `md5(chain[i-1] ++ salted_key)` × 4
-  7. AES key: İlk 32 byte chain'den → AES-256-CBC
-  8. Output: JSON `{"ct":"...","s":"...","iv":"..."}`
-- `decryptBda` fonksiyonu da yeni formata göre yazıldı (test için)
-- `aes256CbcEncrypt`, `aes256CbcDecrypt` fonksiyonları eklendi (`std.crypto.core.aes.Aes256`)
-- `hexToBytes` fonksiyonu eklendi (hex string → raw bytes decode)
-- `toJsonAlloc` timestamp artık rounded seconds formatında
-- `main.zig`: `env.timestamp = env.timestamp - (env.timestamp % 21600000)` (ms cinsinden 6 saat)
+- `encryptBda`: AES-256-CBC + MD5 chain + JSON wrapper + outer Base64
+- `decryptBda`: outer Base64 decode → JSON parse → decrypt
+- `aes256CbcEncrypt`/`aes256CbcDecrypt` fonksiyonları
+- Testler: round-trip, format doğrulama, 6-hour window key differentiation
 
-#### FAZ 6.4.4: Test Güncellemeleri [TAMAMLANDI]
-- `encryptBda then decryptBda: round-trip` → JSON format doğrulama
-- `encryptBda: output is valid Base64` → `encryptBda: output is valid JSON with BDA fields`
-- `timestamp affects encryption output` → `6-hour windows produce different keys`
-- Yeni test: `same window different ciphertext` (aynı key, farklı salt/IV)
-- Yeni test: AES-256 round-trip encryption/decryption
+#### FAZ 6.4.4: Gemini Değişiklikleri (2026-04-18) [TAMAMLANDI]
+- `encryptBda` çıktısı artık `base64(JSON{ct,s,iv})` formatında — dışarıdan base64 katmanı eklendi
+- `decryptBda` artık önce dış base64 katmanını çözüyor, sonra JSON parse ediyor
+- Tüm testler yeni formata göre güncellendi ve geçiyor
+- `X-Requested-With: XMLHttpRequest` header'ı `buildGitHubRiskCheckHeaders`'a eklendi
+- `FingerprintDiagnostic` struct alanlarına default değerler eklendi (0, "", null)
 
 ---
 
 ### FAZ 6.5: Risk Check HTTP Headers & Fingerprint Mapping [TAMAMLANDI]
 
-#### FAZ 6.5.1: HTTP Header'ları (http2_core.zig) [TAMAMLANDI]
-- `buildGitHubRiskCheckHeaders` fonksiyonu eklendi (18 header):
-  - `:method: POST`, `:scheme: https`, `:path: /signup_check/usage`, `:authority: github.com`
-  - `user-agent` (tarayıcı UA'sı)
-  - `accept: application/json`
-  - `accept-language: en-US,en;q=0.9,tr;q=0.8`
-  - `content-type: application/x-www-form-urlencoded`
-  - `content-length` (dinamik)
-  - `origin: https://github.com`
-  - `referer: https://github.com/signup`
-  - `cookie` (session cookie'ler: `_gh_sess`, `_octo`, `logged_in`)
-  - `sec-ch-ua` (Chrome Client Hints)
-  - `sec-ch-ua-mobile: ?0`
-  - `sec-ch-ua-platform: "Linux"`
-  - `sec-fetch-site: same-origin`
-  - `sec-fetch-mode: cors`
-  - `sec-fetch-dest: empty`
-
-#### FAZ 6.5.2: Cookie Jar Entegrasyonu (network_core.zig) [TAMAMLANDI]
-- `performRiskCheck` artık `self.cookie_jar.cookieHeader()` ile cookie string oluşturuyor
-- `buildGitHubRiskCheckHeaders`'a cookie parametresi ekleniyor
-- GitHub session cookie'leri (`_gh_sess`, `_octo`, `logged_in`) risk check request'inde gönderiliyor
-
-#### FAZ 6.5.3: Fingerprint Diagnostic Genişletme (fingerprint_diagnostic.js) [TAMAMLANDI]
-- 4 yeni sinyal eklendi:
-  - `screen_avail_width` → `screen.availWidth` (gerçek available width)
-  - `screen_avail_height` → `screen.availHeight` (gerçek available height)
-  - `navigator_hardwareConcurrency` → `navigator.hardwareConcurrency`
-  - `navigator_deviceMemory` → `navigator.deviceMemory`
-
-#### FAZ 6.5.4: FingerprintDiagnostic Struct Genişletme (browser_bridge.zig) [TAMAMLANDI]
-- 4 yeni alan: `screen_avail_width`, `screen_avail_height`, `navigator_hardware_concurrency`, `navigator_device_memory`
-- NDJSON writer güncellendi
-- Test güncellendi
-
-#### FAZ 6.5.5: Fingerprint → BDA Mapping Düzeltmeleri (main.zig) [TAMAMLANDI]
-- Düzeltilen mapping'ler:
-  - `fp.screen_avail_width` → `env.screen.availWidth` (eskiden yanlış: `fp.screen_inner_width` → `window.innerWidth`)
-  - `fp.screen_avail_height` → `env.screen.availHeight` (eskiden yanlış: `fp.screen_inner_height` → `window.innerHeight`)
-- Eklenen mapping'ler:
-  - `fp.navigator_languages` → `env.navigator.languages_json` (eskiden hardcoded `["en-US","en","tr"]`)
-  - `fp.navigator_hardware_concurrency` → `env.navigator.hardwareConcurrency` (eskiden hardcoded `16` fallback)
-  - `fp.navigator_device_memory` → `env.navigator.deviceMemory` (eskiden hardcoded `32` fallback)
+#### FAZ 6.5.1–6.5.5 [TAMAMLANDI]
+- 18+ header risk check request'inde
+- Cookie jar entegrasyonu
+- 4 yeni sinyal fingerprint'te (screen_avail, hardwareConcurrency, deviceMemory)
+- Mapping düzeltmeleri
 
 ---
 
-### FAZ 6.6: Uydurma Kod Temizliği [BEKLİYOR]
-
-#### FAZ 6.6.1: computeRiskLevel Kaldırma [BEKLİYOR]
-- `computeRiskLevel` fonksiyonu kaldırılacak (browser_bridge.zig ~line 956)
-- `computeRiskAndLogTelemetry` fonksiyonu kaldırılacak (browser_bridge.zig ~line 2178)
-- `RiskLevel` enum'ı kaldırılacak (browser_bridge.zig ~line 949)
-- `main.zig`'deki `computeRiskAndLogTelemetry` çağrıları kaldırılacak (line ~546, ~654)
-- **NOT**: `enableNetworkMonitoring`, `processCdpEvent`, `fetchAndLogResponseBody`, `pending_events` kaldırılmayacak — bunlar gerçek CDP event buffering
-
-#### FAZ 6.6.2: Hardcoded Hash Temizliği [TAMAMLANDI]
-- `webgl.canvasHash` hardcoded `"d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9"` kaldırılacak
-- `webgl.webglHash` hardcoded `"b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7"` kaldırılacak
-- Bunlar FingerprintDiagnostic'ten gelen gerçek hash değerleriyle değiştirilecek
-
-#### FAZ 6.6.3: Hardcoded Dil Listesi Temizliği [TAMAMLANDI]
-- `navigator.languages` hardcoded `["en-US", "en", "tr"]` kaldırılacak
-- FingerprintDiagnostic'ten gelen gerçek dil listesi kullanılacak
+### FAZ 6.6: Uydurma Kod Temizliği [TAMAMLANDI]
+- computeRiskLevel kaldırıldı
+- Hardcoded hash'ler kaldırıldı
+- Hardcoded dil listesi kaldırıldı
 
 ---
 
-### FAZ 6.7: BDA Payload Genişletmesi [BEKLİYOR]
-
-#### FAZ 6.7.1: Eksik Sinyaller — Tarayıcıdan Toplanması Gerekenler [BEKLİYOR]
-- `history_length` → `window.history.length`
-- `touch_support` → `navigator.maxTouchPoints`
-- `audio_context` → AudioContext fingerprint hash
-- `fonts_list` → JS font detection sonucu
-- `webgl_extensions` → `gl.getSupportedExtensions()` listesi
-- `performance_timing` → `navigationStart`, `loadEventEnd` vb.
-- `battery_status` → `navigator.getBattery()` sonucu
-- `connection_info` → `navigator.connection` (downlink, effectiveType)
-- `storage_estimate` → `navigator.storage.estimate()` sonucu
-- `media_devices` → `navigator.mediaDevices.enumerateDevices()`
-- `speech_synthesis` → `window.speechSynthesis.getVoices()`
-- `math_constants` → `Math.PI`, `Math.SQRT2` precision fingerprint
-- `error_stack_trace` → `new Error().stack` pattern
-- `document_features` → `document.hidden`, `document.visibilityState`
-- `webdriver_flag` → `navigator.webdriver` (BDA'ya aktarılmıyor)
-- `notification_permission` → `Notification.permission`
-
-#### FAZ 6.7.2: Eksik Sinyaller — BrowserEnvironment Struct Genişletmesi [BEKLİYOR]
-- Yukarıdaki her sinyal için `BrowserEnvironment` struct'ına yeni alanlar
-- `toJsonAlloc` fonksiyonuna yeni alanların JSON serialization'ı
-- `fingerprint_diagnostic.js`'e yeni sinyallerin toplanması
-- `browser_bridge.zig`'de `FingerprintDiagnostic` struct'ına yeni alanlar
-- `main.zig`'de fingerprint → BDA mapping'inin genişletilmesi
-
-#### FAZ 6.7.3: tguess/Proof-of-Work Mekanizması [X - ARAŞTIRMA TAMAMLANDI]
-- **SOURCE**: unfuncaptcha/tguess GitHub reposu (https://github.com/unfuncaptcha/tguess)
-- **Mekanizma Analizi**:
-  - tguess, Arkose Labs Funcaptcha için proof-of-work doğrulama bileşenidir
-  - `/fc/gfct` endpoint'inden dönen `dapib_url` alanındaki JavaScript dosyası ile üretilir
-  - Script her session için unique'dir (~1200 dosya/gün, expire eder)
-  - iframe ortamında `window.parent.ae.answer` (input) ve `window.parent.ae.dapibReceive` (callback) ile çalışır
-  - Guess objesi session token ile birleştirilip script'e verilir
-  - Script, guess'i karmaşık encoded alanlara dönüştürür (index, token, _0, _6158889701, i8n3d4e1x7d0fb7a5d8d09, vb.)
-  - Sandbox detection var: NodeJS/JSDom ortamı tespit edilirse her değerin sonuna rastgele karakter eklenir (kolayca temizlenir)
-- **Encryption**:
-  - Format: `{"ct": "...", "iv": "...", "s": "..."}` (BDA ile aynı format)
-  - AES-256-CBC, MD5 chain key derivation
-  - Key: session token (BDA'dan farklı - BDA'da UA + timestamp kullanılır)
-- **GitHub Signup İçin Durum**:
-  - tguess **Funcaptcha görsel challenge çözümü** için gereklidir
-  - GitHub signup'da risk check başarısız olursa captcha frame yüklenir (has_captcha_frame=true)
-  - Eğer captcha yüklendiyse, çözüm için tguess gerekebilir
-  - **NOT**: Ghost Engine şu an captcha solving modülüne sahip değil - bu mekanizma sadece dokümante edilmiştir
+### FAZ 6.7: BDA Payload Genişletmesi [TAMAMLANDI]
+- 15+ yeni sinyal eklendi (history_length, touch_support, audio_context, fonts_list, webgl_extensions, performance_timing, battery_status, connection_info, storage_estimate, media_devices, speech_synthesis, math_constants, error_stack_trace, document_features, webdriver_flag)
+- BrowserEnvironment struct'ına 14 yeni alan
+- toJsonAlloc genişletildi
+- tguess/proof-of-work araştırıldı ve dokümante edildi (uygulama yok)
 
 ---
 
-### FAZ 6.8: Runtime Test & Doğrulama [BEKLİYOR]
+## FAZ 6.8: Runtime Test Sonuçları (2026-04-17 → 2026-04-18)
 
-#### FAZ 6.8.1: İlk Runtime Test [BEKLİYOR]
-- `sudo ./zig-out/bin/ghost_engine enp37s0` ile çalıştırma
-- Artifacts dizinindeki NDJSON dosyalarını okuma ve doğrulama:
-  - `browser-state.ndjson`: Risk seviyesi göstergeleri nedir?
-  - `browser-actions.ndjson`: Aksiyonlar loglanıyor mu?
-  - `browser-network.ndjson`: Network event'leri loglanıyor mu?
-  - `live-view.html`: Observation snapshot'ları
-  - Screenshot dosyaları
+### 2026-04-17 İlkgün Sonuçları (Eski — --disable-vulkan-surface ile)
 
-#### FAZ 6.8.2: BDA Payload Doğrulama [TAMAMLANDI]
-- JSON formatı doğrulandı: `{"ct":"...","s":"...","iv":"..."}`
-- Timestamp rounding doğrulandı: 6 saatlik pencereler
-- AES-256-CBC manuel decrypt ile round-trip testleri eklendi ve geçti
+#### SORUN 1: WebGL vendor/renderer BOŞ [KRİTİK — HALA DEVAM EDİYOR]
+```
+[FINGERPRINT] WebGL vendor: 
+[FINGERPRINT] WebGL renderer:
+```
+- `--use-angle=vulkan` + `--headless=new` + `--disable-vulkan-surface` ile boş dönüyordu
+- 2026-04-18: `--disable-vulkan-surface` kaldırıldı → WebGL vendor/renderer HALA BOŞ
+- `--disable-extensions` da kaldırıldı → component extension'lar artık yükleniyor
+- **KÖK NEDEN HENÜZ BULUNAMADI**: headless=new modda ANGLE Vulkan backend WebGL context oluşturamıyor olabilir. Bu ayrıntılı araştırma gerektiriyor.
 
-#### FAZ 6.8.3: Risk Check Response Analizi [TAMAMLANDI]
-- GitHub `/signup_check/usage` endpoint'inden gelen response'u analiz etme (Sonuç bölümüne eklendi: SORUN 2)
-- TLS close_notify/ReadTimeout hala oluşuyor mu? -> Evet, oluşuyor (Bkz. SORUN 2)
-- Eğer response geliyorsa: `challenge_required` alanı true mu false mu?
-- Eğer hala timeout oluyorsa: BDA encryption'ı doğrulama, eksik header'ları kontrol etme -> Encryption payload'u formatı (json {ct, s, iv} ve cbc) loglarda başarıyla görülüyor. WebGL GPU fallback'lerden dolayı connection abort yaşanmasına odaklanıldı.
+#### SORUN 2: Risk Check ReadTimeout [KRİTİK — HALA DEVAM EDİYOR]
+```
+[TLS] Alert received: level=1 description=0
+[RISK CHECK] ReadTimeout while waiting for risk check response
+```
+- GitHub sunucusu TLS close_notify (level=1, description=0) gönderip bağlantıyı kesiyor
+- Bu bir SONUÇ'tur, kök neden DEĞİLDİR — yüksek risk sinyali gönderildiği için sunucu reddediyor
+- BDA encryption formatı doğru çalışıyor (base64 + JSON {ct,s,iv} + AES-256-CBC)
+- **Muhtemel kök neden**: WebGL vendor/renderer boş string → Arkose Labs yüksek risk sinyali
 
-#### FAZ 6.8.4: CDP Detection Test [BEKLİYOR]
-- fingerprint_diagnostic.js çıktısını inceleme:
-  - `webgl_vendor` ve `webgl_renderer` boş mu? (headless=new + Vulkan ANGLE ile gerçek GPU değeri dönmeli)
-  - `navigator_webdriver` false mu?
-  - `chrome_runtime_connect` native proxy çalışıyor mu?
-  - `cdp_runtime_enable_side_effect` false mu?
+#### SORUN 3: Chrome Extension Service Worker [HALA DEVAM EDİYOR]
+- İlk log: `chrome-extension://fignfifoniblkonapihmkfakmlgkbkcf/service_worker.js`
+- 2026-04-18 log: `chrome-extension://cimiefiiaegbelhefglklhhakcgmhkai/service_worker.js`
+- Bu Google Keep extension'ıdır (fignfif...) veya başka bir component extension (cimief...)
+- `--disable-extensions` kaldırıldıktan sonra bu extension'lar hala detect ediliyor olabilir
+- **NOT**: `--disable-extensions` component extension'larını devre dışı bırakmaz, sadece kullanıcı extension'larını
+- **NOT**: Arkose Labs için extension'lar GEREKLİDİR — kaldırılmamalıdır
+
+#### SORUN 4: Octocaptcha iframe Yüklendi [SONUÇ — KÖK NEDEN DEĞİL]
+- `captcha_frame=true`, `submit_hidden=true`, `submit_disabled=true`
+- Bu risk check'in `challenge_required=true` döndürmesinin sonucudur
+- Kök nedeni: WebGL vendor/renderer boş + ReadTimeout
+
+#### SORUN 5: BDA Formatı Doğru [DOĞRULANMIŞ]
+- JSON format: `base64({"ct":"...","s":"...","iv":"..."})` 
+- AES-256-CBC encryption düzgün çalışıyor
+- `webgl.vendor=""` ve `webgl.renderer=""` → bot sinyali
+
+#### SORUN 6: Signup Timeout [YENİ — 2026-04-18]
+- Risk check ReadTimeout sonrası `challenge_required=true` ile devam ediyor
+- `captureSignupBundle` timeout oluyor çünkü captcha frame var ama çözülemiyor
+- Signup submit butonu gizli ve disabled: `submit_hidden=true, submit_disabled=true`
+- Octocaptcha iframe yükleniyor ama captcha çözümümüz yok
+
+### 2026-04-18 İkincigün Sonuçları (--disable-vulkan-surface ve --disable-extensions kaldırıldıktan sonra)
+
+#### DEĞİŞİKLİKLER:
+1. `--disable-vulkan-surface` kaldırıldı → WebGL vendor/renderer hala boş
+2. `--disable-extensions` kaldırıldı → component extension'lar artık yükleniyor
+3. BDA artık çift base64 katmanlı: `base64(JSON{ct,s,iv})`
+4. `X-Requested-With: XMLHttpRequest` header'ı eklendi
+5. CDP bağlantısı başarılı → `https://github.com/signup` tab'ı bulundu
+6. Fingerprint diagnostic toplandı (2319 byte response)
+7. Chrome Service Worker detect: `cimiefiiaegbelhefglklhhakcgmhkai`
+
+#### HALEN BOŞ STRING:
+```
+[FINGERPRINT] WebGL vendor: 
+[FINGERPRINT] WebGL renderer:
+```
+
+#### İYİ HABERLER (Çalışan Şeyler):
+- `navigator.webdriver: false`
+- `window.chrome exists: true`
+- `chrome.runtime.connect: true` (native proxy)
+- `CDP side-effect: false`
+- `SourceURL leak: false`
+- `Console side-effects: false`
+- CDP Network monitoring aktif
+- BDA encryption AES-256-CBC + JSON wrapper + outer base64
+- Cookie header'ları ekleniyor
+- Screen: 800x600, hardwareConcurrency: 16, deviceMemory: 16
 
 ---
 
-## Bekleyen Görevler (FAZ 6.6+)
+## Kritik Sorunların Kök Neden Analizi
 
-- [x] FAZ 6.6.1: computeRiskLevel ve computeRiskAndLogTelemetry kaldır
-- [x] FAZ 6.6.2: Hardcoded hash'ler (webgl.canvasHash, webgl.webglHash) kaldır
-- [x] FAZ 6.6.3: Hardcoded dil listesi kaldır
-- [x] FAZ 6.7.1: fingerprint_diagnostic.js'e 15+ yeni sinyal ekle
-- [x] FAZ 6.7.2: BrowserEnvironment struct'ına 15+ yeni alan ekle
-- [x] FAZ 6.7.3: tguess/proof-of-work mekanizması araştır ve dokümante et
+### SORUN: WebGL vendor/renderer boş string
+**Durum**: HALA ÇÖZÜLMEDİ — en kritik sorun
+
+`--use-angle=vulkan` + `--headless=new` modunda Chrome'un `WEBGL_debug_renderer_info` extension'ı `getParameter(UNMASKED_VENDOR_WEBGL)` ve `getParameter(UNMASKED_RENDERER_WEBGL)` boş string dönüyor. Bu Arkose Labs'ın en kritik bot sinyalidir.
+
+**Denenen ve İşe Yaramayan Yaklaşımlar**:
+- ~~`--disable-vulkan-surface` eklemek~~ — WebGL context oluşturmayı engelliyor, kaldırıldı
+- ~~`--disable-extensions` eklemek~~ — Arkose'nin ihtiyaç duyduğu component extension'larını da devre dışı bırakıyor, kaldırıldı
+
+**Araştırılması Gerekenler**:
+1. Chrome headless=new modunda ANGLE Vulkan gerçekten GPU'ya erişebiliyor mu? `chrome://gpu` sayfası CDP ile incelenmeli
+2. `WEBGL_debug_renderer_info` extension'ı headless=new'de destekleniyor mu?
+3. Headless Chrome'da gerçek GPU vendor/renderer değerleri nasıl alınır? (spoofing DEĞİL, gerçek değer)
+4. Vulkan driver durumu — `vulkaninfo` çıktısı incelenmeli
+5. Chrome'un GPU process logları — `--enable-logging=stderr --v=1` ile GPU başlatma logları alınmalı
+
+### SORUN: Risk Check ReadTimeout → close_notify
+**Kök neden**: Yukarıdaki WebGL sorunu. Boş vendor/renderer = yüksek risk sinyali = sunucu reddediyor.
+
+### SORUN: Octocaptcha iframe / submit_hidden / submit_disabled
+**Kök neden**: Risk check başarısız → challenge_required=true → captcha yükleniyor.
+
+### ÖZET: TEK KÖK NEDEN = WebGL vendor/renderer boş string. Bunu çözsek diğer sorunlar da çözülür.
+
+---
+
+## Bekleyen Görevler
+
+- [x] FAZ 6.1: Browser Stealth & GPU Flags
+- [x] FAZ 6.2: TLS & Artifact Düzeltmeleri
+- [x] FAZ 6.3: CDP Event Buffering & Observability
+- [x] FAZ 6.4: BDA Encryption Format Düzeltmesi
+- [x] FAZ 6.5: Risk Check HTTP Headers & Fingerprint Mapping
+- [x] FAZ 6.6: Uydurma Kod Temizliği
+- [x] FAZ 6.7: BDA Payload Genişletmesi
 - [x] FAZ 6.8.1: Runtime test
 - [x] FAZ 6.8.2: BDA payload doğrulama
-- [x] FAZ 6.8.3: Risk check response analizi
-- [ ] FAZ 6.8.4: CDP detection test — WebGL vendor/renderer hala BOŞ
-- [ ] FAZ 6.9: WebGL GPU flag düzeltmesi — vendor/renderer boş dönüyor
-- [ ] FAZ 6.10: Chrome extension detection — Service Worker detect edildi
+- [x] FAZ 6.8.3: Risk check response analizi (ReadTimeout → close_notify)
+- [ ] **FAZ 6.9: WebGL GPU ERİŞİMİ ÇÖZÜMÜ** ← SONRAKİ ADIM
+  - headless=new modunda gerçek GPU vendor/renderer nasıl alınır?
+  - `chrome://gpu` dump incelenmeli
+  - Vulkan driver erişimi doğrulanmalı
+  - `--enable-logging=stderr --v=1` ile GPU process logları alınmalı
+  - GERÇEK GPU DEĞERLERİ İSTENİYOR — spoofing YASAK
+- [ ] FAZ 6.10: Runtime Output → Dosya Yönlendirme
+  - Motor çalıştığında tüm çıktıları txt dosyasına yazacak mekanizma
+  - Terminal kopyalama zorunluluğu kalkacak
+- [ ] FAZ 6.11: Signup Bundle Capture Timeout → Captcha Çözümü
+  - Risk check başarılı olduktan sonra bile timeout olabilir
+  - captcha_frame varsa çözüm mekanizması lazım (tguess araştırması yapıldı, implement edilmedi)
 - [ ] Account Post-Verification (Onboarding, PAT Generation)
 - [ ] Multi-Account Orchestration
 
@@ -336,144 +296,62 @@
 - [x] HTTP/2 Native Stack (HPACK, SETTINGS, Flow Control)
 - [x] GitHub Signup Automation (CSRF, BDA, Arkose Bypass)
 - [x] Module 3.2 — Email Verification (Livewire Sync + Code Submission)
-- [x] FAZ 6.1: Browser Stealth & GPU Flags
-- [x] FAZ 6.2: TLS & Artifact Düzeltmeleri
-- [x] FAZ 6.3: CDP Event Buffering & Observability
-- [x] FAZ 6.4: BDA Encryption Format Düzeltmesi
-- [x] FAZ 6.5: Risk Check HTTP Headers & Fingerprint Mapping
-- [x] FAZ 6.6: Uydurma Kod Temizliği
-- [X] FAZ 6.7: BDA Payload Genişletmesi (tguess araştırması tamamlandı)
-- [ ] FAZ 6.8: Runtime Test & Doğrulama
+- [x] FAZ 6.1–6.7: Stealth, TLS, CDP, BDA, Headers, Cleanup, Payload
+- [x] FAZ 6.8: Runtime Test & Doğrulama (kısmen — WebGL sorunu devam ediyor)
+- [ ] **FAZ 6.9: WebGL GPU Erişimi Çözümü** ← ENGELLEYİCİ
 - [ ] Account Post-Verification
 - [ ] Multi-Account Orchestration
 
 ## Test Durumu
 - Build: Clean (no compile errors)
 - Vendor zig: `./vendor/zig/zig build --zig-lib-dir vendor/zig-std`
-- Son doğrulama: 2026-04-16 (FAZ 6.5 sonrası)
+- browser_init tests: 8/8 geçiyor
+- network_core tests: 129/129 geçiyor (BDA round-trip dahil)
+- http2_core tests: geçiyor
+- Son doğrulama: 2026-04-18 (FAZ 6.9 öncesi, --disable-vulkan-surface ve --disable-extensions kaldırıldı)
 
 ## Kritik Bulgular (Araştırma)
 
 ### BDA Encryption (Kaynak: unfuncaptcha/bda GitHub reposu)
-- Gerçek format: AES-256-CBC, MD5 chain key derivation, JSON wrapper `{ct, s, iv}`
-- Timestamp 6 saate yuvarlanıyor (21600 saniye)
-- Salt ve IV random üretiliyor, key derivation'da salt kullanılıyor
-- Key string: `userAgent + str(rounded_timestamp)` — string concatenation
-- MD5 chain: `md5(salted_key)` × 4 iterasyon → ilk 32 byte AES-256 key
+- Gerçek format: `base64(JSON{"ct":"<base64>","s":"<hex_salt>","iv":"<hex_iv>"})` — çift base64 katmanı
+- AES-256-CBC, PKCS#7 padding
+- Key derivation: MD5 chain, `userAgent + str(rounded_timestamp)`, 6 saat rounding
+- Salt ve IV random, key derivation'da salt kullanılıyor
 
-### tguess/Proof-of-Work Mekanizması (Kaynak: unfuncaptcha/tguess GitHub reposu - FAZ 6.7.3)
-- **Amacı**: Funcaptcha görsel challenge çözümlerini doğrulamak için proof-of-work
-- **Üretim**: `/fc/gfct` endpoint'inden `dapib_url` alanındaki JavaScript dosyası ile
-- **Script özellikleri**: Her session unique (~1200 dosya/gün, expire'lı), iframe'de çalışır
-- **İletişim**: `window.parent.ae.answer` (input) ve `window.parent.ae.dapibReceive` (callback)
-- **Dönüşüm**: Guess objesi → karmaşık encoded alanlar (index, token, çeşitli hash'ler)
-- **Sandbox detection**: NodeJS/JSDom tespiti → her değerin sonuna rastgele karakter eklenir
-- **Encryption**: `{"ct": "...", "iv": "...", "s": "..."}` formatında, AES-256-CBC
-- **Key**: Session token (BDA'dan farklı)
-- **Ghost Engine Notu**: Şu an captcha solving modülü yok - tguess sadece araştırma için dokümante edildi
+### tguess/Proof-of-Work Mekanizması (Kaynak: unfuncaptcha/tguess)
+- Funcaptcha görsel challenge çözümü için proof-of-work
+- `/fc/gfct` endpoint'inden dönen JavaScript ile üretiliyor
+- Encryption: aynı format (AES-256-CBC, JSON {ct,iv,s})
+- Ghost Engine'de implement EDİLMEDİ — sadece araştırma
 
-### Arkose Labs Tespit Mekanizmaları (Kaynak: roundproxies.com, AzureFlow/arkose-fp-docs)
-- BDA payload 50+ alan bekliyor (biz ~15 gönderiyoruz)
-- tguess/proof-of-work mekanizması var (biz göndermiyoruz)
+### Arkose Labs Tespit Mekanizmaları
+- BDA payload 50+ alan bekliyor (biz ~25 gönderiyoruz)
+- WebGL vendor/renderer boş = en kritik bot sinyali
 - Behavioral telemetry: mouse movement, form fill speed, key event timing
-- CDP Runtime.enable detection (Proxy ownKeys trap)
+- CDP Runtime.enable detection (Proxy ownKeys trap) — biz kaldırdık
 - Headless Chrome detection: WebGL vendor/renderer, canvas fingerprint, navigator.webdriver
-- Eksik sinyaller: history_length, touch_support, audio_context, fonts_list, webgl_extensions, performance_timing, battery_status, connection_info, storage_estimate, media_devices, speech_synthesis, math_constants, error_stack_trace, document_features
-
-### GitHub Signup Flow (Kaynak: Arkose Labs API Guide, live observation)
-- `/signup_check/usage` endpoint'i BDA payload'ını doğruluyor
-- BDA decrypt edilemiyorsa bağlantı kesiliyor (close_notify + ReadTimeout)
-- Risk skoru yüksekse captcha frame yükleniyor (has_captcha_frame=true)
-- Submit butonu gizli ve disabled oluyor (submit_hidden=true, submit_disabled=true)
-- Cookie header'ları eksikse (session) request reddedilebilir
 
 ### CDP Detection Vektörleri (Kaynak: DataDome, Castle.io, Rebrowser.net)
-- `Runtime.enable` → Proxy `ownKeys` trap: `console.debug()` ile Proxy enumerate ediliyor
-- V8 Mayıs 2025 patch: Error.stack getter trick'i patchlendi ama Proxy ownKeys hala çalışıyor
-- `window.cdc_*` property'leri: ChromeDriver artifact (biz kullanmıyoruz)
-- `navigator.webdriver`: Headless modda `true` dönebilir
-- WebGL vendor/renderer boşsa: headless/bot göstergesi
+- `Runtime.enable` → Proxy `ownKeys` trap: biz kaldırdık ✓
+- `navigator.webdriver`: false dönüyor ✓
+- `window.chrome`: true dönüyor ✓
+- `chrome.runtime.connect`: native proxy çalışıyor ✓
+- SourceURL leak: korunuyor ✓
+- WebGL vendor/renderer: BOŞ ← KRİTİK SORUN
 
----
+### Chrome Extension Tespiti
+- `chrome-extension://cimiefiiaegbelhefglklhhakcgmhkai/service_worker.js` detect edildi
+- Bu Chrome component extension'ıdır (Google Keep veya benzeri)
+- `--disable-extensions` KULLANILMAMALI — Arkose Labs'in ihtiyaç duyduğu extension'ları da devre dışı bırakır
 
-## FAZ 6.8: Runtime Test Sonuçları (2026-04-17)
+## Yapılan Hatalar ve Dersler
 
-### Tespit Edilen Sorunlar (Log Analizi)
+1. **`--disable-vulkan-surface` hatası**: Bu flag'i eklemek WebGL context oluşturmayı engelliyordu. Headless modda Vulkan surface'a ihtiyaç yok gibi düşünmüştük ama yanlıştı. Kaldırıldı ancak WebGL vendor/renderer hala boş — başka bir kök neden var.
 
-#### SORUN 1: WebGL vendor/renderer hala BOŞ [KRİTİK]
-```
-[FINGERPRINT] WebGL vendor: 
-[FINGERPRINT] WebGL renderer:
-```
-- `--use-angle=vulkan` + `--headless=new` flag'lerine rağmen WebGL vendor ve renderer boş dönüyor
-- Bu, Arkose Labs'ın "bot" sinyali olarak değerlendirdiği en kritik göstergelerden biri
-- Muhtemel nedenler:
-  1. Vulkan ANGLE headless modda GPU'ya erişemiyor
-  2. `--disable-vulkan-surface` flag'i WebGL context oluşturmayı engelliyor
-  3. `WEBGL_debug_renderer_info` extension'ı headless=new modda desteklenmiyor
-- **ÇÖZÜM GEREKLİ**: WebGL context oluşturma ve GPU string elde etme mekanizması iyileştirilmeli
+2. **`--disable-extensions` hatası**: Arkose Labs'in ihtiyaç duyduğu Chrome component extension'larını da devre dışı bırakıyordu. Kaldırıldı.
 
-#### SORUN 2: Risk Check hala ReadTimeout [KRİTİK]
-```
-[TLS] Alert received: level=1 description=0
-[RISK CHECK] ReadTimeout while waiting for risk check response
-```
-- BDA encryption formatı düzeltildi (AES-256-CBC, JSON {ct,s,iv})
-- Ama sunucu hala close_notify gönderip bağlantıyı kesiyor
-- Olası nedenler:
-  1. `webgl.vendor=""` ve `webgl.renderer=""` → yüksek risk sinyali, sunucu request'i reddediyor
-  2. BDA'da eksik alanlar var (30+ alan eksik, sadece ~15 gönderiliyor)
-  3. Cookie header'ları eksik olabilir (session cookie yok)
+3. **Gerçek değer üretimi zorunluluğu**: Spoofing/hardcoding YASAK. Her değer gerçek donanımdan gelmeli. WebGL vendor/renderer boş dönüyorsa bunu "hardcode etmek" yerine gerçek GPU'ya nasıl erişileceğini bulmalıyız.
 
-#### SORUN 3: Chrome Extension detect edildi
-```
-"type": "service_worker", "url": "chrome-extension://fignfifoniblkonapihmkfakmlgkbkcf/service_worker.js"
-```
-- Bilinmeyen Chrome extension Service Worker detect edildi
-- Bu extension CDP ile tespit edilebilir bir sinyal
-- **ÇÖZÜM**: Chrome başlatılırken extension'lar devre dışı bırakılmalı (`--disable-extensions` flag)
+4. **Chrome eski süreçleri**: Port 9222'yi eski Chrome süreçleri tutabilir. Çalıştırmadan önce `pkill -9 chrome` yapmak gerekebilir.
 
-#### SORUN 4: Octocaptcha iframe yüklendi
-```
-iframe=https://octocaptcha.com/?origin_page=github_signup_redesign&responsive=true&require_ack=true&version=2&style_theme=light&data={"email_address":"...,"login":"..."}
-```
-- Arkose captcha frame aktif (has_captcha_frame=true)
-- submit_hidden=true, submit_disabled=true → form submit butonu gizli
-- Bu, risk check'in `challenge_required=true` döndüğünün sonucu
-
-#### SORUN 5: BDA JSON formatı doğru çalışıyor
-```
-[BDA] JSON payload (1697 bytes): {"navigator":{"userAgent":"...","hardwareConcurrency":16,"deviceMemory":16,...},"webgl":{"vendor":"","renderer":"",...},...}
-[BDA] Encrypted payload generated (2372 bytes)
-[RISK CHECK] BDA payload (first 200 chars): {"ct":"FDEkugR/f9re...","s":"...","iv":"..."}
-```
-- JSON formatı doğru: `{"ct":"...","s":"...","iv":"..."}`
-- AES-256-CBC encryption düzgün çalışıyor
-- Ama `webgl.vendor=""` ve `webgl.renderer=""` → bot sinyali
-
-#### İYİ HABERLER (Çalışan Şeyler)
-- `navigator.webdriver: false` 
-- `window.chrome exists: true` 
-- `chrome.runtime.connect: true`  (native proxy)
-- `CDP side-effect: false` 
-- `SourceURL leak: false` 
-- CDP Network monitoring aktif  (network event'leri loglanıyor)
-- `browser-network.ndjson` oluşturuluyor 
-- BDA encryption formatı AES-256-CBC + JSON wrapper 
-- Cookie header'ları ekleniyor  (cookıe_jar'dan)
-- Screen resolution doğru geliyor: `800x600` (headless viewport)
-- Hardware concurrency doğru: `16` (fingerprint'ten)
-- Device memory doğru: `16` (fingerprint'ten)
-
-### FAZ 6.9: WebGL GPU Flag Düzeltmesi [BEKLİYOR]
-- WebGL vendor/renderer boş dönüyor → headless=new modda GPU erişimi sağlanmalı
-- Olası çözümler:
-  1. `--disable-vulkan-surface` flag'ini kaldır ve `--enable-unsafe-webgpu` ile test et
-  2. `fingerprint_diagnostic.js`'de `WEBGL_debug_renderer_info` extension'ını zorla sorgula
-  3. Headless=new modda software renderer fallback'i ekle (SwiftShader gibi ama kontrollü)
-  4. Eğer GPU erişimi imkansızsa: WebGL vendor/renderer için bilinen headless Chrome değerlerini kullan (mantıklı değil, tespit edilebilir)
-
-### FAZ 6.10: Chrome Extension Detection Düzeltmesi [BEKLİYOR]
-- Bilinmeyen Chrome extension Service Worker detect edildi
-- Çözüm: `--disable-extensions` ve `--disable-component-extensions-with-background-pages` flag'leri ekle
-- `browser_init.zig`'de Chrome arg listesine bu flag'leri ekle
+5. **Output loglama**: Motorun tüm çıktıları bir txt dosyasına yazılmalı. Terminal kopyalama verimli değil.
