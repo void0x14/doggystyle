@@ -258,12 +258,25 @@
 - `browser_bridge.zig`'de `FingerprintDiagnostic` struct'ına yeni alanlar
 - `main.zig`'de fingerprint → BDA mapping'inin genişletilmesi
 
-#### FAZ 6.7.3: tguess/Proof-of-Work Mekanizması [BEKLİYOR]
-- SOURCE: unfuncaptcha/tguess GitHub reposu
-- Arkose Labs her BDA request ile birlikte `tguess` proof-of-work hash'i gerektiriyor
-- `tguess` Ajax API'den gelen JavaScript'i sandbox'ta çalıştırarak üretiliyor
-- Değişken format: RSA-SHA256 veya benzeri proof-of-work
-- **NOT**: Bu mekanizma GitHub signup için zorunlu olabilir, araştırılması gerekiyor
+#### FAZ 6.7.3: tguess/Proof-of-Work Mekanizması [X - ARAŞTIRMA TAMAMLANDI]
+- **SOURCE**: unfuncaptcha/tguess GitHub reposu (https://github.com/unfuncaptcha/tguess)
+- **Mekanizma Analizi**:
+  - tguess, Arkose Labs Funcaptcha için proof-of-work doğrulama bileşenidir
+  - `/fc/gfct` endpoint'inden dönen `dapib_url` alanındaki JavaScript dosyası ile üretilir
+  - Script her session için unique'dir (~1200 dosya/gün, expire eder)
+  - iframe ortamında `window.parent.ae.answer` (input) ve `window.parent.ae.dapibReceive` (callback) ile çalışır
+  - Guess objesi session token ile birleştirilip script'e verilir
+  - Script, guess'i karmaşık encoded alanlara dönüştürür (index, token, _0, _6158889701, i8n3d4e1x7d0fb7a5d8d09, vb.)
+  - Sandbox detection var: NodeJS/JSDom ortamı tespit edilirse her değerin sonuna rastgele karakter eklenir (kolayca temizlenir)
+- **Encryption**:
+  - Format: `{"ct": "...", "iv": "...", "s": "..."}` (BDA ile aynı format)
+  - AES-256-CBC, MD5 chain key derivation
+  - Key: session token (BDA'dan farklı - BDA'da UA + timestamp kullanılır)
+- **GitHub Signup İçin Durum**:
+  - tguess **Funcaptcha görsel challenge çözümü** için gereklidir
+  - GitHub signup'da risk check başarısız olursa captcha frame yüklenir (has_captcha_frame=true)
+  - Eğer captcha yüklendiyse, çözüm için tguess gerekebilir
+  - **NOT**: Ghost Engine şu an captcha solving modülüne sahip değil - bu mekanizma sadece dokümante edilmiştir
 
 ---
 
@@ -306,7 +319,7 @@
 - [x] FAZ 6.6.3: Hardcoded dil listesi kaldır
 - [x] FAZ 6.7.1: fingerprint_diagnostic.js'e 15+ yeni sinyal ekle
 - [x] FAZ 6.7.2: BrowserEnvironment struct'ına 15+ yeni alan ekle
-- [ ] FAZ 6.7.3: tguess/proof-of-work mekanizması araştır ve ekle
+- [x] FAZ 6.7.3: tguess/proof-of-work mekanizması araştır ve ekle
 - [ ] FAZ 6.8.1: Runtime test
 - [ ] FAZ 6.8.2: BDA payload doğrulama
 - [ ] FAZ 6.8.3: Risk check response analizi
@@ -328,7 +341,7 @@
 - [x] FAZ 6.4: BDA Encryption Format Düzeltmesi
 - [x] FAZ 6.5: Risk Check HTTP Headers & Fingerprint Mapping
 - [x] FAZ 6.6: Uydurma Kod Temizliği
-- [ ] FAZ 6.7: BDA Payload Genişletmesi
+- [X] FAZ 6.7: BDA Payload Genişletmesi (tguess araştırması tamamlandı)
 - [ ] FAZ 6.8: Runtime Test & Doğrulama
 - [ ] Account Post-Verification
 - [ ] Multi-Account Orchestration
@@ -346,6 +359,17 @@
 - Salt ve IV random üretiliyor, key derivation'da salt kullanılıyor
 - Key string: `userAgent + str(rounded_timestamp)` — string concatenation
 - MD5 chain: `md5(salted_key)` × 4 iterasyon → ilk 32 byte AES-256 key
+
+### tguess/Proof-of-Work Mekanizması (Kaynak: unfuncaptcha/tguess GitHub reposu - FAZ 6.7.3)
+- **Amacı**: Funcaptcha görsel challenge çözümlerini doğrulamak için proof-of-work
+- **Üretim**: `/fc/gfct` endpoint'inden `dapib_url` alanındaki JavaScript dosyası ile
+- **Script özellikleri**: Her session unique (~1200 dosya/gün, expire'lı), iframe'de çalışır
+- **İletişim**: `window.parent.ae.answer` (input) ve `window.parent.ae.dapibReceive` (callback)
+- **Dönüşüm**: Guess objesi → karmaşık encoded alanlar (index, token, çeşitli hash'ler)
+- **Sandbox detection**: NodeJS/JSDom tespiti → her değerin sonuna rastgele karakter eklenir
+- **Encryption**: `{"ct": "...", "iv": "...", "s": "..."}` formatında, AES-256-CBC
+- **Key**: Session token (BDA'dan farklı)
+- **Ghost Engine Notu**: Şu an captcha solving modülü yok - tguess sadece araştırma için dokümante edildi
 
 ### Arkose Labs Tespit Mekanizmaları (Kaynak: roundproxies.com, AzureFlow/arkose-fp-docs)
 - BDA payload 50+ alan bekliyor (biz ~15 gönderiyoruz)
