@@ -2326,13 +2326,22 @@ pub fn buildGitHubRiskCheckHeaders(
     const encoded_sec_fetch_dest = try literal_sec_fetch_dest.encode(allocator);
     defer allocator.free(encoded_sec_fetch_dest);
 
+    const literal_x_requested_with = LiteralHeaderFieldIncrementalIndexing{
+        .name_index = 0,
+        .name = "x-requested-with",
+        .value = "XMLHttpRequest",
+    };
+    const encoded_x_requested_with = try literal_x_requested_with.encode(allocator);
+    defer allocator.free(encoded_x_requested_with);
+
     const total_len = encoded_method.len + encoded_scheme.len +
         encoded_path.len + encoded_authority.len +
         encoded_ua.len + encoded_accept.len + encoded_accept_language.len +
         encoded_ct.len + encoded_cl.len +
         encoded_origin.len + encoded_referer.len + encoded_cookie.len +
         encoded_sec_ch_ua.len + encoded_sec_ch_ua_mobile.len + encoded_sec_ch_ua_platform.len +
-        encoded_sec_fetch_site.len + encoded_sec_fetch_mode.len + encoded_sec_fetch_dest.len;
+        encoded_sec_fetch_site.len + encoded_sec_fetch_mode.len + encoded_sec_fetch_dest.len +
+        encoded_x_requested_with.len;
 
     const result = try allocator.alloc(u8, total_len);
     var offset: usize = 0;
@@ -2373,6 +2382,8 @@ pub fn buildGitHubRiskCheckHeaders(
     offset += encoded_sec_fetch_mode.len;
     @memcpy(result[offset .. offset + encoded_sec_fetch_dest.len], encoded_sec_fetch_dest);
     offset += encoded_sec_fetch_dest.len;
+    @memcpy(result[offset .. offset + encoded_x_requested_with.len], encoded_x_requested_with);
+    offset += encoded_x_requested_with.len;
 
     std.debug.assert(offset == total_len);
     return result;

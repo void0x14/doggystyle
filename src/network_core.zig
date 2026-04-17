@@ -6374,15 +6374,20 @@ pub fn encryptBda(allocator: std.mem.Allocator, env: *const BrowserEnvironment) 
     allocator.free(encrypted);
 
     // Step 11: Build JSON output
-    // {"ct":"<base64_ciphertext>","s":"<hex_salt>","iv":"<hex_iv>"}
-    const result = try std.fmt.allocPrint(
+    const json_result = try std.fmt.allocPrint(
         allocator,
         "{{\"ct\":\"{s}\",\"s\":\"{s}\",\"iv\":\"{s}\"}}",
         .{ base64_output, salt_hex[0..32], iv_hex[0..32] },
     );
+    defer allocator.free(json_result);
     allocator.free(base64_output);
 
-    return result;
+    // Step 12: Base64 encode the entire JSON per Arkose specification
+    const final_base64_len = base64_encoder.calcSize(json_result.len);
+    const final_base64 = try allocator.alloc(u8, final_base64_len);
+    _ = base64_encoder.encode(final_base64, json_result);
+
+    return final_base64;
 }
 
 /// AES-128-CBC encryption (manual implementation using Zig std.crypto.aes)
@@ -6414,9 +6419,16 @@ fn aes128CbcEncrypt(key: [16]u8, iv: [16]u8, plaintext: []const u8, ciphertext: 
 }
 
 /// Decrypt BDA payload (for testing round-trip)
-/// Input: JSON string {"ct":"<base64>","s":"<hex_salt>","iv":"<hex_iv>"}
+/// Input: Base64 string containing JSON {"ct":"<base64>","s":"<hex_salt>","iv":"<hex_iv>"}
 /// SOURCE: Arkose Labs BDA encryption — reverse engineered from client JS
-pub fn decryptBda(allocator: std.mem.Allocator, env: *const BrowserEnvironment, json_input: []const u8) ![]u8 {
+pub fn decryptBda(allocator: std.mem.Allocator, env: *const BrowserEnvironment, b64_input: []const u8) ![]u8 {
+    // Step 0: Decode outer base64
+    const outer_base64_decoder = std.base64.standard.Decoder;
+    const json_len = try outer_base64_decoder.calcSizeForSlice(b64_input);
+    const json_input = try allocator.alloc(u8, json_len);
+    defer allocator.free(json_input);
+    try outer_base64_decoder.decode(json_input, b64_input);
+
     // Step 1: Parse JSON to extract "ct", "s", "iv" fields
     const ct_marker = "\"ct\":\"";
     const s_marker = "\"s\":\"";
@@ -6777,11 +6789,17 @@ test "encryptBda then decryptBda: round-trip" {
     const encrypted = try encryptBda(allocator, &env);
     defer allocator.free(encrypted);
 
-    // Verify JSON structure: {"ct":"...","s":"...","iv":"..."}
-    try std.testing.expect(encrypted.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, encrypted, "\"ct\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encrypted, "\"s\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encrypted, "\"iv\":\"") != null);
+    // Verify JSON structure: {"ct":"...","s":"...","iv":"..."} inside base64 string
+    const base64_decoder = std.base64.standard.Decoder;
+    const json_len = try base64_decoder.calcSizeForSlice(encrypted);
+    const decoded_json = try allocator.alloc(u8, json_len);
+    defer allocator.free(decoded_json);
+    try base64_decoder.decode(decoded_json, encrypted);
+
+    try std.testing.expect(decoded_json.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, decoded_json, "\"ct\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decoded_json, "\"s\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decoded_json, "\"iv\":\"") != null);
 
     // Decrypt
     const decrypted = try decryptBda(allocator, &env, encrypted);
@@ -6795,13 +6813,20 @@ test "encryptBda then decryptBda: round-trip" {
     try std.testing.expectEqualStrings(original_json, decrypted);
 }
 
-test "encryptBda: output is valid JSON with BDA fields" {
+test "encryptBda: output is valid base64-encoded JSON with BDA fields" {
     const allocator = std.testing.allocator;
 
     var env = BrowserEnvironment{};
     env.timestamp = 1712345678000;
-    const encrypted = try encryptBda(allocator, &env);
+    const encrypted_b64 = try encryptBda(allocator, &env);
+    defer allocator.free(encrypted_b64);
+
+    // Decode base64
+    const base64_decoder = std.base64.standard.Decoder;
+    const json_len = try base64_decoder.calcSizeForSlice(encrypted_b64);
+    const encrypted = try allocator.alloc(u8, json_len);
     defer allocator.free(encrypted);
+    try base64_decoder.decode(encrypted, encrypted_b64);
 
     // Verify JSON structure
     try std.testing.expect(encrypted[0] == '{');
@@ -7034,23 +7059,29 @@ test "FAZ 6.8.2: BDA payload verification" {
     @memset(&env.nonce, 0x42);
 
     // 1. Generate encrypted BDA
-    const encrypted_json = try encryptBda(allocator, &env);
-    defer allocator.free(encrypted_json);
+    const encrypted_b64 = try encryptBda(allocator, &env);
+    defer allocator.free(encrypted_b64);
 
-    // 2. Validate JSON structure: {"ct":"...","s":"...","iv":"..."}
+    // 2. Decode inner JSON structure
+    const base64_decoder = std.base64.standard.Decoder;
+    const json_len = try base64_decoder.calcSizeForSlice(encrypted_b64);
+    const encrypted_json = try allocator.alloc(u8, json_len);
+    defer allocator.free(encrypted_json);
+    try base64_decoder.decode(encrypted_json, encrypted_b64);
+
+    // 3. Validate JSON structure: {"ct":"...","s":"...","iv":"..."}
     try std.testing.expect(encrypted_json[0] == '{');
     try std.testing.expect(std.mem.indexOf(u8, encrypted_json, "\"ct\":\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encrypted_json, "\"s\":\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encrypted_json, "\"iv\":\"") != null);
 
-    // 3. Validate Timestamp Rounding (6 hours = 21600 seconds)
+    // 4. Validate Timestamp Rounding (6 hours = 21600 seconds)
     const ts_seconds = env.timestamp / 1000;
     const rounded_ts = ts_seconds - (ts_seconds % 21600);
     try std.testing.expectEqual(@as(u64, 1712340000), rounded_ts); // 1712345678 -> 1712340000
 
-
-    // 4. Manual Decryption Verification (Round-trip proves AES-256-CBC and derivation logic)
-    const decrypted = try decryptBda(allocator, &env, encrypted_json);
+    // 5. Manual Decryption Verification (Round-trip proves AES-256-CBC and derivation logic)
+    const decrypted = try decryptBda(allocator, &env, encrypted_b64);
     defer allocator.free(decrypted);
 
     const original_json = try env.toJsonAlloc(allocator);

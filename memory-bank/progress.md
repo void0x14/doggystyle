@@ -296,11 +296,11 @@
 - Timestamp rounding doğrulandı: 6 saatlik pencereler
 - AES-256-CBC manuel decrypt ile round-trip testleri eklendi ve geçti
 
-#### FAZ 6.8.3: Risk Check Response Analizi [BEKLİYOR]
-- GitHub `/signup_check/usage` endpoint'inden gelen response'u analiz etme
-- TLS close_notify/ReadTimeout hala oluşuyor mu?
+#### FAZ 6.8.3: Risk Check Response Analizi [TAMAMLANDI]
+- GitHub `/signup_check/usage` endpoint'inden gelen response'u analiz etme (Sonuç bölümüne eklendi: SORUN 2)
+- TLS close_notify/ReadTimeout hala oluşuyor mu? -> Evet, oluşuyor (Bkz. SORUN 2)
 - Eğer response geliyorsa: `challenge_required` alanı true mu false mu?
-- Eğer hala timeout oluyorsa: BDA encryption'ı doğrulama, eksik header'ları kontrol etme
+- Eğer hala timeout oluyorsa: BDA encryption'ı doğrulama, eksik header'ları kontrol etme -> Encryption payload'u formatı (json {ct, s, iv} ve cbc) loglarda başarıyla görülüyor. WebGL GPU fallback'lerden dolayı connection abort yaşanmasına odaklanıldı.
 
 #### FAZ 6.8.4: CDP Detection Test [BEKLİYOR]
 - fingerprint_diagnostic.js çıktısını inceleme:
@@ -321,7 +321,7 @@
 - [x] FAZ 6.7.3: tguess/proof-of-work mekanizması araştır ve dokümante et
 - [x] FAZ 6.8.1: Runtime test
 - [x] FAZ 6.8.2: BDA payload doğrulama
-- [ ] FAZ 6.8.3: Risk check response analizi
+- [x] FAZ 6.8.3: Risk check response analizi
 - [ ] FAZ 6.8.4: CDP detection test — WebGL vendor/renderer hala BOŞ
 - [ ] FAZ 6.9: WebGL GPU flag düzeltmesi — vendor/renderer boş dönüyor
 - [ ] FAZ 6.10: Chrome extension detection — Service Worker detect edildi
