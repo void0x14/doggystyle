@@ -548,14 +548,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("[SIGNUP] Using Email: {s} (TEST MODE - Digistallone bypassed)\n", .{email});
     std.debug.print("[SIGNUP] Submitting POST to /signup...\n", .{});
 
-    // =========================================================================
-    // OBSERVABILITY POLL — Capture initial state before signup form interaction
-    // Drains CDP events and writes risk-level telemetry to browser-network.ndjson
-    // =========================================================================
-    bridge.computeRiskAndLogTelemetry("pre-signup") catch |err| {
-        std.debug.print("[OBSERVE] ⚠️ Pre-signup telemetry poll failed: {}\n", .{err});
-    };
-
     std.debug.print("[BROWSER] Capturing exact browser-owned signup bundle...\n", .{});
     var signup_bundle = bridge.captureSignupBundle(username, email, password, "") catch |err| {
         std.debug.print("[BROWSER] FAILED: Could not capture signup bundle: {}\n", .{err});
@@ -657,12 +649,6 @@ pub fn main(init: std.process.Init) !void {
     const post_signup_grace = std.os.linux.timespec{ .sec = 1, .nsec = 500 * std.time.ns_per_ms };
     _ = std.os.linux.nanosleep(&post_signup_grace, null);
     try bridge.navigateToAccountVerifications();
-    // =========================================================================
-    // OBSERVABILITY POLL — Capture state before verification form interaction
-    // =========================================================================
-    bridge.computeRiskAndLogTelemetry("pre-verify") catch |err| {
-        std.debug.print("[OBSERVE] ⚠️ Pre-verify telemetry poll failed: {}\n", .{err});
-    };
 
     std.debug.print("[BROWSER] Capturing exact browser-owned verify bundle...\n", .{});
     var verify_bundle = bridge.captureVerifyBundle(github_code) catch |err| {

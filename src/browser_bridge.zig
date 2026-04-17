@@ -946,23 +946,6 @@ const BrowserUiState = struct {
     text_snippet: []const u8 = "",
 };
 
-const RiskLevel = enum {
-    LOW,
-    MEDIUM,
-    HIGH,
-    CRITICAL,
-};
-
-fn computeRiskLevel(state: BrowserUiState) RiskLevel {
-    if (state.octocaptcha_length == 0 and state.has_captcha_frame) return .CRITICAL;
-    if (state.submit_hidden == true and state.submit_disabled == true) return .CRITICAL;
-    if (state.has_captcha_frame) return .HIGH;
-    if (state.submit_hidden == true or state.submit_disabled == true) return .HIGH;
-    if (state.load_button_hidden == true) return .MEDIUM;
-    if (state.has_cookie_banner) return .MEDIUM;
-    return .LOW;
-}
-
 // ---------------------------------------------------------------------------
 // Browser Audit Result — structured observability for every bridge action
 // SOURCE: PRD "Full Real-Time Browser Observability System", ticket 446647de
@@ -1970,8 +1953,7 @@ pub const BrowserBridge = struct {
                 paused.deinit(self.allocator);
             }
 
-            // Emit telemetry + diagnostic state every poll cycle (rate-limited internally)
-            self.computeRiskAndLogTelemetry("request-wait") catch {};
+            // Emit diagnostic state every poll cycle (rate-limited internally)
             self.emitDiagnosticState("request-wait", false) catch {};
 
             // Read next WebSocket message with short timeout for responsive polling
@@ -2179,94 +2161,6 @@ pub const BrowserBridge = struct {
         try line_buf.appendSlice(body_esc[0..body_esc_len]);
         try line_buf.appendSlice("\"}\n");
         try writeAll(fd, line_buf.items.ptr, line_buf.items.len);
-    }
-
-    // Real-time telemetry: compute risk level and write NDJSON line on every observeUiState poll.
-    // SOURCE: PRD "Full Real-Time Browser Observability System" — risk-level telemetry
-    pub fn computeRiskAndLogTelemetry(self: *BrowserBridge, label: []const u8) BridgeError!void {
-        const state: BrowserUiState = self.observeUiState() catch |err| blk: {
-            std.debug.print("[BRIDGE] ⚠️ observeUiState failed in telemetry ({}) — using fallback\n", .{err});
-            break :blk BrowserUiState{
-                .url = try self.allocator.dupe(u8, "about:blank"),
-                .title = try self.allocator.dupe(u8, "CDP connected"),
-                .octocaptcha_length = 0,
-                .email_length = 0,
-                .password_length = 0,
-                .login_length = 0,
-                .submit_hidden = null,
-                .submit_disabled = null,
-                .load_button_hidden = null,
-                .load_button_disabled = null,
-                .has_captcha_frame = false,
-                .has_verify_completed = false,
-                .has_account_verif_text = false,
-                .has_cookie_banner = false,
-                .iframe_src = null,
-                .text_snippet = try self.allocator.dupe(u8, "observeUiState failed"),
-            };
-        };
-        defer self.freeUiState(state);
-
-        const risk = computeRiskLevel(state);
-        const trace_dir = self.diagnostics_dir orelse return;
-
-        var path_buf: [1024]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "{s}/browser-network.ndjson", .{trace_dir}) catch return error.OutOfMemory;
-        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-            .APPEND = true,
-            .CLOEXEC = true,
-        }, 0o644) catch return error.WriteFailed;
-        defer _ = std.c.close(fd);
-
-        var line_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer line_buf.deinit();
-        var tmp: [64]u8 = undefined;
-        var url_esc: [2048]u8 = undefined;
-        var title_esc: [512]u8 = undefined;
-        const url_esc_len = escapeJsonString(state.url, &url_esc);
-        const title_esc_len = escapeJsonString(state.title, &title_esc);
-
-        try line_buf.appendSlice("{\"ts\":");
-        try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{currentUnixMs()}) catch return error.OutOfMemory);
-        try line_buf.appendSlice(",\"type\":\"poll\"");
-        try line_buf.appendSlice(",\"label\":\"");
-        try line_buf.appendSlice(label);
-        try line_buf.appendSlice("\",\"url\":\"");
-        try line_buf.appendSlice(url_esc[0..url_esc_len]);
-        try line_buf.appendSlice("\",\"title\":\"");
-        try line_buf.appendSlice(title_esc[0..title_esc_len]);
-        try line_buf.appendSlice("\",\"captcha_frame\":");
-        try line_buf.appendSlice(if (state.has_captcha_frame) "true" else "false");
-        try line_buf.appendSlice(",\"submit_hidden\":");
-        if (state.submit_hidden) |sh| {
-            try line_buf.appendSlice(if (sh) "true" else "false");
-        } else {
-            try line_buf.appendSlice("null");
-        }
-        try line_buf.appendSlice(",\"submit_disabled\":");
-        if (state.submit_disabled) |sd| {
-            try line_buf.appendSlice(if (sd) "true" else "false");
-        } else {
-            try line_buf.appendSlice("null");
-        }
-        try line_buf.appendSlice(",\"token_len\":");
-        try line_buf.appendSlice(std.fmt.bufPrint(&tmp, "{d}", .{state.octocaptcha_length}) catch return error.OutOfMemory);
-        try line_buf.appendSlice(",\"risk\":\"");
-        try line_buf.appendSlice(@tagName(risk));
-        try line_buf.appendSlice("\"}\n");
-
-        try writeAll(fd, line_buf.items.ptr, line_buf.items.len);
-        std.debug.print("[OBSERVE] {s}: risk={s} url={s} token_len={d} captcha={} submit_hidden={any} submit_disabled={any}\n", .{
-            label,
-            @tagName(risk),
-            state.url,
-            state.octocaptcha_length,
-            state.has_captcha_frame,
-            state.submit_hidden,
-            state.submit_disabled,
-        });
     }
 
     fn emitDiagnosticState(self: *BrowserBridge, label: []const u8, force_screenshot: bool) BridgeError!void {

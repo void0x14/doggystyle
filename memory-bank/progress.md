@@ -1,3 +1,4 @@
+
 # Progress Breakdown: Ghost Engine Implementation
 
 ## Tamamlanan Temel Özellikler (FAZ 0)
@@ -105,11 +106,11 @@
 - `fetchAndLogResponseBody()`: Response body'yi CDP ile çekiyor
 - Loglama: Her network event `browser-network.ndjson`'a yazılıyor
 
-#### FAZ 6.3.3: Uydurma Risk Level Sistemi [KISMEN TAMAMLANDI]
-- `computeRiskLevel` ve `computeRiskAndLogTelemetry` fonksiyonları eklendi (uydurma risk seviyesi)
-- `RiskLevel` enum: LOW, MEDIUM, HIGH, CRITICAL
-- **NOT**: Bu fonksiyonlar gerçek veriye dayanmıyor, kaldırılması gerekiyor (FAZ 6.6)
-- `main.zig`'de `computeRiskAndLogTelemetry` çağrıları eklendi (pre-signup, pre-verify)
+#### FAZ 6.3.3: Uydurma Risk Level Sistemi [TAMAMLANDI]
+- `computeRiskLevel` ve `computeRiskAndLogTelemetry` fonksiyonları kaldırıldı
+- `RiskLevel` enum kaldırıldı
+- `main.zig` çağrıları kaldırıldı
+- **NOT**: FAZ 6.3.1-6.3.2'deki gerçek CDP event buffering (`pending_events`, `processCdpEvent`, `fetchAndLogResponseBody`) korundu
 
 ---
 
@@ -300,7 +301,7 @@
 
 ## Bekleyen Görevler (FAZ 6.6+)
 
-- [ ] FAZ 6.6.1: computeRiskLevel ve computeRiskAndLogTelemetry kaldır
+- [x] FAZ 6.6.1: computeRiskLevel ve computeRiskAndLogTelemetry kaldır
 - [ ] FAZ 6.6.2: Hardcoded hash'ler (webgl.canvasHash, webgl.webglHash) kaldır
 - [ ] FAZ 6.6.3: Hardcoded dil listesi kaldır
 - [ ] FAZ 6.7.1: fingerprint_diagnostic.js'e 15+ yeni sinyal ekle
