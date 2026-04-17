@@ -236,6 +236,128 @@
     }
   });
 
+  // === FAZ 6.7.1 New Signals ===
+
+  collect('history_length', function() {
+    return window.history ? window.history.length : 0;
+  });
+
+  collect('touch_support', function() {
+    return navigator.maxTouchPoints || 0;
+  });
+
+  collect('audio_context', function() {
+    try {
+      var OfflineAudioContext = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+      if (!OfflineAudioContext) return 'not_supported';
+      var ctx = new OfflineAudioContext(1, 44100, 44100);
+      return ctx.sampleRate + '_' + ctx.state;
+    } catch(e) {
+      return 'error';
+    }
+  });
+
+  collect('fonts_list', function() {
+    try {
+      var testFonts = ['Arial', 'Courier New', 'Times New Roman', 'Comic Sans MS', 'Impact', 'Verdana'];
+      var canvas = document.createElement('canvas');
+      var ctx = canvas.getContext('2d');
+      var text = 'abcdefghijklmnopqrstuvwxyz0123456789';
+      ctx.font = '72px monospace';
+      var baselineWidth = ctx.measureText(text).width;
+      var detected = [];
+      for (var i = 0; i < testFonts.length; i++) {
+          ctx.font = '72px "' + testFonts[i] + '", monospace';
+          if (ctx.measureText(text).width !== baselineWidth) {
+              detected.push(testFonts[i]);
+          }
+      }
+      return JSON.stringify(detected);
+    } catch(e) {
+      return '[]';
+    }
+  });
+
+  collect('webgl_extensions', function() {
+    try {
+      var canvas = document.createElement('canvas');
+      var gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      if (!gl) return '';
+      var exts = gl.getSupportedExtensions();
+      return JSON.stringify(exts || []);
+    } catch(e) {
+      return '[]';
+    }
+  });
+
+  collect('performance_timing', function() {
+    if (!window.performance || !window.performance.timing) return '{}';
+    var t = window.performance.timing;
+    return JSON.stringify({
+      navigationStart: t.navigationStart,
+      loadEventEnd: t.loadEventEnd,
+      domComplete: t.domComplete
+    });
+  });
+
+  collect('battery_status', function() {
+    return 'getBattery' in navigator ? 'supported' : 'unsupported';
+  });
+
+  collect('connection_info', function() {
+    var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (!c) return '{}';
+    return JSON.stringify({
+      downlink: c.downlink,
+      effectiveType: c.effectiveType,
+      rtt: c.rtt,
+      saveData: c.saveData
+    });
+  });
+
+  collect('storage_estimate', function() {
+    return (navigator.storage && navigator.storage.estimate) ? 'supported' : 'unsupported';
+  });
+
+  collect('media_devices', function() {
+    return (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) ? 'supported' : 'unsupported';
+  });
+
+  collect('speech_synthesis', function() {
+    if (!window.speechSynthesis) return '[]';
+    var voices = window.speechSynthesis.getVoices();
+    return JSON.stringify(voices.map(function(v) { return v.name; }));
+  });
+
+  collect('math_constants', function() {
+    return JSON.stringify({
+      PI: Math.PI,
+      E: Math.E,
+      SQRT2: Math.SQRT2,
+      LN2: Math.LN2
+    });
+  });
+
+  collect('error_stack_trace', function() {
+    try {
+      throw new Error('test');
+    } catch(e) {
+      if (!e.stack) return '';
+      return e.stack.split('\n')[0] + ' format';
+    }
+  });
+
+  collect('document_features', function() {
+    return JSON.stringify({
+      hidden: document.hidden,
+      visibilityState: document.visibilityState
+    });
+  });
+
+  collect('webdriver_flag', function() {
+    return typeof navigator.webdriver !== 'undefined' ? navigator.webdriver : false;
+  });
+
   // === Permissions Signals ===
 
   collect('notification_permission', function() {
