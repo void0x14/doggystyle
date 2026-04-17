@@ -43,6 +43,51 @@ Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 
 ---
 
+## [2026-04-18] — --use-angle=opengl Causes Mesa Software Renderer / Empty WebGL in Headless Mode
+
+**Ne oldu:** `browser_init.zig` satır 387'de `--use-angle=opengl` flag'i kullanılıyor. Kod yorumları `--use-angle=vulkan` ve `--use-gl=angle` öneriyor ama uygulama farklı. Bu uyumsuzluk headless Chrome'da WebGL context'in ya tamamen başlatılamamasına (boş string) ya da Mesa/SwiftShader yazılım renderer'ına düşmesine neden oluyor.
+
+**Gerçek:** `--use-angle=opengl` ANGLE'ın OpenGL backend'ini kullanır. Headless Linux ortamında (X11/Wayland olmadan), OpenGL path'i Mesa software rasterizer'a (llvmpipe/SwiftShader) düşer çünkü gerçek GPU'ya erişmek için GLX/EGL surface gerekir ve `EGL_PLATFORM=surfaceless` ile surface yok. Buna karşılık `--use-angle=vulkan` ANGLE'ın Vulkan backend'ini kullanır ve `/dev/dri/renderD128` üzerinden doğrudan gerçek GPU'ya erişir — surface gerektirmez.
+
+**Kaynak:** Chromium ANGLE Implementation — https://chromium.googlesource.com/angle/angle/+/HEAD/doc/Implementation.md
+**Kaynak:** Chrome --headless=new GPU rendering — https://developer.chrome.com/docs/chromium/new-headless
+**Kaynak:** Mesa DRM render nodes — https://dri.freedesktop.org/docs/drm/gpu/overview.html
+
+**Düzeltme:** `--use-angle=opengl` → `--use-angle=vulkan` ve `--use-gl=egl` → `--use-gl=angle`. İkisi birlikte çalışmalıdır. FAZ 7.1.1 ve 7.1.2'de uygulanacak.
+
+**Tekrar olmaması için:** `--use-angle=vulkan` dışındaki ANGLE backend'leri headless modda gerçek GPU'ya erişemez. OpenGL ANGLE backend'i X11/Wayland surface gerektirir ve headless'ta software fallback'e düşer.
+
+---
+
+## [2026-04-18] — MESA_LOADER_DRIVER_OVERRIDE=iris Hardcoded for Intel, Breaks on AMD GPU
+
+**Ne oldu:** `browser_init.zig` satır 309'da `MESA_LOADER_DRIVER_OVERRIDE=iris` sabit olarak ayarlanıyor. Ama sistemde hem Intel i5-13500H hem de AMD RX 460 var. `iris` driver'ı AMD GPU'da çalışmaz ve Mesa fallback'e neden olur.
+
+**Gerçek:** Mesa driver isimleri GPU vendor'a özeldir: Intel Gen12+ için `iris`, AMD GCN+ için `radeonsi`. Sabit hardcode her iki GPU'yu da destekleyemez. Runtime'da hangi render node'un hangi GPU'ya ait olduğunu tespit etmek gerekir.
+
+**Kaynak:** Mesa driver documentation — iris for Intel Gen12+, radeonsi for AMD GCN+
+
+**Düzeltme:** Runtime GPU detection ile dinamik driver seçimi yapılmalı. `/dev/dri/renderD128` device'ından `libdrm` veya `lspci` ile GPU vendor tespit edilip uygun driver override uygulanmalı. FAZ 7.3.1'de uygulanacak.
+
+**Tekrar olmaması için:** Driver override değeri asla sabit hardcode edilmemeli. Runtime'da tespit edilmeli.
+
+---
+
+## [2026-04-18] — DISPLAY=:99 Environment Variable Causes X11 Session Leak in Headless Mode
+
+**Ne oldu:** `buildSafeEnvironment` fonksiyonu satır 298'de `DISPLAY=:99` set ediyor. Ama `--headless=new` modunda DISPLAY gereksiz ve X11 sızıntısına neden olabilir. Ayrıca Xvfb spawn kodu zaten FAZ 6.2.1'de kaldırılmış ama DISPLAY sabiti kalmış.
+
+**Gerçek:** `--headless=new` Chrome'un kendi render pipeline'ını kullanır ve X11/Xvfb'ye ihtiyaç duymaz. DISPLAY environment variable'ı bırakmak anti-bot sistemler tarafından "X11 session potential" olarak tespit edilebilir.
+
+**Kaynak:** man 7 environ — X11/Wayland session variables
+**Kaynak:** Chrome --headless=new — https://developer.chrome.com/docs/chromium/new-headless
+
+**Düzeltme:** `XVFB_DISPLAY` sabiti kaldırılacak ve `DISPLAY` `PURGED_ENV_VARS` listesine eklenecek. FAZ 7.1.4 ve 7.1.5'te uygulanacak.
+
+**Tekrar olmaması için:** Headless Chrome ortamında DISPLAY ve XAUTHORITY gibi X11 değişkenleri asla set edilmemeli.
+
+---
+
 ## [2026-04-14] — WebGL Empty Vendor/Renderer And chrome.runtime Missing Flagged By Arkose BDA
 
 **Hata:** `browser-fingerprint.ndjson` diagnostic verisi `webgl_vendor = ""` ve `webgl_renderer = ""` gösteriyordu. Ayrıca `chrome_runtime_connect = false` ve `chrome_runtime_sendMessage = false` idi. Arkose Labs BDA (Browser Data Analytics) bu alanları topluyor ve boş/eksik değerleri bot işareti olarak kullanıyor.
