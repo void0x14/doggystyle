@@ -5863,7 +5863,7 @@ pub const NavigatorInfo = struct {
     deviceMemory: u8 = 8, // 8 GB RAM
     platform: []const u8 = "Linux x86_64",
     vendor: []const u8 = "Google Inc.",
-    languages: []const []const u8 = &[_][]const u8{ "en-US", "en", "tr" },
+    languages: []const []const u8 = &[_][]const u8{},
     languages_json: []const u8 = "",
     doNotTrack: ?[]const u8 = null, // Not set by default in Chrome
 

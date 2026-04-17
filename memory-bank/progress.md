@@ -220,12 +220,12 @@
 - `main.zig`'deki `computeRiskAndLogTelemetry` çağrıları kaldırılacak (line ~546, ~654)
 - **NOT**: `enableNetworkMonitoring`, `processCdpEvent`, `fetchAndLogResponseBody`, `pending_events` kaldırılmayacak — bunlar gerçek CDP event buffering
 
-#### FAZ 6.6.2: Hardcoded Hash Temizliği [BEKLİYOR]
+#### FAZ 6.6.2: Hardcoded Hash Temizliği [TAMAMLANDI]
 - `webgl.canvasHash` hardcoded `"d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9"` kaldırılacak
 - `webgl.webglHash` hardcoded `"b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7"` kaldırılacak
 - Bunlar FingerprintDiagnostic'ten gelen gerçek hash değerleriyle değiştirilecek
 
-#### FAZ 6.6.3: Hardcoded Dil Listesi Temizliği [BEKLİYOR]
+#### FAZ 6.6.3: Hardcoded Dil Listesi Temizliği [TAMAMLANDI]
 - `navigator.languages` hardcoded `["en-US", "en", "tr"]` kaldırılacak
 - FingerprintDiagnostic'ten gelen gerçek dil listesi kullanılacak
 
@@ -303,7 +303,7 @@
 
 - [x] FAZ 6.6.1: computeRiskLevel ve computeRiskAndLogTelemetry kaldır
 - [x] FAZ 6.6.2: Hardcoded hash'ler (webgl.canvasHash, webgl.webglHash) kaldır
-- [ ] FAZ 6.6.3: Hardcoded dil listesi kaldır
+- [x] FAZ 6.6.3: Hardcoded dil listesi kaldır
 - [ ] FAZ 6.7.1: fingerprint_diagnostic.js'e 15+ yeni sinyal ekle
 - [ ] FAZ 6.7.2: BrowserEnvironment struct'ına 15+ yeni alan ekle
 - [ ] FAZ 6.7.3: tguess/proof-of-work mekanizması araştır ve ekle
@@ -327,7 +327,7 @@
 - [x] FAZ 6.3: CDP Event Buffering & Observability
 - [x] FAZ 6.4: BDA Encryption Format Düzeltmesi
 - [x] FAZ 6.5: Risk Check HTTP Headers & Fingerprint Mapping
-- [ ] FAZ 6.6: Uydurma Kod Temizliği
+- [x] FAZ 6.6: Uydurma Kod Temizliği
 - [ ] FAZ 6.7: BDA Payload Genişletmesi
 - [ ] FAZ 6.8: Runtime Test & Doğrulama
 - [ ] Account Post-Verification
