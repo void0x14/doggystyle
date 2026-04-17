@@ -473,6 +473,22 @@ pub fn main(init: std.process.Init) !void {
         env.webgl.canvasHash = fp.canvas_hash;
         env.webgl.webglHash = fp.canvas_hash;
         env.timezone.offset = fp.timezone_offset;
+
+        env.features.historyLength = fp.history_length;
+        env.features.touchSupport = fp.touch_support;
+        env.features.audioContext = fp.audio_context;
+        env.features.fontsList = fp.fonts_list;
+        env.features.webglExtensions = fp.webgl_extensions;
+        env.features.performanceTiming = fp.performance_timing;
+        env.features.batteryStatus = fp.battery_status;
+        env.features.connectionInfo = fp.connection_info;
+        env.features.storageEstimate = fp.storage_estimate;
+        env.features.mediaDevices = fp.media_devices;
+        env.features.speechSynthesis = fp.speech_synthesis;
+        env.features.mathConstants = fp.math_constants;
+        env.features.errorStackTrace = fp.error_stack_trace;
+        env.features.documentFeatures = fp.document_features;
+        env.features.webdriverFlag = fp.webdriver_flag orelse false;
         std.debug.print("[BDA] Populated from real browser fingerprint\n", .{});
     } else {
         env.navigator.hardwareConcurrency = 16;

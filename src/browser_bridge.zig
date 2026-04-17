@@ -1171,6 +1171,21 @@ pub const FingerprintDiagnostic = struct {
     iframe_contentWindow_exists: bool,
     console_debug_side_effects: bool,
     sourceurl_leak: bool,
+    history_length: u32,
+    touch_support: u32,
+    audio_context: []const u8,
+    fonts_list: []const u8,
+    webgl_extensions: []const u8,
+    performance_timing: []const u8,
+    battery_status: []const u8,
+    connection_info: []const u8,
+    storage_estimate: []const u8,
+    media_devices: []const u8,
+    speech_synthesis: []const u8,
+    math_constants: []const u8,
+    error_stack_trace: []const u8,
+    document_features: []const u8,
+    webdriver_flag: ?bool,
 
     /// Free all allocator-owned string fields
     pub fn deinit(self: *FingerprintDiagnostic, allocator: mem.Allocator) void {
@@ -1186,6 +1201,18 @@ pub const FingerprintDiagnostic = struct {
         allocator.free(self.permissions_notifications);
         allocator.free(self.permissions_geolocation);
         allocator.free(self.stealth_errors);
+        allocator.free(self.audio_context);
+        allocator.free(self.fonts_list);
+        allocator.free(self.webgl_extensions);
+        allocator.free(self.performance_timing);
+        allocator.free(self.battery_status);
+        allocator.free(self.connection_info);
+        allocator.free(self.storage_estimate);
+        allocator.free(self.media_devices);
+        allocator.free(self.speech_synthesis);
+        allocator.free(self.math_constants);
+        allocator.free(self.error_stack_trace);
+        allocator.free(self.document_features);
     }
 
     comptime {
@@ -1219,6 +1246,21 @@ pub const FingerprintDiagnostic = struct {
         std.debug.assert(@hasField(@This(), "iframe_contentWindow_exists"));
         std.debug.assert(@hasField(@This(), "console_debug_side_effects"));
         std.debug.assert(@hasField(@This(), "sourceurl_leak"));
+        std.debug.assert(@hasField(@This(), "history_length"));
+        std.debug.assert(@hasField(@This(), "touch_support"));
+        std.debug.assert(@hasField(@This(), "audio_context"));
+        std.debug.assert(@hasField(@This(), "fonts_list"));
+        std.debug.assert(@hasField(@This(), "webgl_extensions"));
+        std.debug.assert(@hasField(@This(), "performance_timing"));
+        std.debug.assert(@hasField(@This(), "battery_status"));
+        std.debug.assert(@hasField(@This(), "connection_info"));
+        std.debug.assert(@hasField(@This(), "storage_estimate"));
+        std.debug.assert(@hasField(@This(), "media_devices"));
+        std.debug.assert(@hasField(@This(), "speech_synthesis"));
+        std.debug.assert(@hasField(@This(), "math_constants"));
+        std.debug.assert(@hasField(@This(), "error_stack_trace"));
+        std.debug.assert(@hasField(@This(), "document_features"));
+        std.debug.assert(@hasField(@This(), "webdriver_flag"));
     }
 };
 
@@ -1563,7 +1605,22 @@ pub const BrowserBridge = struct {
         diagnostic.permissions_notifications = self.allocator.dupe(u8, diagnostic.permissions_notifications) catch return BridgeError.OutOfMemory;
         diagnostic.permissions_geolocation = self.allocator.dupe(u8, diagnostic.permissions_geolocation) catch return BridgeError.OutOfMemory;
         diagnostic.stealth_errors = self.allocator.dupe(u8, diagnostic.stealth_errors) catch return BridgeError.OutOfMemory;
-
+        diagnostic.sourceurl_leak = parsed.value.sourceurl_leak;
+        diagnostic.history_length = parsed.value.history_length;
+        diagnostic.touch_support = parsed.value.touch_support;
+        diagnostic.audio_context = self.allocator.dupe(u8, diagnostic.audio_context) catch return BridgeError.OutOfMemory;
+        diagnostic.fonts_list = self.allocator.dupe(u8, diagnostic.fonts_list) catch return BridgeError.OutOfMemory;
+        diagnostic.webgl_extensions = self.allocator.dupe(u8, diagnostic.webgl_extensions) catch return BridgeError.OutOfMemory;
+        diagnostic.performance_timing = self.allocator.dupe(u8, diagnostic.performance_timing) catch return BridgeError.OutOfMemory;
+        diagnostic.battery_status = self.allocator.dupe(u8, diagnostic.battery_status) catch return BridgeError.OutOfMemory;
+        diagnostic.connection_info = self.allocator.dupe(u8, diagnostic.connection_info) catch return BridgeError.OutOfMemory;
+        diagnostic.storage_estimate = self.allocator.dupe(u8, diagnostic.storage_estimate) catch return BridgeError.OutOfMemory;
+        diagnostic.media_devices = self.allocator.dupe(u8, diagnostic.media_devices) catch return BridgeError.OutOfMemory;
+        diagnostic.speech_synthesis = self.allocator.dupe(u8, diagnostic.speech_synthesis) catch return BridgeError.OutOfMemory;
+        diagnostic.math_constants = self.allocator.dupe(u8, diagnostic.math_constants) catch return BridgeError.OutOfMemory;
+        diagnostic.error_stack_trace = self.allocator.dupe(u8, diagnostic.error_stack_trace) catch return BridgeError.OutOfMemory;
+        diagnostic.document_features = self.allocator.dupe(u8, diagnostic.document_features) catch return BridgeError.OutOfMemory;
+        diagnostic.webdriver_flag = parsed.value.webdriver_flag;
         std.debug.print("[BRIDGE] Fingerprint diagnostic complete\n", .{});
         return diagnostic;
     }

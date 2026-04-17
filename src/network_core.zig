@@ -541,7 +541,7 @@ pub fn getInterfaceIp(name: []const u8) !u32 {
         if (posix.system.ioctl(fd, SIOCGIFADDR, @intFromPtr(&ifreq)) != 0) {
             return error.InterfaceNotFound;
         }
-        const addr: *const posix.sockaddr.in = @ptrCast(&ifreq.ifru.addr);
+        const addr: *const posix.sockaddr.in = @ptrCast(@alignCast(&ifreq.ifru.addr));
         return @byteSwap(addr.addr);
     } else if (is_windows) {
         // Windows implementation using GetAdaptersAddresses simplified for brevity
@@ -5942,6 +5942,24 @@ pub const TimezoneInfo = struct {
     daylightSaving: bool = false,
 };
 
+pub const FeaturesInfo = struct {
+    historyLength: u32 = 0,
+    touchSupport: u32 = 0,
+    audioContext: []const u8 = "not_supported",
+    fontsList: []const u8 = "[]",
+    webglExtensions: []const u8 = "[]",
+    performanceTiming: []const u8 = "{}",
+    batteryStatus: []const u8 = "unsupported",
+    connectionInfo: []const u8 = "{}",
+    storageEstimate: []const u8 = "unsupported",
+    mediaDevices: []const u8 = "unsupported",
+    speechSynthesis: []const u8 = "[]",
+    mathConstants: []const u8 = "{}",
+    errorStackTrace: []const u8 = "",
+    documentFeatures: []const u8 = "{}",
+    webdriverFlag: bool = false,
+};
+
 /// SOURCE: Arkose Labs BDA schema — reverse engineered from client JS
 /// NOTE: This schema is proprietary and changes frequently.
 ///       Values here represent a "typical" Linux Chrome instance.
@@ -5952,6 +5970,7 @@ pub const BrowserEnvironment = struct {
     canvas: CanvasInfo = .{},
     timezone: TimezoneInfo = .{},
     plugins: []const PluginInfo = standardLinuxPlugins,
+    features: FeaturesInfo = .{},
 
     // Cryptographic freshness
     timestamp: u64 = 0, // Milliseconds since epoch
@@ -5995,6 +6014,19 @@ pub const BrowserEnvironment = struct {
         total_len += self.webgl.webglHash.len + 20;
         total_len += self.timezone.timezone.len + 20;
         total_len += self.plugins.len * 200; // Per-plugin overhead
+        total_len += self.features.audioContext.len + 20;
+        total_len += self.features.fontsList.len + 20;
+        total_len += self.features.webglExtensions.len + 20;
+        total_len += self.features.performanceTiming.len + 20;
+        total_len += self.features.batteryStatus.len + 20;
+        total_len += self.features.connectionInfo.len + 20;
+        total_len += self.features.storageEstimate.len + 20;
+        total_len += self.features.mediaDevices.len + 20;
+        total_len += self.features.speechSynthesis.len + 20;
+        total_len += self.features.mathConstants.len + 20;
+        total_len += self.features.errorStackTrace.len + 20;
+        total_len += self.features.documentFeatures.len + 20;
+        total_len += 2048; // Base overhead for features
 
         // Allocate
         const buf = try allocator.alloc(u8, total_len);
@@ -6133,6 +6165,62 @@ pub const BrowserEnvironment = struct {
             writer.writeSlice("\"}");
         }
         writer.writeSlice("],");
+
+        // features
+        writer.writeSlice("\"features\":{");
+        writer.writeSlice("\"historyLength\":");
+        var hl_buf: [16]u8 = undefined;
+        const hl_len = std.fmt.printInt(&hl_buf, self.features.historyLength, 10, .lower, .{});
+        writer.writeSlice(hl_buf[0..hl_len]);
+        writer.writeSlice(",");
+        writer.writeSlice("\"touchSupport\":");
+        var ts_supp_buf: [16]u8 = undefined;
+        const ts_supp_len = std.fmt.printInt(&ts_supp_buf, self.features.touchSupport, 10, .lower, .{});
+        writer.writeSlice(ts_supp_buf[0..ts_supp_len]);
+        writer.writeSlice(",");
+        writer.writeSlice("\"audioContext\":\"");
+        writer.writeSlice(self.features.audioContext);
+        writer.writeSlice("\",");
+        writer.writeSlice("\"fontsList\":");
+        writer.writeSlice(self.features.fontsList);
+        writer.writeSlice(",");
+        writer.writeSlice("\"webglExtensions\":");
+        writer.writeSlice(self.features.webglExtensions);
+        writer.writeSlice(",");
+        writer.writeSlice("\"performanceTiming\":");
+        writer.writeSlice(self.features.performanceTiming);
+        writer.writeSlice(",");
+        writer.writeSlice("\"batteryStatus\":\"");
+        writer.writeSlice(self.features.batteryStatus);
+        writer.writeSlice("\",");
+        writer.writeSlice("\"connectionInfo\":");
+        writer.writeSlice(self.features.connectionInfo);
+        writer.writeSlice(",");
+        writer.writeSlice("\"storageEstimate\":\"");
+        writer.writeSlice(self.features.storageEstimate);
+        writer.writeSlice("\",");
+        writer.writeSlice("\"mediaDevices\":\"");
+        writer.writeSlice(self.features.mediaDevices);
+        writer.writeSlice("\",");
+        writer.writeSlice("\"speechSynthesis\":");
+        writer.writeSlice(self.features.speechSynthesis);
+        writer.writeSlice(",");
+        writer.writeSlice("\"mathConstants\":");
+        writer.writeSlice(self.features.mathConstants);
+        writer.writeSlice(",");
+        writer.writeSlice("\"errorStackTrace\":\"");
+        writer.writeSlice(self.features.errorStackTrace);
+        writer.writeSlice("\",");
+        writer.writeSlice("\"documentFeatures\":");
+        writer.writeSlice(self.features.documentFeatures);
+        writer.writeSlice(",");
+        writer.writeSlice("\"webdriverFlag\":");
+        if (self.features.webdriverFlag) {
+            writer.writeSlice("true");
+        } else {
+            writer.writeSlice("false");
+        }
+        writer.writeSlice("},");
 
         // timestamp (rounded to 6-hour boundary per Arkose Labs BDA format)
         const ts_seconds = self.timestamp / 1000;

@@ -305,7 +305,7 @@
 - [x] FAZ 6.6.2: Hardcoded hash'ler (webgl.canvasHash, webgl.webglHash) kaldır
 - [x] FAZ 6.6.3: Hardcoded dil listesi kaldır
 - [x] FAZ 6.7.1: fingerprint_diagnostic.js'e 15+ yeni sinyal ekle
-- [ ] FAZ 6.7.2: BrowserEnvironment struct'ına 15+ yeni alan ekle
+- [x] FAZ 6.7.2: BrowserEnvironment struct'ına 15+ yeni alan ekle
 - [ ] FAZ 6.7.3: tguess/proof-of-work mekanizması araştır ve ekle
 - [ ] FAZ 6.8.1: Runtime test
 - [ ] FAZ 6.8.2: BDA payload doğrulama
