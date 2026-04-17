@@ -470,6 +470,8 @@ pub fn main(init: std.process.Init) !void {
         env.screen.availWidth = @intCast(fp.screen_avail_width);
         env.screen.availHeight = @intCast(fp.screen_avail_height);
         env.canvas.hash = fp.canvas_hash;
+        env.webgl.canvasHash = fp.canvas_hash;
+        env.webgl.webglHash = fp.canvas_hash;
         env.timezone.offset = fp.timezone_offset;
         std.debug.print("[BDA] Populated from real browser fingerprint\n", .{});
     } else {

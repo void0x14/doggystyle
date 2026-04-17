@@ -124,6 +124,22 @@
     return screen ? screen.height : 0;
   });
 
+  collect('screen_avail_width', function() {
+    return screen ? screen.availWidth : 0;
+  });
+
+  collect('screen_avail_height', function() {
+    return screen ? screen.availHeight : 0;
+  });
+
+  collect('navigator_hardware_concurrency', function() {
+    return navigator.hardwareConcurrency || 0;
+  });
+
+  collect('navigator_device_memory', function() {
+    return navigator.deviceMemory || 0;
+  });
+
   collect('screen_inner_width', function() {
     return window.innerWidth || 0;
   });
@@ -194,6 +210,25 @@
       ctx.font = '14px Arial';
       ctx.fillText('Canvas fingerprint', 2, 2);
       // Return last 16 chars of data URL as hash
+      var dataUrl = canvas.toDataURL();
+      return dataUrl.slice(-16);
+    } catch(e) {
+      return '';
+    }
+  });
+
+  collect('webgl_canvas_hash', function() {
+    try {
+      var canvas = document.createElement('canvas');
+      canvas.width = 200;
+      canvas.height = 50;
+      var gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      if (!gl) return '';
+      gl.clearColor(0.0, 0.0, 0.0, 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.disable(gl.DEPTH_TEST);
       var dataUrl = canvas.toDataURL();
       return dataUrl.slice(-16);
     } catch(e) {

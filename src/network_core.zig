@@ -5922,12 +5922,8 @@ pub const WebGLInfo = struct {
     maxViewportDims: [2]u32 = .{ 32768, 32768 },
     aliasedLineWidthRange: [2]f32 = .{ 1.0, 1.0 },
 
-    /// Hardcoded hash representing typical RX460 canvas fingerprint
-    /// SOURCE: Computed from canvas 2D rendering on standard test image
-    canvasHash: []const u8 = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9",
-
-    /// Hardcoded hash representing typical WebGL fingerprint
-    webglHash: []const u8 = "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7",
+    canvasHash: []const u8 = "",
+    webglHash: []const u8 = "",
 };
 
 pub const CanvasInfo = struct {
@@ -6028,18 +6024,19 @@ pub const BrowserEnvironment = struct {
         writer.writeSlice("\"vendor\":\"");
         writer.writeSlice(self.navigator.vendor);
         writer.writeSlice("\",");
-        writer.writeSlice("\"languages\":[");
         if (self.navigator.languages_json.len > 0) {
+            writer.writeSlice("\"languages\":");
             writer.writeSlice(self.navigator.languages_json);
         } else {
+            writer.writeSlice("\"languages\":[");
             for (self.navigator.languages, 0..) |lang, i| {
                 if (i > 0) writer.writeByte(',');
                 writer.writeByte('"');
                 writer.writeSlice(lang);
                 writer.writeByte('"');
             }
+            writer.writeSlice("]");
         }
-        writer.writeSlice("]");
         writer.writeSlice("},");
 
         // screen

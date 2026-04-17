@@ -302,7 +302,7 @@
 ## Bekleyen Görevler (FAZ 6.6+)
 
 - [x] FAZ 6.6.1: computeRiskLevel ve computeRiskAndLogTelemetry kaldır
-- [ ] FAZ 6.6.2: Hardcoded hash'ler (webgl.canvasHash, webgl.webglHash) kaldır
+- [x] FAZ 6.6.2: Hardcoded hash'ler (webgl.canvasHash, webgl.webglHash) kaldır
 - [ ] FAZ 6.6.3: Hardcoded dil listesi kaldır
 - [ ] FAZ 6.7.1: fingerprint_diagnostic.js'e 15+ yeni sinyal ekle
 - [ ] FAZ 6.7.2: BrowserEnvironment struct'ına 15+ yeni alan ekle
