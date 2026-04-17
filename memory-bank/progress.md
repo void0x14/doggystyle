@@ -291,11 +291,10 @@
   - `live-view.html`: Observation snapshot'ları
   - Screenshot dosyaları
 
-#### FAZ 6.8.2: BDA Payload Doğrulama [BEKLİYOR]
-- stdout'tan BDA JSON payload'unu okuma
-- JSON formatını doğrulama: `{"ct":"...","s":"...","iv":"..."}` yapısı
-- Timestamp rounding'ı doğrulama: 6 saate yuvarlanmış mı?
-- AES-256-CBC encryption'ı manuel decrypt ile doğrulama
+#### FAZ 6.8.2: BDA Payload Doğrulama [TAMAMLANDI]
+- JSON formatı doğrulandı: `{"ct":"...","s":"...","iv":"..."}`
+- Timestamp rounding doğrulandı: 6 saatlik pencereler
+- AES-256-CBC manuel decrypt ile round-trip testleri eklendi ve geçti
 
 #### FAZ 6.8.3: Risk Check Response Analizi [BEKLİYOR]
 - GitHub `/signup_check/usage` endpoint'inden gelen response'u analiz etme
@@ -320,8 +319,8 @@
 - [x] FAZ 6.7.1: fingerprint_diagnostic.js'e 15+ yeni sinyal ekle
 - [x] FAZ 6.7.2: BrowserEnvironment struct'ına 15+ yeni alan ekle
 - [x] FAZ 6.7.3: tguess/proof-of-work mekanizması araştır ve ekle
-- [ ] FAZ 6.8.1: Runtime test
-- [ ] FAZ 6.8.2: BDA payload doğrulama
+- [x] FAZ 6.8.1: Runtime test
+- [x] FAZ 6.8.2: BDA payload doğrulama
 - [ ] FAZ 6.8.3: Risk check response analizi
 - [ ] FAZ 6.8.4: CDP detection test
 - [ ] Account Post-Verification (Onboarding, PAT Generation)

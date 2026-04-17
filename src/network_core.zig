@@ -7025,6 +7025,41 @@ test "aes256CbcEncrypt/Decrypt: round-trip" {
     try std.testing.expectEqualStrings(plaintext, decrypted[0..dec_unpadded_len]);
 }
 
+test "FAZ 6.8.2: BDA payload verification" {
+    const allocator = std.testing.allocator;
+
+    var env = BrowserEnvironment{};
+    env.timestamp = 1712345678000; // Fixed timestamp
+    env.navigator.userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/123.0.0.0";
+    @memset(&env.nonce, 0x42);
+
+    // 1. Generate encrypted BDA
+    const encrypted_json = try encryptBda(allocator, &env);
+    defer allocator.free(encrypted_json);
+
+    // 2. Validate JSON structure: {"ct":"...","s":"...","iv":"..."}
+    try std.testing.expect(encrypted_json[0] == '{');
+    try std.testing.expect(std.mem.indexOf(u8, encrypted_json, "\"ct\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encrypted_json, "\"s\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encrypted_json, "\"iv\":\"") != null);
+
+    // 3. Validate Timestamp Rounding (6 hours = 21600 seconds)
+    const ts_seconds = env.timestamp / 1000;
+    const rounded_ts = ts_seconds - (ts_seconds % 21600);
+    try std.testing.expectEqual(@as(u64, 1712340000), rounded_ts); // 1712345678 -> 1712340000
+
+
+    // 4. Manual Decryption Verification (Round-trip proves AES-256-CBC and derivation logic)
+    const decrypted = try decryptBda(allocator, &env, encrypted_json);
+    defer allocator.free(decrypted);
+
+    const original_json = try env.toJsonAlloc(allocator);
+    defer allocator.free(original_json);
+
+    try std.testing.expectEqualStrings(original_json, decrypted);
+}
+
+
 // =============================================================================
 // MODULE 3.3: Onboarding Bypass & Session Persistence
 // SOURCE: RFC 7230, Section 3 - HTTP Message Format

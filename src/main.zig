@@ -503,6 +503,7 @@ pub fn main(init: std.process.Init) !void {
     const bda_json = try env.toJsonAlloc(allocator);
     defer allocator.free(bda_json);
     std.debug.print("[BDA] JSON payload ({d} bytes): {s}\n", .{ bda_json.len, bda_json[0..@min(bda_json.len, 500)] });
+    std.debug.print("[BDA] Encrypted string: {s}\n", .{bda_payload});
     std.debug.print("[BDA] Encrypted payload generated ({d} bytes)\n", .{bda_payload.len});
     std.debug.print("[RISK CHECK] Sending POST to /signup_check/usage...\n", .{});
 
