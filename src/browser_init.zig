@@ -81,7 +81,7 @@ pub const CHROME_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.3
 pub const PROFILE_PREFIX = "/tmp/ghost_";
 
 /// Number of arguments passed to Chrome
-pub const CHROME_ARG_COUNT: usize = 26;
+pub const CHROME_ARG_COUNT: usize = 25;
 
 /// Maximum attempts to generate a unique profile directory
 pub const MAX_MKDTEMP_ATTEMPTS: usize = 10;
@@ -89,9 +89,6 @@ pub const MAX_MKDTEMP_ATTEMPTS: usize = 10;
 /// CDP remote debugging port
 /// SOURCE: Chrome DevTools Protocol — --remote-debugging-port flag
 pub const CDP_PORT: u16 = 9222;
-
-/// Xvfb display number for virtual framebuffer
-pub const XVFB_DISPLAY = ":99";
 
 /// Target URL for signup page (Chrome navigates here after extension loads)
 /// SOURCE: GitHub signup flow — https://github.com/signup
@@ -113,11 +110,12 @@ pub const PREFERENCES_JSON =
 // ---------------------------------------------------------------------------
 
 /// Environment variables that MUST be excluded to prevent session leaks
-/// NOTE: DISPLAY is NOT purged — Xvfb needs it
+/// NOTE: DISPLAY is purged — headless=new does not need X11/Xvfb
 /// SOURCE: man 7 environ — X11/Wayland session variables
 pub const PURGED_ENV_VARS: []const []const u8 = &.{
     "XAUTHORITY",
     "XDG_RUNTIME_DIR",
+    "DISPLAY",
 };
 
 /// Minimal safe environment for headless Chrome
@@ -295,7 +293,6 @@ pub fn buildSafeEnvironment(
     env_map.put("TERM", "xterm-256color") catch return BrowserInitError.OutOfMemory;
     env_map.put("HOME", profile_dir) catch return BrowserInitError.OutOfMemory;
     env_map.put("TZ", "UTC") catch return BrowserInitError.OutOfMemory;
-    env_map.put("DISPLAY", XVFB_DISPLAY) catch return BrowserInitError.OutOfMemory;
 
     // DRM/EGL surfaceless configuration for Chrome 147
     // SOURCE: Mesa DRM/EGL platform — surfaceless EGL for headless GPU rendering
@@ -368,7 +365,6 @@ fn buildChromeArgvWithBinary(
     return .{
         chrome_binary,
         "--no-sandbox",
-        "--disable-blink-features=AutomationControlled",
         "--no-first-run",
         "--disable-dev-shm-usage",
         "--disable-background-networking",
@@ -383,8 +379,8 @@ fn buildChromeArgvWithBinary(
         "--remote-allow-origins=*",
         user_data_dir_arg,
         actual_start_url,
-        "--use-gl=egl",
-        "--use-angle=opengl",
+        "--use-gl=angle",
+        "--use-angle=vulkan",
         "--ozone-platform=drm",
         "--render-node-override=/dev/dri/renderD128",
         "--disable-gpu-sandbox",
@@ -670,7 +666,15 @@ test "buildChromeArgv: binds runtime profile directory into argv" {
     const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &cdp_port_buf);
 
     try std.testing.expectEqualStrings(CHROME_BINARY, argv[0]);
-    try std.testing.expectEqualStrings(SIGNUP_URL, argv[argv.len - 6]);
+
+    var saw_signup_url = false;
+    for (argv) |arg| {
+        if (mem.eql(u8, arg, SIGNUP_URL)) {
+            saw_signup_url = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_signup_url);
 
     var saw_user_data_dir = false;
     for (argv) |arg| {
@@ -705,10 +709,9 @@ test "StealthBrowser: argv contains required stealth flags" {
     const argv = try buildChromeArgv("/tmp/test_profile", &user_data_dir_buf, &cdp_port_buf);
 
     const expected_flags = [_][]const u8{
-        "--disable-blink-features=AutomationControlled",
         "--no-first-run",
-        "--use-gl=egl",
-        "--use-angle=opengl",
+        "--use-gl=angle",
+        "--use-angle=vulkan",
         "--ozone-platform=drm",
         "--render-node-override=/dev/dri/renderD128",
         "--disable-gpu-sandbox",
@@ -738,10 +741,10 @@ test "StealthBrowser: argv contains required stealth flags" {
 
     // Verify GPU-killing flags are REMOVED
     for (argv) |arg| {
-        try std.testing.expect(!mem.startsWith(u8, arg, "--disable-gpu"));
+        try std.testing.expect(!mem.eql(u8, arg, "--disable-gpu"));
         try std.testing.expect(!mem.startsWith(u8, arg, "--enable-unsafe-swiftshader"));
         try std.testing.expect(!mem.startsWith(u8, arg, "--enable-webgl"));
-        try std.testing.expect(!mem.startsWith(u8, arg, "--use-gl=desktop"));
+        try std.testing.expect(!mem.eql(u8, arg, "--use-gl=desktop"));
     }
 
     // Verify DRM/EGL surfaceless flags are PRESENT

@@ -28,10 +28,6 @@
     return JSON.stringify(window.__stealth_errors || []);
   });
 
-  collect('webgl_patched', function() {
-    return !!window.__webgl_patched;
-  });
-
   collect('chrome_runtime_emulated', function() {
     return !!window.__chrome_runtime_emulated;
   });
