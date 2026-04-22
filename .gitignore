@@ -33,3 +33,7 @@ test_esc.zig
 test_stringify.zig
 artifacts/
 .agent
+b
+kernel_panic
+main
+root
