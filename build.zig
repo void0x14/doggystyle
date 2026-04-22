@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "ghost_engine",
+        .name = "siege_engine",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
 
     // Setup Fuzzing / Unit Testing with strict std.testing mechanisms
     const test_exe = b.addTest(.{
-        .name = "ghost_engine_tests",
+        .name = "siege_engine_tests",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/network_core.zig"),
             .target = target,
@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
 
     // Run with sudo — NOPASSWD configured in /etc/sudoers.d/ghost-engine
     // Required for raw sockets (SOCK_RAW) and iptables (RST suppression)
-    const exe_path = b.pathFromRoot("zig-out/bin/ghost_engine");
+    const exe_path = b.pathFromRoot("zig-out/bin/siege_engine");
     const run_cmd = b.addSystemCommand(&.{
         "sudo",
         exe_path,
@@ -92,7 +92,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArg("enp37s0");
     }
 
-    const run_step = b.step("run", "Run the ghost engine");
+    const run_step = b.step("run", "Run the siege engine");
     run_step.dependOn(&run_cmd.step);
 
     // Convenience: zig build run -- <interface>

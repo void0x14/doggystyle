@@ -205,7 +205,7 @@ pub const is_macos = builtin.os.tag == .macos; // not supported, but fallback
 
 comptime {
     if (!is_linux and !is_windows) {
-        @compileError("Ghost Engine only supports Linux (CachyOS) and Windows 11");
+        @compileError("Siege Engine only supports Linux (CachyOS) and Windows 11");
     }
 }
 
@@ -7090,7 +7090,6 @@ test "FAZ 6.8.2: BDA payload verification" {
     try std.testing.expectEqualStrings(original_json, decrypted);
 }
 
-
 // =============================================================================
 // MODULE 3.3: Onboarding Bypass & Session Persistence
 // SOURCE: RFC 7230, Section 3 - HTTP Message Format
@@ -7808,7 +7807,7 @@ pub const GitHubHttpClient = struct {
     /// SOURCE: RFC 8446, Section 5.2 — TLS Record Encryption
     /// SOURCE: linux/net/ipv4/tcp.c — TCP data transmission via raw socket
     ///
-    /// WIRING: This function replaces the HTTP/1.1 placeholder with actual Ghost Engine stack:
+    /// WIRING: This function replaces the HTTP/1.1 placeholder with actual Siege Engine stack:
     ///   a) Client connection preface
     ///   b) Initial SETTINGS
     ///   c) Server SETTINGS wait + ACK
