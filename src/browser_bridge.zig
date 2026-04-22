@@ -93,9 +93,6 @@ pub const MAX_BRIDGE_SCRIPT_SIZE: usize = 32768;
 /// Maximum buffer size for fingerprint_diagnostic.js source file
 pub const MAX_DIAGNOSTIC_JS_SIZE: usize = 65536;
 
-/// Maximum buffer size for stealth_evasion.js source file
-pub const MAX_STEALTH_SCRIPT_SIZE: usize = 16384;
-
 /// WebSocket opcodes
 /// SOURCE: RFC 6455, Section 5.2 — Base Framing Protocol
 const WS_OPCODE_TEXT: u8 = 0x01;
@@ -882,22 +879,6 @@ fn readBrowserSessionBridgeScript(buf: []u8) ![]u8 {
     return buf[0..total];
 }
 
-/// Read stealth_evasion.js source file from disk
-/// SOURCE: src/stealth_evasion.js — WebGL monkey-patch + chrome.runtime emulation
-fn readStealthEvasionScript(buf: []u8) ![]u8 {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, "src/stealth_evasion.js", .{ .ACCMODE = .RDONLY }, 0) catch
-        return error.ReadFailed;
-    defer _ = std.c.close(fd);
-
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = std.posix.read(fd, buf[total..]) catch return error.ReadFailed;
-        if (n == 0) break;
-        total += n;
-    }
-    return buf[0..total];
-}
-
 fn sanitizeTraceLabel(label: []const u8, buf: []u8) []const u8 {
     var len: usize = 0;
     for (label) |ch| {
@@ -1138,10 +1119,6 @@ pub const HarvestResult = struct {
 /// Fingerprint diagnostic data structure containing 25+ Arkose BDA signals
 /// NOTE: NOT a packed struct — contains variable-length string slices
 pub const FingerprintDiagnostic = struct {
-    stealth_script_loaded: bool,
-    stealth_errors: []const u8,
-    webgl_patched: bool,
-    chrome_runtime_emulated: bool,
     navigator_webdriver: ?bool,
     window_chrome_exists: bool,
     chrome_runtime_connect: bool,
@@ -1200,7 +1177,6 @@ pub const FingerprintDiagnostic = struct {
         allocator.free(self.notification_permission);
         allocator.free(self.permissions_notifications);
         allocator.free(self.permissions_geolocation);
-        allocator.free(self.stealth_errors);
         allocator.free(self.audio_context);
         allocator.free(self.fonts_list);
         allocator.free(self.webgl_extensions);
@@ -1221,6 +1197,7 @@ pub const FingerprintDiagnostic = struct {
         std.debug.assert(@hasField(@This(), "window_chrome_exists"));
         std.debug.assert(@hasField(@This(), "chrome_runtime_connect"));
         std.debug.assert(@hasField(@This(), "chrome_runtime_sendMessage"));
+        std.debug.assert(@hasField(@This(), "navigator_plugins_length"));
         std.debug.assert(@hasField(@This(), "navigator_plugins_length"));
         std.debug.assert(@hasField(@This(), "navigator_plugins_names"));
         std.debug.assert(@hasField(@This(), "navigator_languages"));
@@ -1401,17 +1378,7 @@ pub const BrowserBridge = struct {
             std.debug.print("[BRIDGE] ⚠️ Network.enable failed: {} — network events won't be logged\n", .{err});
         };
 
-        // STEP 1: Inject stealth script FIRST (runs before any page JS)
-        // SOURCE: scrapfly.io — stealth script must execute before Arkose enforcement.js
-        // The stealth script patches WebGL getParameter and emulates chrome.runtime
-        var stealth_script_buf: [MAX_STEALTH_SCRIPT_SIZE]u8 = undefined;
-        const stealth_script = readStealthEvasionScript(&stealth_script_buf) catch return BridgeError.ReadFailed;
-        bridge.cdp.addScriptOnNewDocument(stealth_script) catch |err| {
-            std.debug.print("[BRIDGE] stealth script addScriptOnNewDocument failed: {}\n", .{err});
-            // Non-fatal: continue without stealth (will be detected but functional)
-        };
-
-        // STEP 2: Inject bridge script (runs after stealth script)
+        // STEP 1: Inject bridge script (runs on new documents)
         var bridge_script_buf: [MAX_BRIDGE_SCRIPT_SIZE]u8 = undefined;
         const bridge_script = readBrowserSessionBridgeScript(&bridge_script_buf) catch return BridgeError.ReadFailed;
         _ = blk: {
@@ -1545,19 +1512,6 @@ pub const BrowserBridge = struct {
     /// SOURCE: PRD Diagnostic Signal Specification (prd.md)
     /// SOURCE: CDP Runtime.evaluate — execute JavaScript in page context
     pub fn collectFingerprint(self: *BrowserBridge) BridgeError!FingerprintDiagnostic {
-        // Step 0: Inject stealth script into CURRENT page (it was only registered for NEW documents)
-        var stealth_buf: [MAX_STEALTH_SCRIPT_SIZE]u8 = undefined;
-        const stealth_js = readStealthEvasionScript(&stealth_buf) catch |err| {
-            std.debug.print("[BRIDGE] Failed to read stealth_evasion.js: {}\n", .{err});
-            return BridgeError.ReadFailed;
-        };
-        const stealth_result = self.cdp.evaluate(stealth_js) catch |err| blk: {
-            std.debug.print("[BRIDGE] Failed to inject stealth script into current page: {}\n", .{err});
-            // Non-fatal: continue without stealth
-            break :blk &[0]u8{};
-        };
-        defer self.allocator.free(stealth_result);
-
         // Step 1: Read diagnostic JS source
         var diagnostic_buf: [MAX_DIAGNOSTIC_JS_SIZE]u8 = undefined;
         const diagnostic_js = readFingerprintDiagnostic(&diagnostic_buf) catch |err| {
@@ -1603,8 +1557,7 @@ pub const BrowserBridge = struct {
         diagnostic.language = self.allocator.dupe(u8, diagnostic.language) catch return BridgeError.OutOfMemory;
         diagnostic.notification_permission = self.allocator.dupe(u8, diagnostic.notification_permission) catch return BridgeError.OutOfMemory;
         diagnostic.permissions_notifications = self.allocator.dupe(u8, diagnostic.permissions_notifications) catch return BridgeError.OutOfMemory;
-        diagnostic.permissions_geolocation = self.allocator.dupe(u8, diagnostic.permissions_geolocation) catch return BridgeError.OutOfMemory;
-        diagnostic.stealth_errors = self.allocator.dupe(u8, diagnostic.stealth_errors) catch return BridgeError.OutOfMemory;
+        diagnostic.navigator_plugins_names = self.allocator.dupe(u8, diagnostic.navigator_plugins_names) catch return BridgeError.OutOfMemory;
         diagnostic.sourceurl_leak = parsed.value.sourceurl_leak;
         diagnostic.history_length = parsed.value.history_length;
         diagnostic.touch_support = parsed.value.touch_support;
@@ -3372,7 +3325,7 @@ test "FingerprintDiagnostic: round-trip JSON parsing with all 25 fields" {
     // Mock CDP response with all fields populated (including new fields)
     // NOTE: navigator_plugins_names and navigator_languages are JSON strings (arrays stringified)
     const mock_cdp_response =
-        \\{"id":1,"result":{"result":{"type":"string","value":"{\"stealth_script_loaded\":true,\"stealth_errors\":\"[]\",\"webgl_patched\":true,\"chrome_runtime_emulated\":true,\"navigator_webdriver\":false,\"window_chrome_exists\":true,\"chrome_runtime_connect\":true,\"chrome_runtime_sendMessage\":true,\"navigator_plugins_length\":3,\"navigator_plugins_names\":\"[\\\"Chrome PDF Plugin\\\",\\\"Chrome PDF Viewer\\\",\\\"Native Client\\\"]\",\"navigator_languages\":\"[\\\"en-US\\\",\\\"en\\\"]\",\"navigator_platform\":\"Linux x86_64\",\"navigator_userAgent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\",\"screen_width\":1920,\"screen_height\":1080,\"screen_inner_width\":1920,\"screen_inner_height\":1040,\"screen_avail_width\":1920,\"screen_avail_height\":1040,\"navigator_hardware_concurrency\":8,\"navigator_device_memory\":4,\"webgl_vendor\":\"\",\"webgl_renderer\":\"\",\"canvas_hash\":\"a1b2c3d4e5f6g7h8\",\"timezone_offset\":-180,\"language\":\"en-US\",\"notification_permission\":\"default\",\"permissions_notifications\":\"query_supported\",\"permissions_geolocation\":\"query_supported\",\"cdp_runtime_enable_side_effect\":false,\"iframe_contentWindow_exists\":true,\"console_debug_side_effects\":false,\"sourceurl_leak\":false}"}}}
+        \\{"id":1,"result":{"result":{"type":"string","value":"{\\"navigator_webdriver\\":false,\\"window_chrome_exists\\":true,\\"chrome_runtime_connect\\":true,\\"chrome_runtime_sendMessage\\":true,\\"navigator_plugins_length\\":3,\\"navigator_plugins_names\\":\\"[\\\\\\"Chrome PDF Plugin\\\\\\",\\\\\\"Chrome PDF Viewer\\\\\\",\\\\\\"Native Client\\\\\\"]\\",\\"navigator_languages\\":\\"[\\\\\\"en-US\\\\\\",\\\\\\"en\\\\\\"]\\",\\"navigator_platform\\":\\"Linux x86_64\\",\\"navigator_userAgent\\":\\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\\",\\"screen_width\\":1920,\\"screen_height\\":1080,\\"screen_inner_width\\":1920,\\"screen_inner_height\\":1040,\\"screen_avail_width\\":1920,\\"screen_avail_height\\":1040,\\"navigator_hardware_concurrency\\":8,\\"navigator_device_memory\\":4,\\"webgl_vendor\\":\\"\\",\\"webgl_renderer\\":\\"\\",\\"canvas_hash\\":\\"a1b2c3d4e5f6g7h8\\",\\"timezone_offset\\":-180,\\"language\\":\\"en-US\\",\\"notification_permission\\":\\"default\\",\\"permissions_notifications\\":\\"query_supported\\",\\"permissions_geolocation\\":\\"query_supported\\",\\"cdp_runtime_enable_side_effect\\":false,\\"iframe_contentWindow_exists\\":true,\\"console_debug_side_effects\\":false,\\"sourceurl_leak\\":false}"}}}
     ;
 
     // Extract inner JSON from CDP response
@@ -3385,12 +3338,8 @@ test "FingerprintDiagnostic: round-trip JSON parsing with all 25 fields" {
     });
     defer parsed.deinit();
 
-    // Verify all 29 fields are present and correct
+    // Verify all fields are present and correct
     const diag = parsed.value;
-    try std.testing.expect(diag.stealth_script_loaded == true);
-    try std.testing.expectEqualStrings("[]", diag.stealth_errors);
-    try std.testing.expect(diag.webgl_patched == true);
-    try std.testing.expect(diag.chrome_runtime_emulated == true);
     try std.testing.expect(diag.navigator_webdriver == false);
     try std.testing.expect(diag.window_chrome_exists == true);
     try std.testing.expect(diag.chrome_runtime_connect == true);
@@ -3457,15 +3406,7 @@ pub fn writeFingerprintNDJSON(
     try line_buf.appendSlice(allocator, ts_len);
     try line_buf.appendSlice(allocator, ",\"tag\":\"");
     try line_buf.appendSlice(allocator, tag);
-    try line_buf.appendSlice(allocator, "\",\"stealth_script_loaded\":");
-    try line_buf.appendSlice(allocator, fmtBool(diagnostic.stealth_script_loaded));
-    try line_buf.appendSlice(allocator, ",\"stealth_errors\":");
-    try line_buf.appendSlice(allocator, diagnostic.stealth_errors);
-    try line_buf.appendSlice(allocator, ",\"webgl_patched\":");
-    try line_buf.appendSlice(allocator, fmtBool(diagnostic.webgl_patched));
-    try line_buf.appendSlice(allocator, ",\"chrome_runtime_emulated\":");
-    try line_buf.appendSlice(allocator, fmtBool(diagnostic.chrome_runtime_emulated));
-    try line_buf.appendSlice(allocator, ",\"navigator_webdriver\":");
+    try line_buf.appendSlice(allocator, "\",\"navigator_webdriver\":");
     try line_buf.appendSlice(allocator, fmtBoolOptional(diagnostic.navigator_webdriver));
     try line_buf.appendSlice(allocator, ",\"window_chrome_exists\":");
     try line_buf.appendSlice(allocator, fmtBool(diagnostic.window_chrome_exists));

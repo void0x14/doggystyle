@@ -1,5 +1,5 @@
 #!/bin/bash
-# Ghost Engine Verification Script - ZERO DEPENDENCY / ZERO INTERVENTION
+# Siege Engine Verification Script - ZERO DEPENDENCY / ZERO INTERVENTION
 # Compiles, configures iptables, runs the engine, validates output, cleans up.
 #
 # Exit codes: 0 = overall success, 1 = failure
@@ -17,8 +17,8 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-ENGINE_OUTPUT=$(mktemp /tmp/ghost_engine_output.XXXXXX)
-BUILD_LOG=$(mktemp /tmp/ghost_build.XXXXXX)
+ENGINE_OUTPUT=$(mktemp /tmp/siege_engine_output.XXXXXX)
+BUILD_LOG=$(mktemp /tmp/siege_build.XXXXXX)
 
 cleanup() {
     rm -f "$ENGINE_OUTPUT" "$BUILD_LOG"
@@ -31,10 +31,10 @@ log_warn() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 
 # ---- Phase 1: Build ----
-echo -e "${BLUE}[*] Ghost Engine Zero-Dependency Verification${NC}"
+echo -e "${BLUE}[*] Siege Engine Zero-Dependency Verification${NC}"
 echo -e "${BLUE}[*] Target: $TARGET:$PORT${NC}"
 echo -e "${BLUE}[*] Zig Version: $(./vendor/zig/zig version 2>&1)${NC}"
-echo -e "${BLUE}[*] Building Ghost Engine...${NC}"
+echo -e "${BLUE}[*] Building Siege Engine...${NC}"
 
 if ! ./vendor/zig/zig build 2>&1 | tee "$BUILD_LOG"; then
     log_fail "Build failed"
@@ -44,7 +44,7 @@ fi
 log_ok "Build completed"
 
 # ---- Phase 2: Run ----
-echo -e "${BLUE}[*] Launching Ghost Engine (timeout ${TIMEOUT}s)...${NC}"
+echo -e "${BLUE}[*] Launching Siege Engine (timeout ${TIMEOUT}s)...${NC}"
 echo -e "${YELLOW}[!] Requires root for raw socket access${NC}"
 
 # Pre-authenticate sudo on the real TTY so password prompt works correctly.
@@ -56,7 +56,7 @@ if ! sudo -v 2>/dev/tty; then
 fi
 
 # Run with timeout; capture combined stdout+stderr
-timeout $TIMEOUT sudo ./zig-out/bin/ghost_engine "$TARGET" "$PORT" >"$ENGINE_OUTPUT" 2>&1 || true
+timeout $TIMEOUT sudo ./zig-out/bin/siege_engine "$TARGET" "$PORT" >"$ENGINE_OUTPUT" 2>&1 || true
 
 # ---- Phase 3: Validate ----
 echo -e "${BLUE}[*] Analyzing output...${NC}"
@@ -174,7 +174,7 @@ echo -e "${BLUE}    Handshake stages completed: $STAGES/5${NC}"
 
 if [ $RESULT -eq 0 ]; then
     if [ $STAGES -ge 4 ]; then
-        echo -e "${GREEN}[OVERALL SUCCESS] Ghost Engine Surgical Integrity Verified${NC}"
+        echo -e "${GREEN}[OVERALL SUCCESS] Siege Engine Surgical Integrity Verified${NC}"
     elif [ $STAGES -ge 2 ]; then
         echo -e "${YELLOW}[PARTIAL SUCCESS] Core functionality verified, handshake incomplete${NC}"
     else

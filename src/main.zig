@@ -100,7 +100,7 @@ fn refreshGitHubTransport(
     std.debug.print("[GITHUB] Transport refresh complete; HTTP/2 state reset\n", .{});
 }
 
-/// Ghost Engine — Master Orchestrator (PRODUCTION)
+/// Siege Engine — Master Orchestrator (PRODUCTION)
 ///
 /// Bu dosya tüm modülleri kronolojik sırada birleştirir:
 ///   1. Jitter Engine Initialization
@@ -112,10 +112,10 @@ fn refreshGitHubTransport(
 ///   7. Safe Shutdown + Resource Cleanup
 ///
 /// KULLANIM:
-///   sudo ./zig-out/bin/ghost_engine <interface>
+///   sudo ./zig-out/bin/siege_engine <interface>
 ///
 /// ÖRNEK:
-///   sudo ./zig-out/bin/ghost_engine enp37s0
+///   sudo ./zig-out/bin/siege_engine enp37s0
 ///
 /// NOT: Raw socket için root yetkisi gereklidir.
 pub fn main(init: std.process.Init) !void {
@@ -130,8 +130,8 @@ pub fn main(init: std.process.Init) !void {
     _ = args_iter.skip(); // argv[0]
 
     const iface_name = args_iter.next() orelse {
-        std.debug.print("KULLANIM: sudo ./zig-out/bin/ghost_engine <interface>\n", .{});
-        std.debug.print("ÖRNEK:  sudo ./zig-out/bin/ghost_engine enp37s0\n", .{});
+        std.debug.print("KULLANIM: sudo ./zig-out/bin/siege_engine <interface>\n", .{});
+        std.debug.print("ÖRNEK:  sudo ./zig-out/bin/siege_engine enp37s0\n", .{});
         std.process.exit(1);
     };
 
@@ -149,11 +149,11 @@ pub fn main(init: std.process.Init) !void {
     // =========================================================================
     std.debug.print("\n", .{});
     std.debug.print("╔══════════════════════════════════════════════════════════╗\n", .{});
-    std.debug.print("║           GHOST ENGINE — PRODUCTION MODE                ║\n", .{});
+    std.debug.print("║           SIEGE ENGINE — PRODUCTION MODE                ║\n", .{});
     std.debug.print("╚══════════════════════════════════════════════════════════╝\n", .{});
     std.debug.print("\n", .{});
 
-    std.debug.print("[INIT] Booting Ghost Engine...\n", .{});
+    std.debug.print("[INIT] Booting Siege Engine...\n", .{});
     try jitter.JitterEngine.initJitterEngine();
     std.debug.print("[JITTER] Engine initialized (monotonic + getrandom)\n", .{});
 
@@ -727,6 +727,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("\n[SHUTDOWN] Initiating safe shutdown...\n", .{});
     std.debug.print("[SHUTDOWN] Firewall cleanup (defer removeRstSuppression)...\n", .{});
     std.debug.print("[SHUTDOWN] Socket cleanup (defer sock.deinit)...\n", .{});
-    std.debug.print("[SHUTDOWN] Ghost Engine shutdown complete.\n", .{});
+    std.debug.print("[SHUTDOWN] Siege Engine shutdown complete.\n", .{});
     std.debug.print("\n", .{});
 }

@@ -20,18 +20,6 @@
 
   // === CDP/Automation Detection Signals ===
 
-  collect('stealth_script_loaded', function() {
-    return !!window.__stealth_loaded;
-  });
-
-  collect('stealth_errors', function() {
-    return JSON.stringify(window.__stealth_errors || []);
-  });
-
-  collect('chrome_runtime_emulated', function() {
-    return !!window.__chrome_runtime_emulated;
-  });
-
   collect('navigator_webdriver', function() {
     return navigator.webdriver;
   });
