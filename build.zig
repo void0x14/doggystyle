@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
     test_exe.root_module.linkSystemLibrary("c", .{});
 
     const test_step = b.step("test", "Run rigorous unit and fuzz tests");
-    // FIX: Use vendor Zig binary (0.16.0-dev.3132) instead of system Zig.
+    // FIX: Use vendor Zig binary (0.16.0-dev.3135) instead of system Zig.
     // addRunArtifact on test binaries in Zig 0.16-dev injects --listen=- which causes
     // the test runner to hang waiting for IPC on stdin/stdout.
     const vendor_zig = b.pathFromRoot("vendor/zig/zig");
