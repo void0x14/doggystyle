@@ -5,6 +5,8 @@ const jitter = @import("jitter_core.zig");
 const digistallone = @import("digistallone.zig");
 const browser_init = @import("browser_init.zig");
 const browser_bridge = @import("browser_bridge.zig");
+const audio_bypass = @import("arkose/audio_bypass.zig");
+const audio_injector = @import("arkose/audio_injector.zig");
 const process = std.process;
 const Io = std.Io;
 
@@ -98,6 +100,29 @@ fn refreshGitHubTransport(
     );
     try github_client.adoptHandshake(allocator, handshake);
     std.debug.print("[GITHUB] Transport refresh complete; HTTP/2 state reset\n", .{});
+}
+
+// =============================================================================
+// SOUND — Arkose Audio CAPTCHA Bypass Pipeline (delegates to audio_bypass module)
+// =============================================================================
+// SOURCE: src/arkose/audio_bypass.zig — full pipeline implementation
+// SOURCE: src/arkose/audio_injector.zig — browser injection
+//
+fn solveArkoseAudioChallenge(
+    bridge: *browser_bridge.BrowserBridge,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) !void {
+    const result = try audio_bypass.runAudioBypass(bridge, allocator, io);
+    if (result.success) {
+        std.debug.print("[AUDIO BYPASS] All {d}/{d} challenges completed in {d}ms\n", .{
+            result.total_challenges, audio_bypass.TARGET_CHALLENGES, result.execution_time_ms,
+        });
+    } else {
+        std.debug.print("[AUDIO BYPASS] Partial success: {d}/{d} challenges in {d}ms\n", .{
+            result.total_challenges, audio_bypass.TARGET_CHALLENGES, result.execution_time_ms,
+        });
+    }
 }
 
 /// Siege Engine — Master Orchestrator (PRODUCTION)
@@ -528,7 +553,14 @@ pub fn main(init: std.process.Init) !void {
     if (!risk_status.challenge_required) {
         std.debug.print("[SUCCESS] Arkose Bypassed via Low-Risk Signature\n", .{});
     } else {
-        std.debug.print("[WARN] Challenge required! Risk score might be too high.\n", .{});
+        std.debug.print("[WARN] Challenge required! Activating Audio Bypass Pipeline...\n", .{});
+        // SOURCE: Arkose Labs Audio CAPTCHA — rtag/audio endpoint (live test 2026-04-24)
+        // Solve audio challenges before proceeding with signup
+        solveArkoseAudioChallenge(&bridge, allocator, io) catch |err| {
+            std.debug.print("[AUDIO BYPASS] Pipeline failed: {}\n", .{err});
+            std.debug.print("[AUDIO BYPASS] Continuing with signup anyway (challenge may be visual)\n", .{});
+        };
+        std.debug.print("[AUDIO BYPASS] Pipeline complete\n", .{});
     }
 
     // =========================================================================

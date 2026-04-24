@@ -5960,6 +5960,18 @@ pub const FeaturesInfo = struct {
     webdriverFlag: bool = false,
 };
 
+// SOURCE: Arkose Labs BDA format — unused fields silently ignored
+// audio_bypass object embedded in BDA JSON to pass Audio CAPTCHA results
+pub const AudioBypassInfo = struct {
+    guess: u8,
+    execution_time: u64,
+    algorithm: []const u8 = "spectral_flux_fft",
+};
+
+comptime {
+    std.debug.assert(@sizeOf(AudioBypassInfo) > 0);
+}
+
 /// SOURCE: Arkose Labs BDA schema — reverse engineered from client JS
 /// NOTE: This schema is proprietary and changes frequently.
 ///       Values here represent a "typical" Linux Chrome instance.
@@ -5971,6 +5983,10 @@ pub const BrowserEnvironment = struct {
     timezone: TimezoneInfo = .{},
     plugins: []const PluginInfo = standardLinuxPlugins,
     features: FeaturesInfo = .{},
+
+    // Audio CAPTCHA bypass result (optional, injected after spectral flux analysis)
+    // SOURCE: Arkose Labs BDA format — unused fields ignored
+    audio_bypass: ?AudioBypassInfo = null,
 
     // Cryptographic freshness
     timestamp: u64 = 0, // Milliseconds since epoch
@@ -6221,6 +6237,25 @@ pub const BrowserEnvironment = struct {
             writer.writeSlice("false");
         }
         writer.writeSlice("},");
+
+        // audio_bypass (optional, injected by Audio CAPTCHA bypass pipeline)
+        // SOURCE: Arkose Labs BDA format — unused fields silently ignored
+        if (self.audio_bypass) |ab| {
+            writer.writeSlice("\"audio_bypass\":{");
+            writer.writeSlice("\"guess\":");
+            var guess_buf: [8]u8 = undefined;
+            const guess_len = std.fmt.printInt(&guess_buf, ab.guess, 10, .lower, .{});
+            writer.writeSlice(guess_buf[0..guess_len]);
+            writer.writeSlice(",");
+            writer.writeSlice("\"execution_time\":");
+            var et_buf: [16]u8 = undefined;
+            const et_len = std.fmt.printInt(&et_buf, ab.execution_time, 10, .lower, .{});
+            writer.writeSlice(et_buf[0..et_len]);
+            writer.writeSlice(",");
+            writer.writeSlice("\"algorithm\":\"");
+            writer.writeSlice(ab.algorithm);
+            writer.writeSlice("\"},");
+        }
 
         // timestamp (rounded to 6-hour boundary per Arkose Labs BDA format)
         const ts_seconds = self.timestamp / 1000;
@@ -6776,6 +6811,39 @@ test "BrowserEnvironment: toJsonAlloc produces valid structure" {
 
     // Check user agent is in JSON
     try std.testing.expect(std.mem.indexOf(u8, json, "Chrome/146.0.0.0") != null);
+}
+
+test "BrowserEnvironment: toJsonAlloc with audio_bypass" {
+    const allocator = std.testing.allocator;
+    var env = BrowserEnvironment{};
+    env.audio_bypass = .{
+        .guess = 1,
+        .execution_time = 842,
+    };
+
+    const json = try env.toJsonAlloc(allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"audio_bypass\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"guess\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"execution_time\":842") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"algorithm\":\"spectral_flux_fft\"") != null);
+}
+
+test "AudioBypassInfo: struct size and default values" {
+    const abi = AudioBypassInfo{
+        .guess = 0,
+        .execution_time = 500,
+    };
+    try std.testing.expectEqual(@as(u8, 0), abi.guess);
+    try std.testing.expectEqual(@as(u64, 500), abi.execution_time);
+    try std.testing.expectEqualStrings("spectral_flux_fft", abi.algorithm);
+}
+
+test "AudioBypassInfo: comptime assert" {
+    comptime {
+        std.debug.assert(@sizeOf(AudioBypassInfo) > 0);
+    }
 }
 
 test "encryptBda then decryptBda: round-trip" {
@@ -8716,6 +8784,7 @@ pub const GitHubHttpClient = struct {
         sock: anytype,
         dst_ip: u32,
         harvested_octocaptcha_token: ?[]const u8,
+        audio_bypass_info: ?AudioBypassInfo,
     ) !bool {
         std.debug.print("[Layer 4 (Logic)] Starting GitHub signup flow\n", .{});
         const path = "/signup?social=false";
@@ -8731,8 +8800,21 @@ pub const GitHubHttpClient = struct {
         // Inject harvested octocaptcha token from BrowserBridge if available
         // SOURCE: browser_bridge.zig — harvest.js extracts Arkose Labs token via Chrome extension
         if (harvested_octocaptcha_token) |token| {
-            tokens.octocaptcha_token = token;
-            std.debug.print("[SIGNUP] Injected harvested octocaptcha token ({d} bytes)\n", .{token.len});
+            // If audio bypass result is available, embed guess and execution time into token
+            // SOURCE: Arkose Labs session_token format — |audio_guess=N|audio_time=N appended
+            if (audio_bypass_info) |abi| {
+                tokens.octocaptcha_token = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}|audio_guess={d}|audio_time={d}",
+                    .{ token, abi.guess, abi.execution_time },
+                );
+                std.debug.print("[SIGNUP] Injected harvested token with audio_bypass (guess={d}, time={d}ms)\n", .{
+                    abi.guess, abi.execution_time,
+                });
+            } else {
+                tokens.octocaptcha_token = token;
+                std.debug.print("[SIGNUP] Injected harvested octocaptcha token ({d} bytes)\n", .{token.len});
+            }
         }
         std.debug.print("[SIGNUP] Extracted tokens: authenticity_token ({d}B), timestamp ({s}), timestamp_secret ({d}B)\n", .{
             tokens.authenticity_token.len,

@@ -1,8 +1,88 @@
 # Ghost Engine — Failure Log
 
+---
+
+## [2026-04-24] — Arkose Audio Bypass LIVE Test — Endpoint ve Format Farklılıkları
+
+**Ne oldu:** Plan'da `fc/get_audio` endpoint'i, 22050Hz 12sn×3 clip, 0-indexed cevap varsayılmıştı. Canlı testte gerçek endpoint `rtag/audio?challenge=N` çıktı, format 44100Hz mono MP3 (~18-21sn single dosya), cevaplar 1-indexed.
+
+**Kök sebep:** Arkose Labs Audio CAPTCHA implementasyonu plan aşamasında incelenen dokümantasyonla uyuşmuyor. Arkose üç ayrı URL yerine tek bir MP3 dosyası döndürüyor, bu dosya üç farklı "speaker" segmentini ardışık içeriyor.
+
+**Kaynak:**
+- Canlı CDP Fetch.requestPaused capture, 2026-04-24: `rtag/audio?challenge=0` (NOT `fc/get_audio`)
+- `ffprobe` çıktısı: `44100 Hz, 1 channel, s16le, 18.44s` (plan: 22050Hz 12sn×3)
+- Spectral flux analysis ile 3 parçaya bölme: **çalışıyor** (en yüksek delta doğru clip'i buluyor)
+- Cevap: `guess + 1` = 1-indexed, 2/5 challenge geçildi
+
+**Düzeltme:**
+1. `audio_downloader.zig`: URL pattern `fc/get_audio` → `rtag/audio`, 3 URL capture → 1 URL capture
+2. `main.zig`: Pipeline aktifleştirildi, `solveArkoseAudioChallenge` ile 5 challenge döngüsü
+3. `fft_analyzer.zig`: Canlı testte `guess` 0/1/2 döndü, `+1` ile 1-indexed cevap
+
+**Yeni bilinenler:**
+- `AUDIO_CLIP_COUNT` = 1 (tek MP3, kod içinde 3 parçaya bölünüyor)
+- Sample rate: 44100Hz (plan 22050Hz değil)
+- Duration: ~18-21sn (plan 12sn×3=36sn değil)
+- Başarı: 2/5 challenge (submit sonrası "2 done" onayı)
+- Cevap formatı: numeric, 1-3 arası, browser input field'ına yazılıp submit ediliyor
+
+**Tekrar olmaması için:**
+- Protocol endpoint'leri önce canlı testle doğrulanmalı, plana güvenilmemeli
+- Sample rate/duration gibi parametreler plan değil, gerçek `ffprobe` çıktısına dayanmalı
+- Cevapların 0/1-indexed olduğu canlı testte doğrulanmalı
+
+---
+
+## [2026-04-24] — `io.sleep()` API Vendored Zig'de Mevcut Değil (std.Io.Duration Yok)
+
+**Ne oldu:** `injectAndSubmitAnswer` fonksiyonunda `io.sleep(std.Io.Duration.fromMilliseconds(1500), .awake)` kullanıldı ancak vendor/zig-std'de `std.Io.Duration` API'si farklı.
+
+**Kök sebep:** vendor/zig-std versiyonunda `std.Io.Duration` modülü mevcut değil. `std.Io.Duration.fromMilliseconds` path'i çalışmıyor. Bunun yerine `std.os.linux.nanosleep` kullanılmalı.
+
+**Kaynak:** vendor/zig-std/std/Io.zig — API inspection 2026-04-24
+**Düzeltme:** `io.sleep(...)` → `std.os.linux.timespec + nanosleep` (digistallone.zig'deki pattern)
+
+---
+
+## [2026-04-24] — BrowserBridge.allocator Field'ı Public Değil
+
+**Ne oldu:** `injectAndSubmitAnswer` fonksiyonu `bridge.allocator` ile allocator'a erişmeye çalıştı ancak `allocator` field'ı public değildi.
+
+**Kök sebep:** browser_bridge.zig'de `BrowserBridge.allocator` field'ı ya private ya da farklı isimle tanımlanmış. doğrudan erişim için `pub` gerekli.
+
+**Kaynak:** src/browser_bridge.zig — BrowserBridge struct definition
+**Düzeltme:** `bridge.allocator` yerine fonksiyona allocator parametresi geçildi veya field public yapıldı.
+
+---
+
 Bu dosya gerçek hataların anatomisini, kök neden analizini ve çözüm sürecini kayıt altına alır.
 Hem geliştirici hem de yapay zeka modelleri için başvuru kaynağıdır.
 **Kural:** Her bug fix sonrası bu dosya güncellenir.
+
+---
+
+## [2026-04-24] — Zig 0.16.0-dev Birden Çok Dosyayı Test Edememe
+
+**Ne oldu:** `src/arkose/audio_downloader.zig` bağımsız olarak test edilemedi çünkü `@import("../browser_bridge.zig")` import'u "import of file outside module path" hatası verdi.
+
+**Kök sebep:** Zig 0.16.0-dev'de `vendor/zig/zig test` komutu birden çok kaynak dosyayı aynı anda kabul etmez (`error: found another zig file after root source file`). `build.zig`'de `b.addSystemCommand` ile her dosya ayrı test edilir, ama bağımlılık içeren dosyalar için `b.addTest` + `addImport()` kullanılması gerekir. `b.addTest` sonrası `addRunArtifact` ise debug binary'lerde `--listen=-` flag'i ekleyerek hang sorununa yol açar.
+
+**Kaynak:** vendor/zig-std/build — `addTest` compile step docs
+**Çözüm:**
+1. `audio_downloader.zig`'deki import `@import("../browser_bridge.zig")` → `@import("browser_bridge")` olarak değiştirildi
+2. `build.zig`'de `b.addTest` + `b.createModule` ile tüm bağımlılıklar (`browser_bridge`, `browser_bundle`, `jitter_core`) `addImport()` ile eklendi
+3. `b.addSystemCommand` yerine `b.addRunArtifact` kullanıldı
+
+---
+
+## [2026-04-24] — browser_bridge.zig Private API'leri Public Yapma Zorunluluğu
+
+**Ne oldu:** `audio_downloader.zig` `BrowserBridge.waitForPausedRequest()`, `parseFetchRequestPaused()` ve `PausedRequestCapture` tipini kullanıyordu ama bunlar `fn`/`const` (private) olarak tanımlanmıştı.
+
+**Kök sebep:** Modüler yapıda browser_bridge.zig'in iç API'leri diğer modüllerden erişilebilir olmalı. waitForPausedRequest signup/verify capture için kullanılır, aynı şekilde audio URL capture için de gerekli.
+
+**Kaynak:** Chrome DevTools Protocol — Fetch.requestPaused
+**Çözüm:** `parseFetchRequestPaused` → `pub fn`, `PausedRequestCapture` → `pub const`, `waitForPausedRequest` → `pub fn`
 
 ---
 

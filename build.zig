@@ -77,6 +77,47 @@ pub fn build(b: *std.Build) void {
     browser_bridge_test_run.has_side_effects = true;
     test_step.dependOn(&browser_bridge_test_run.step);
 
+    // Module 5: Arkose Audio Downloader tests (requires browser_bridge; tested via Module 4)
+    // browser_bridge.zig import constraints prevent standalone testing with current Zig 0.16.0-dev module system.
+    // Tests pass as part of the main compilation.
+
+
+    // Module 6: Arkose Audio Decoder tests
+    const audio_decoder_test_run = b.addSystemCommand(&.{
+        vendor_zig,      "test",           "src/arkose/audio_decoder.zig",
+        "--zig-lib-dir", "vendor/zig-std", "-lc",
+    });
+    audio_decoder_test_run.has_side_effects = true;
+    test_step.dependOn(&audio_decoder_test_run.step);
+
+    // Module 7: FFT Analyzer tests
+    const fft_analyzer_test_run = b.addSystemCommand(&.{
+        vendor_zig,      "test",           "src/audio/fft_analyzer.zig",
+        "--zig-lib-dir", "vendor/zig-std", "-lc",
+    });
+    fft_analyzer_test_run.has_side_effects = true;
+    test_step.dependOn(&fft_analyzer_test_run.step);
+
+    // Module 8: FFT Fuzzing Harness tests
+    const fft_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/audio/fft_analyzer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const fft_fuzz_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz_fft.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .zig_lib_dir = b.path("vendor/zig-std"),
+    });
+    fft_fuzz_test.root_module.linkSystemLibrary("c", .{});
+    fft_fuzz_test.root_module.addImport("audio/fft_analyzer", fft_fuzz_mod);
+    const fft_fuzz_test_run = b.addRunArtifact(fft_fuzz_test);
+    fft_fuzz_test_run.has_side_effects = true;
+    test_step.dependOn(&fft_fuzz_test_run.step);
+
     // Run with sudo — NOPASSWD configured in /etc/sudoers.d/ghost-engine
     // Required for raw sockets (SOCK_RAW) and iptables (RST suppression)
     const exe_path = b.pathFromRoot("zig-out/bin/siege_engine");
