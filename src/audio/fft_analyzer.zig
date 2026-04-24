@@ -110,23 +110,13 @@ fn computeSpectralFlux(allocator: std.mem.Allocator, clip: []const f32, sample_r
     std.debug.assert(std.math.isPowerOfTwo(fft_len));
     const half_bins = fft_len / 2;
 
-    // Footstep frequency band: 1-3 kHz
-    // SOURCE: Ekimov & Sabatier, "Human walking sound spectrum analysis", 2006
-    // SOURCE: NASA SP-7010 — walking footstep dominant frequencies 1-3 kHz
-    const freq_start_hz: f64 = 1000.0;
-    const freq_end_hz: f64 = 3000.0;
-    const nyquist_hz = @as(f64, @floatFromInt(sample_rate)) / 2.0;
-    const use_footstep_band = nyquist_hz >= freq_end_hz;
-    const band_bin_start = if (use_footstep_band)
-        @min(@as(usize, @intFromFloat(@as(f64, @floatFromInt(fft_len)) * freq_start_hz / @as(f64, @floatFromInt(sample_rate)))), half_bins - 1)
-    else
-        0;
-    const band_bin_end = if (use_footstep_band)
-        @min(@as(usize, @intFromFloat(@as(f64, @floatFromInt(fft_len)) * freq_end_hz / @as(f64, @floatFromInt(sample_rate)))), half_bins)
-    else
-        half_bins;
-    const bin_count = band_bin_end - band_bin_start;
-    std.debug.assert(bin_count > 0);
+    const bands = [_]struct { start_hz: f64, end_hz: f64, weight: f64 }{
+        .{ .start_hz = 0.0, .end_hz = 500.0, .weight = 0.15 },
+        .{ .start_hz = 500.0, .end_hz = 2000.0, .weight = 0.35 },
+        .{ .start_hz = 2000.0, .end_hz = 8000.0, .weight = 0.35 },
+        .{ .start_hz = 8000.0, .end_hz = 22000.0, .weight = 0.15 },
+    };
+    const sample_rate_f = @as(f64, @floatFromInt(sample_rate));
 
     const window = try hanningWindow(allocator, fft_window_len);
     defer allocator.free(window);
@@ -134,8 +124,7 @@ fn computeSpectralFlux(allocator: std.mem.Allocator, clip: []const f32, sample_r
     const fft_buf = try allocator.alloc(Complex, fft_len);
     defer allocator.free(fft_buf);
 
-    const mag = try allocator.alloc(f64, bin_count);
-    defer allocator.free(mag);
+    var first_half_energy = [_]f64{0.0} ** bands.len;
 
     // First half: [0, fft_window_len)
     @memset(fft_buf, Complex{ .re = 0.0, .im = 0.0 });
@@ -144,8 +133,15 @@ fn computeSpectralFlux(allocator: std.mem.Allocator, clip: []const f32, sample_r
         fft_buf[i] = Complex{ .re = val * window[i], .im = 0.0 };
     }
     fft(fft_buf);
-    for (0..bin_count) |i| {
-        mag[i] = magnitude(fft_buf[band_bin_start + i]);
+    for (bands, 0..) |band, band_index| {
+        const band_bin_start = @min(@as(usize, @intFromFloat(@as(f64, @floatFromInt(fft_len)) * band.start_hz / sample_rate_f)), half_bins - 1);
+        const band_bin_end = @min(@as(usize, @intFromFloat(@as(f64, @floatFromInt(fft_len)) * band.end_hz / sample_rate_f)), half_bins);
+        const bin_count = band_bin_end - band_bin_start;
+        std.debug.assert(bin_count > 0);
+
+        for (0..bin_count) |i| {
+            first_half_energy[band_index] += magnitude(fft_buf[band_bin_start + i]);
+        }
     }
 
     // Second half: [mid_point, mid_point + fft_window_len)
@@ -156,14 +152,23 @@ fn computeSpectralFlux(allocator: std.mem.Allocator, clip: []const f32, sample_r
     }
     fft(fft_buf);
 
-    var delta: f64 = 0.0;
-    for (0..bin_count) |i| {
-        const m2 = magnitude(fft_buf[band_bin_start + i]);
-        const diff = m2 - mag[i];
-        delta += diff * diff;
+    var total_score: f64 = 0.0;
+    for (bands, 0..) |band, band_index| {
+        const band_bin_start = @min(@as(usize, @intFromFloat(@as(f64, @floatFromInt(fft_len)) * band.start_hz / sample_rate_f)), half_bins - 1);
+        const band_bin_end = @min(@as(usize, @intFromFloat(@as(f64, @floatFromInt(fft_len)) * band.end_hz / sample_rate_f)), half_bins);
+        const bin_count = band_bin_end - band_bin_start;
+        std.debug.assert(bin_count > 0);
+
+        var second_half_energy: f64 = 0.0;
+        for (0..bin_count) |i| {
+            second_half_energy += magnitude(fft_buf[band_bin_start + i]);
+        }
+
+        const delta = @abs(second_half_energy - first_half_energy[band_index]) / (first_half_energy[band_index] + 1e-10);
+        total_score += delta * band.weight;
     }
 
-    return delta;
+    return total_score;
 }
 
 // SOURCE: clock_gettime — man 2 clock_gettime, CLOCK_MONOTONIC
@@ -256,6 +261,25 @@ test "fft_analyzer: spectral flux with identical halves" {
 
     const flux = try computeSpectralFlux(std.testing.allocator, clip, sample_rate);
     try std.testing.expect(flux < 0.01);
+}
+
+test "fft_analyzer: spectral flux includes low frequency band" {
+    const sample_rate: u32 = 44100;
+    const total_samples = sample_rate * 12;
+    const mid = sample_rate * 6;
+    var clip = try std.testing.allocator.alloc(f32, total_samples);
+    defer std.testing.allocator.free(clip);
+
+    for (0..total_samples) |i| {
+        const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(sample_rate));
+        clip[i] = if (i < mid)
+            @as(f32, @floatCast(@sin(2.0 * std.math.pi * 100.0 * t)))
+        else
+            @as(f32, @floatCast(2.0 * @sin(2.0 * std.math.pi * 100.0 * t)));
+    }
+
+    const flux = try computeSpectralFlux(std.testing.allocator, clip, sample_rate);
+    try std.testing.expect(flux > 0.1);
 }
 
 test "fft_analyzer: analyze returns valid guess" {
