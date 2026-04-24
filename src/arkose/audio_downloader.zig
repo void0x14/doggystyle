@@ -21,7 +21,7 @@ const mem = std.mem;
 const ascii = std.ascii;
 const posix = std.posix;
 const crypto = std.crypto;
-const browser_bridge = @import("browser_bridge");
+const browser_bridge = @import("../browser_bridge.zig");
 
 // ---------------------------------------------------------------------------
 // Error Types
