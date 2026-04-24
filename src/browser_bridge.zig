@@ -1557,6 +1557,7 @@ pub const BrowserBridge = struct {
         diagnostic.language = self.allocator.dupe(u8, diagnostic.language) catch return BridgeError.OutOfMemory;
         diagnostic.notification_permission = self.allocator.dupe(u8, diagnostic.notification_permission) catch return BridgeError.OutOfMemory;
         diagnostic.permissions_notifications = self.allocator.dupe(u8, diagnostic.permissions_notifications) catch return BridgeError.OutOfMemory;
+        diagnostic.permissions_geolocation = self.allocator.dupe(u8, diagnostic.permissions_geolocation) catch return BridgeError.OutOfMemory;
         diagnostic.navigator_plugins_names = self.allocator.dupe(u8, diagnostic.navigator_plugins_names) catch return BridgeError.OutOfMemory;
         diagnostic.sourceurl_leak = parsed.value.sourceurl_leak;
         diagnostic.history_length = parsed.value.history_length;

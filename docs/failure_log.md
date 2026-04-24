@@ -2133,3 +2133,27 @@ if (total_len > MTU_LIMIT) {
 3. Harvest edilen `octocaptcha_token` → `performSignup`'a `harvested_octocaptcha_token` parametresi olarak geçirildi
 4. Harvest edilen `_octo` cookie → `github_client.cookie_jar.setOctoCookie()` ile cookie jar'a inject edildi
 5. `performSignup` fonksiyonuna `?[]const u8` parametre eklendi — harvested token varsa `SignupTokens.octocaptcha_token`'a set ediyor
+
+---
+
+## [2026-04-25] — permissions_geolocation SEGFAULT — collectFingerprint() eksik dupe
+
+**Ne oldu:** `writeFingerprintNDJSON()` çağrısında `diagnostic.permissions_geolocation` alanı `appendSlice` ile buffer'a eklenirken SEGFAULT oluştu. `memcpy.zig:170`'de kaynak pointer geçersiz.
+
+**Kök sebep:** `browser_bridge.zig:1549-1560` arası `collectFingerprint()` fonksiyonunda, JSON parse sonucu oluşan struct'ın string alanları `allocator.dupe()` ile kopyalanıyor. Ancak `permissions_geolocation` alanı bu kopyalama listesinden MUAF tutulmuş (copy-paste hatası). `parsed.deinit()` çağrıldığında JSON buffer serbest bırakılıyor, `diagnostic.permissions_geolocation` hala o freed memory'yi işaret ediyor → use-after-free → SEGFAULT.
+
+**Kaynak:**
+- `browser_bridge.zig:1146`: `permissions_geolocation: []const u8` — opsiyonel değil, her zaman değer bekleniyor
+- `browser_bridge.zig:1545`: `defer parsed.deinit()` — JSON buffer'ı free ediyor
+- `browser_bridge.zig:1549-1560`: dupe işlemi — `permissions_geolocation` eksik
+
+**Düzeltme:**
+- `browser_bridge.zig:1560`: `diagnostic.permissions_geolocation = self.allocator.dupe(u8, diagnostic.permissions_geolocation) catch return BridgeError.OutOfMemory;` satırı eklendi
+
+**Doğrulama:**
+- `vendor/zig/zig build` → EXIT_CODE=0
+- `vendor/zig/zig build test` → 222/222 test geçti
+
+**Tekrar olmaması için:**
+- Struct'a yeni `[]const u8` alanı eklenirken, `collectFingerprint()` içindeki dupe listesine de eklenmeli
+- `deinit()` fonksiyonunda free edilen her alan, dupe listesinde de olmalı
