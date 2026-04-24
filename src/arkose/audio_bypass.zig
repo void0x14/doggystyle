@@ -175,7 +175,7 @@ pub fn runAudioBypass(
             flux_result.deltas[0], flux_result.deltas[1], flux_result.deltas[2],
         });
         std.debug.print("[AUDIO BYPASS] Guess (highest delta): {d} -> Answer: {d}\n", .{ flux_result.guess, answer });
-        std.debug.print("[AUDIO BYPASS] Analysis time: {d}ms\n", .{flux_result.execution_time_ms});
+        std.debug.print("[AUDIO BYPASS] Analysis time: {d}us\n", .{flux_result.execution_time_us});
 
         // Step 9: Inject answer into browser and submit
         audio_injector.injectAnswer(bridge, answer) catch |err| {

@@ -1,18 +1,37 @@
 const std = @import("std");
 
+const CLIP_COUNT: usize = 3;
+const MAX_THREAD_SCRATCH_BYTES: usize = std.Thread.SpawnConfig.default_stack_size / 4;
+const MAX_FFT_N: usize = MAX_THREAD_SCRATCH_BYTES / (@sizeOf(f32) * 2);
+
 pub const Complex = struct {
-    re: f64,
-    im: f64,
+    re: f32,
+    im: f32,
 };
 
 pub const SpectralFluxResult = struct {
     guess: u8,
-    execution_time_ms: u64,
-    deltas: [3]f64,
+    execution_time_us: u64,
+    deltas: [CLIP_COUNT]f64,
+};
+
+const ClipAnalysisContext = struct {
+    clip: []const f32,
+    sample_rate: u32,
+    output: *[]f32,
+    delta: *f64,
+    failed: *std.atomic.Value(bool),
+};
+
+const AnalysisError = error{
+    InvalidClip,
+    FftTooLarge,
+    OutputBufferTooSmall,
+    ClipAnalysisFailed,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(Complex) == 16);
+    std.debug.assert(@sizeOf(Complex) == @sizeOf(f32) * 2);
     std.debug.assert(@sizeOf(SpectralFluxResult) > 0);
 }
 
@@ -47,8 +66,8 @@ pub fn fft(buffer: []Complex) void {
             var j: usize = 0;
             while (j < half) : (j += 1) {
                 const angle = -2.0 * std.math.pi *
-                    @as(f64, @floatFromInt(j)) /
-                    @as(f64, @floatFromInt(stage_len));
+                    @as(f32, @floatFromInt(j)) /
+                    @as(f32, @floatFromInt(stage_len));
                 const w_re = std.math.cos(angle);
                 const w_im = std.math.sin(angle);
 
@@ -83,30 +102,52 @@ fn bitReverse(x: usize, numBits: usize) usize {
 
 // SOURCE: Cauchy-Schwarz theorem — Euclidean norm
 pub fn magnitude(comp: Complex) f64 {
-    return @sqrt(comp.re * comp.re + comp.im * comp.im);
+    const re: f64 = @floatCast(comp.re);
+    const im: f64 = @floatCast(comp.im);
+    return @sqrt(re * re + im * im);
 }
 
 // SOURCE: Blackman & Tukey, "The measurement of power spectra", 1958
-fn hanningWindow(allocator: std.mem.Allocator, length: usize) ![]f64 {
-    const window = try allocator.alloc(f64, length);
-    const inv = 1.0 / @as(f64, @floatFromInt(length - 1));
-    for (0..length) |n| {
-        const x = @as(f64, @floatFromInt(n));
-        window[n] = 0.5 * (1.0 - std.math.cos(2.0 * std.math.pi * x * inv));
-    }
-    return window;
+fn hanningWindowValue(index: usize, length: usize) f32 {
+    const inv = 1.0 / @as(f32, @floatFromInt(length - 1));
+    const x = @as(f32, @floatFromInt(index));
+    return 0.5 * (1.0 - std.math.cos(2.0 * std.math.pi * x * inv));
+}
+
+fn fftLenForClip(clip: []const f32, sample_rate: u32) AnalysisError!usize {
+    const total_samples = clip.len;
+    const mid_point = @min(@as(usize, sample_rate) * 6, total_samples / 2);
+    if (mid_point == 0) return error.InvalidClip;
+
+    const second_half_len = total_samples - mid_point;
+    const fft_window_len = @min(mid_point, second_half_len);
+    if (fft_window_len < 2) return error.InvalidClip;
+
+    const fft_len_u64 = std.math.ceilPowerOfTwo(u64, fft_window_len) catch return error.FftTooLarge;
+    const fft_len: usize = @intCast(fft_len_u64);
+    if (fft_len > MAX_FFT_N) return error.FftTooLarge;
+    return fft_len;
+}
+
+fn outputAsComplex(output: []f32, fft_len: usize) AnalysisError![]Complex {
+    const needed = fft_len * 2;
+    if (output.len < needed) return error.OutputBufferTooSmall;
+    const bytes = std.mem.sliceAsBytes(output[0..needed]);
+    return std.mem.bytesAsSlice(Complex, bytes);
 }
 
 // SOURCE: Scheirer & Slaney, "Construction and evaluation of a robust
 // multifeature speech/music discriminator", 1997, IEEE ICASSP
-fn computeSpectralFlux(allocator: std.mem.Allocator, clip: []const f32, sample_rate: u32) !f64 {
+fn computeSpectralFlux(scratch_allocator: std.mem.Allocator, clip: []const f32, sample_rate: u32, output: []f32) AnalysisError!f64 {
     const total_samples = clip.len;
-    const mid_point = @min(sample_rate * 6, total_samples / 2);
-    std.debug.assert(mid_point > 0);
+    const mid_point = @min(@as(usize, sample_rate) * 6, total_samples / 2);
+    if (mid_point == 0) return error.InvalidClip;
+
     const second_half_len = total_samples - mid_point;
     const fft_window_len = @min(mid_point, second_half_len);
+    if (fft_window_len < 2) return error.InvalidClip;
 
-    const fft_len = try std.math.ceilPowerOfTwo(u64, fft_window_len);
+    const fft_len = try fftLenForClip(clip, sample_rate);
     std.debug.assert(std.math.isPowerOfTwo(fft_len));
     const half_bins = fft_len / 2;
 
@@ -118,37 +159,32 @@ fn computeSpectralFlux(allocator: std.mem.Allocator, clip: []const f32, sample_r
     };
     const sample_rate_f = @as(f64, @floatFromInt(sample_rate));
 
-    const window = try hanningWindow(allocator, fft_window_len);
-    defer allocator.free(window);
+    const window = scratch_allocator.alloc(f32, fft_window_len) catch return error.FftTooLarge;
+    for (0..fft_window_len) |i| {
+        window[i] = hanningWindowValue(i, fft_window_len);
+    }
 
-    const fft_buf = try allocator.alloc(Complex, fft_len);
-    defer allocator.free(fft_buf);
-
+    const fft_buf = try outputAsComplex(output, fft_len);
     var first_half_energy = [_]f64{0.0} ** bands.len;
 
-    // First half: [0, fft_window_len)
     @memset(fft_buf, Complex{ .re = 0.0, .im = 0.0 });
     for (0..fft_window_len) |i| {
-        const val: f64 = @floatCast(clip[i]);
-        fft_buf[i] = Complex{ .re = val * window[i], .im = 0.0 };
+        fft_buf[i] = Complex{ .re = clip[i] * window[i], .im = 0.0 };
     }
     fft(fft_buf);
     for (bands, 0..) |band, band_index| {
         const band_bin_start = @min(@as(usize, @intFromFloat(@as(f64, @floatFromInt(fft_len)) * band.start_hz / sample_rate_f)), half_bins - 1);
         const band_bin_end = @min(@as(usize, @intFromFloat(@as(f64, @floatFromInt(fft_len)) * band.end_hz / sample_rate_f)), half_bins);
-        const bin_count = band_bin_end - band_bin_start;
-        std.debug.assert(bin_count > 0);
+        if (band_bin_end <= band_bin_start) return error.InvalidClip;
 
-        for (0..bin_count) |i| {
-            first_half_energy[band_index] += magnitude(fft_buf[band_bin_start + i]);
+        for (band_bin_start..band_bin_end) |bin| {
+            first_half_energy[band_index] += magnitude(fft_buf[bin]);
         }
     }
 
-    // Second half: [mid_point, mid_point + fft_window_len)
     @memset(fft_buf, Complex{ .re = 0.0, .im = 0.0 });
     for (0..fft_window_len) |i| {
-        const val: f64 = @floatCast(clip[mid_point + i]);
-        fft_buf[i] = Complex{ .re = val * window[i], .im = 0.0 };
+        fft_buf[i] = Complex{ .re = clip[mid_point + i] * window[i], .im = 0.0 };
     }
     fft(fft_buf);
 
@@ -156,12 +192,11 @@ fn computeSpectralFlux(allocator: std.mem.Allocator, clip: []const f32, sample_r
     for (bands, 0..) |band, band_index| {
         const band_bin_start = @min(@as(usize, @intFromFloat(@as(f64, @floatFromInt(fft_len)) * band.start_hz / sample_rate_f)), half_bins - 1);
         const band_bin_end = @min(@as(usize, @intFromFloat(@as(f64, @floatFromInt(fft_len)) * band.end_hz / sample_rate_f)), half_bins);
-        const bin_count = band_bin_end - band_bin_start;
-        std.debug.assert(bin_count > 0);
+        if (band_bin_end <= band_bin_start) return error.InvalidClip;
 
         var second_half_energy: f64 = 0.0;
-        for (0..bin_count) |i| {
-            second_half_energy += magnitude(fft_buf[band_bin_start + i]);
+        for (band_bin_start..band_bin_end) |bin| {
+            second_half_energy += magnitude(fft_buf[bin]);
         }
 
         const delta = @abs(second_half_energy - first_half_energy[band_index]) / (first_half_energy[band_index] + 1e-10);
@@ -171,29 +206,82 @@ fn computeSpectralFlux(allocator: std.mem.Allocator, clip: []const f32, sample_r
     return total_score;
 }
 
-// SOURCE: clock_gettime — man 2 clock_gettime, CLOCK_MONOTONIC
-pub fn analyze(allocator: std.mem.Allocator, clips: []const []const f32, sample_rate: u32) !SpectralFluxResult {
-    std.debug.assert(clips.len == 3);
-
-    var start_ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &start_ts);
-
-    var deltas: [3]f64 = undefined;
-    for (clips, 0..) |clip, i| {
-        deltas[i] = try computeSpectralFlux(allocator, clip, sample_rate);
+fn analyzeClip(ctx: *ClipAnalysisContext) void {
+    const fft_len = fftLenForClip(ctx.clip, ctx.sample_rate) catch {
+        ctx.failed.store(true, .release);
+        return;
+    };
+    const scratch_len = fft_len * @sizeOf(f32) * 2;
+    if (scratch_len > MAX_THREAD_SCRATCH_BYTES) {
+        ctx.failed.store(true, .release);
+        return;
     }
 
-    var end_ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &end_ts);
+    var scratch_storage: [MAX_THREAD_SCRATCH_BYTES]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(scratch_storage[0..scratch_len]);
+    const delta = computeSpectralFlux(fixed.allocator(), ctx.clip, ctx.sample_rate, ctx.output.*) catch {
+        ctx.failed.store(true, .release);
+        return;
+    };
+    ctx.delta.* = delta;
+}
 
-    const start_ns = @as(u128, @intCast(start_ts.sec)) * 1_000_000_000 +
-        @as(u128, @intCast(start_ts.nsec));
-    const end_ns = @as(u128, @intCast(end_ts.sec)) * 1_000_000_000 +
-        @as(u128, @intCast(end_ts.nsec));
-    const elapsed_ns = end_ns - start_ns;
-    const elapsed_ms = @as(u64, @intCast(elapsed_ns / 1_000_000));
+fn monotonicNowNs() u128 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u128, @intCast(ts.sec)) * 1_000_000_000 + @as(u128, @intCast(ts.nsec));
+}
 
-    std.debug.assert(elapsed_ms > 0);
+// SOURCE: clock_gettime — man 2 clock_gettime, CLOCK_MONOTONIC
+pub fn analyze(allocator: std.mem.Allocator, clips: []const []const f32, sample_rate: u32) !SpectralFluxResult {
+    std.debug.assert(clips.len == CLIP_COUNT);
+
+    const start_ns = monotonicNowNs();
+
+    var output_buffers: [CLIP_COUNT][]f32 = undefined;
+    var allocated_outputs: usize = 0;
+    errdefer {
+        for (output_buffers[0..allocated_outputs]) |buf| allocator.free(buf);
+    }
+    defer {
+        for (output_buffers[0..allocated_outputs]) |buf| allocator.free(buf);
+    }
+
+    for (clips, 0..) |clip, i| {
+        const fft_len = try fftLenForClip(clip, sample_rate);
+        output_buffers[i] = try allocator.alloc(f32, fft_len * 2);
+        allocated_outputs += 1;
+    }
+
+    var deltas: [CLIP_COUNT]f64 = [_]f64{0.0} ** CLIP_COUNT;
+    var failed = std.atomic.Value(bool).init(false);
+    var contexts: [CLIP_COUNT]ClipAnalysisContext = undefined;
+    var threads: [CLIP_COUNT]std.Thread = undefined;
+    var spawned_count: usize = 0;
+
+    for (clips, 0..) |clip, i| {
+        contexts[i] = .{
+            .clip = clip,
+            .sample_rate = sample_rate,
+            .output = &output_buffers[i],
+            .delta = &deltas[i],
+            .failed = &failed,
+        };
+        threads[i] = std.Thread.spawn(.{}, analyzeClip, .{&contexts[i]}) catch |err| {
+            for (threads[0..spawned_count]) |thread| thread.join();
+            return err;
+        };
+        spawned_count += 1;
+    }
+
+    for (threads[0..spawned_count]) |thread| {
+        thread.join();
+    }
+
+    const elapsed_ns = monotonicNowNs() - start_ns;
+    const elapsed_us = @as(u64, @intCast(elapsed_ns / 1_000));
+
+    if (failed.load(.acquire)) return error.ClipAnalysisFailed;
 
     var max_index: u8 = 0;
     var max_delta = deltas[0];
@@ -207,7 +295,7 @@ pub fn analyze(allocator: std.mem.Allocator, clips: []const []const f32, sample_
 
     return SpectralFluxResult{
         .guess = max_index,
-        .execution_time_ms = elapsed_ms,
+        .execution_time_us = elapsed_us,
         .deltas = deltas,
     };
 }
@@ -215,7 +303,7 @@ pub fn analyze(allocator: std.mem.Allocator, clips: []const []const f32, sample_
 // ---- Tests ----
 
 test "fft_analyzer: Complex struct size" {
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(Complex));
+    try std.testing.expectEqual(@as(usize, @sizeOf(f32) * 2), @sizeOf(Complex));
 }
 
 test "fft_analyzer: FFT correctness (DC signal)" {
@@ -223,11 +311,11 @@ test "fft_analyzer: FFT correctness (DC signal)" {
     var buffer: [N]Complex = undefined;
     for (&buffer) |*b| b.* = .{ .re = 1.0, .im = 0.0 };
     fft(&buffer);
-    try std.testing.expectApproxEqAbs(@as(f64, 8.0), buffer[0].re, 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), buffer[0].im, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), buffer[0].re, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), buffer[0].im, 1e-5);
     for (1..N) |i| {
-        try std.testing.expectApproxEqAbs(@as(f64, 0.0), buffer[i].re, 1e-9);
-        try std.testing.expectApproxEqAbs(@as(f64, 0.0), buffer[i].im, 1e-9);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), buffer[i].re, 1e-5);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), buffer[i].im, 1e-5);
     }
 }
 
@@ -235,6 +323,11 @@ test "fft_analyzer: spectral flux with synthetic data" {
     const sample_rate: u32 = 100;
     var clip = try std.testing.allocator.alloc(f32, sample_rate * 12);
     defer std.testing.allocator.free(clip);
+    const fft_len = try fftLenForClip(clip, sample_rate);
+    const output = try std.testing.allocator.alloc(f32, fft_len * 2);
+    defer std.testing.allocator.free(output);
+    var scratch_storage: [MAX_THREAD_SCRATCH_BYTES]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch_storage);
 
     for (0..sample_rate * 6) |i| {
         const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(sample_rate));
@@ -245,7 +338,7 @@ test "fft_analyzer: spectral flux with synthetic data" {
         clip[i] = @as(f32, @floatCast(std.math.sin(2.0 * std.math.pi * 880.0 * t)));
     }
 
-    const flux = try computeSpectralFlux(std.testing.allocator, clip, sample_rate);
+    const flux = try computeSpectralFlux(fixed.allocator(), clip, sample_rate, output);
     try std.testing.expect(flux > 0.0);
 }
 
@@ -253,13 +346,18 @@ test "fft_analyzer: spectral flux with identical halves" {
     const sample_rate: u32 = 100;
     var clip = try std.testing.allocator.alloc(f32, sample_rate * 12);
     defer std.testing.allocator.free(clip);
+    const fft_len = try fftLenForClip(clip, sample_rate);
+    const output = try std.testing.allocator.alloc(f32, fft_len * 2);
+    defer std.testing.allocator.free(output);
+    var scratch_storage: [MAX_THREAD_SCRATCH_BYTES]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch_storage);
 
     for (0..sample_rate * 12) |i| {
         const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(sample_rate));
         clip[i] = @as(f32, @floatCast(std.math.sin(2.0 * std.math.pi * 440.0 * t)));
     }
 
-    const flux = try computeSpectralFlux(std.testing.allocator, clip, sample_rate);
+    const flux = try computeSpectralFlux(fixed.allocator(), clip, sample_rate, output);
     try std.testing.expect(flux < 0.01);
 }
 
@@ -269,6 +367,11 @@ test "fft_analyzer: spectral flux includes low frequency band" {
     const mid = sample_rate * 6;
     var clip = try std.testing.allocator.alloc(f32, total_samples);
     defer std.testing.allocator.free(clip);
+    const fft_len = try fftLenForClip(clip, sample_rate);
+    const output = try std.testing.allocator.alloc(f32, fft_len * 2);
+    defer std.testing.allocator.free(output);
+    var scratch_storage: [MAX_THREAD_SCRATCH_BYTES]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch_storage);
 
     for (0..total_samples) |i| {
         const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(sample_rate));
@@ -278,7 +381,7 @@ test "fft_analyzer: spectral flux includes low frequency band" {
             @as(f32, @floatCast(2.0 * @sin(2.0 * std.math.pi * 100.0 * t)));
     }
 
-    const flux = try computeSpectralFlux(std.testing.allocator, clip, sample_rate);
+    const flux = try computeSpectralFlux(fixed.allocator(), clip, sample_rate, output);
     try std.testing.expect(flux > 0.1);
 }
 
@@ -319,7 +422,7 @@ test "fft_analyzer: analyze returns valid guess" {
     try std.testing.expectEqual(@as(u8, 0), result.guess);
     try std.testing.expect(result.deltas[0] > result.deltas[1]);
     try std.testing.expect(result.deltas[0] > result.deltas[2]);
-    try std.testing.expect(result.execution_time_ms > 0);
+    try std.testing.expect(result.execution_time_us > 0);
 }
 
 test "fft_analyzer: gerçek Arkose audio verisi ile analiz" {
@@ -350,21 +453,26 @@ test "fft_analyzer: gerçek Arkose audio verisi ile analiz" {
     const result = try analyze(allocator, &clips, sample_rate);
 
     std.debug.print("\n=== ARKOSE AUDIO ANALYSIS RESULT ===\n", .{});
-    std.debug.print("Clip split: 21.133s → 3 × {d:.3}s\n", .{@as(f64, @floatFromInt(clip_len)) / @as(f64, sample_rate)});
+    std.debug.print("Clip split: 21.133s -> 3 x {d:.3}s\n", .{@as(f64, @floatFromInt(clip_len)) / @as(f64, sample_rate)});
     std.debug.print("Spectral flux deltas: [{d:.6}, {d:.6}, {d:.6}]\n", .{ result.deltas[0], result.deltas[1], result.deltas[2] });
     std.debug.print("Guess (highest delta clip): {d}\n", .{result.guess});
-    std.debug.print("Execution time: {d} ms\n", .{result.execution_time_ms});
+    std.debug.print("Execution time: {d} us\n", .{result.execution_time_us});
 
     // Also try the plan approach: first 12s split at 6s midpoint
     const plan_samples_12s: usize = sample_rate * 12;
     if (all_samples.len >= plan_samples_12s) {
         const plan_clip = all_samples[0..plan_samples_12s];
-        const plan_result = try computeSpectralFlux(allocator, plan_clip, sample_rate);
+        const fft_len = try fftLenForClip(plan_clip, sample_rate);
+        const output = try allocator.alloc(f32, fft_len * 2);
+        defer allocator.free(output);
+        var scratch_storage: [MAX_THREAD_SCRATCH_BYTES]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch_storage);
+        const plan_result = try computeSpectralFlux(fixed.allocator(), plan_clip, sample_rate, output);
         std.debug.print("\n--- Plan approach (12s, split at 6s) ---\n", .{});
         std.debug.print("Spectral flux (first vs second half): {d:.6}\n", .{plan_result});
     }
 
     // Validate: execution_time must be > 0
-    try std.testing.expect(result.execution_time_ms > 0);
+    try std.testing.expect(result.execution_time_us > 0);
     try std.testing.expect(result.guess <= 2);
 }
