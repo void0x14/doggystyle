@@ -522,51 +522,18 @@ pub fn fetchAudioViaCdpEvaluate(
     allocator: std.mem.Allocator,
     challenge_index: u8,
     session_token: []const u8,
+    game_token: []const u8,
 ) AudioDownloaderError!FetchResult {
     const challenge_str = try std.fmt.allocPrint(allocator, "{d}", .{challenge_index});
     defer allocator.free(challenge_str);
 
-    // Build JS that finds gameToken and fetches audio via same-origin fetch()
+    // Build JS that fetches audio via same-origin fetch()
     // SOURCE: ChromeDevTools MCP live test 2026-04-25 — enforcement page
-    // SOURCE: LIVE DEBUG 2026-04-25 — /fc/gfct/ POST endpoint returns gameToken after PoW
+    // SOURCE: ChromeDevTools MCP live test 2026-04-25 — /fc/gfct/ returns challengeID as gameToken
+    // game_token passed directly from Network response capture (FAZ 1)
     const js = try std.fmt.allocPrint(allocator,
         \\(async () => {{
-        \\  let gt = '';
-        \\  try {{ gt = window.gameToken || window.__gameToken || ''; }} catch(e) {{}}
-        \\  if (!gt) try {{ gt = localStorage.getItem('gameToken') || ''; }} catch(e) {{}}
-        \\  if (!gt) {{
-        \\    try {{
-        \\      const k = Object.keys(window).find(k => k.startsWith('arkoseLabsClientApi'));
-        \\      if (k && window[k]) {{ gt = window[k].gameToken || window[k].game_token || ''; }}
-        \\    }} catch(e) {{}}
-        \\  }}
-        \\  if (!gt) {{
-        \\    try {{
-        \\      for (const f of document.querySelectorAll('iframe')) {{
-        \\        if (f.src) {{
-        \\          const m = f.src.match(/[?&]game_token=([^&]+)/);
-        \\          if (m) {{ gt = decodeURIComponent(m[1]); break; }}
-        \\        }}
-        \\      }}
-        \\    }} catch(e) {{}}
-        \\  }}
-        \\  // Fallback: fetch gameToken from fc/gfct API (same-origin)
-        \\  // SOURCE: LIVE DEBUG 2026-04-25 — enforcement page calls /fc/gfct/ after PoW
-        \\  if (!gt) {{
-        \\    try {{
-        \\      const st = window.location.hash.slice(1) || '{s}';
-        \\      const resp = await fetch('/fc/gfct/', {{
-        \\        method: 'POST',
-        \\        headers: {{'Content-Type':'application/json'}},
-        \\        body: JSON.stringify({{session_token: st}})
-        \\      }});
-        \\      if (resp.ok) {{
-        \\        const data = await resp.json();
-        \\        gt = data?.token || data?.gameToken || data?.game_token || '';
-        \\      }}
-        \\    }} catch(e) {{}}
-        \\  }}
-        \\  if (!gt) return 'ERROR:NO_GAME_TOKEN';
+        \\  const gt = '{s}';
         \\  const challenge = '{s}';
         \\  const sessionTok = '{s}';
         \\  let url = '/rtag/audio?challenge=' + challenge + '&gameToken=' + encodeURIComponent(gt);
@@ -581,7 +548,7 @@ pub fn fetchAudioViaCdpEvaluate(
         \\    return btoa(binary);
         \\  }} catch(e) {{ return 'ERROR:FETCH'; }}
         \\}})()
-    , .{ session_token, challenge_str, session_token });
+    , .{ game_token, challenge_str, session_token });
     defer allocator.free(js);
 
     std.debug.print("[AUDIO] CDP evaluate fetch: challenge={s}, sessionToken={s}\n", .{ challenge_str, session_token });

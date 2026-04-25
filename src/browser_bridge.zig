@@ -633,6 +633,33 @@ pub const CdpClient = struct {
         return self.pending_events.orderedRemove(0);
     }
 
+    // FAZ 1: Poll WebSocket and buffer one pending CDP event without blocking.
+    // Returns true if a frame was read (event buffered or response discarded).
+    // Returns false if no data available (poll timeout).
+    // Caller should loop until this returns false to drain all buffered frames.
+    // SOURCE: man 2 poll — POLLIN for readable data, timeout=0 for non-blocking
+    pub fn tryReadPendingEvents(self: *CdpClient) bool {
+        var pfd: [1]std.posix.pollfd = undefined;
+        pfd[0] = .{
+            .fd = self.fd,
+            .events = @as(i16, @intCast(1)),
+            .revents = 0,
+        };
+        const poll_rc = std.posix.poll(&pfd, 0) catch return false;
+        if (poll_rc <= 0) return false;
+        if ((pfd[0].revents & @as(i16, @intCast(1))) == 0) return false;
+
+        const frame = self.recvWsTextAlloc() catch return false;
+        if (extractTopLevelMessageId(self.allocator, frame)) |_| {
+            self.allocator.free(frame);
+        } else {
+            self.pending_events.append(frame) catch {
+                self.allocator.free(frame);
+            };
+        }
+        return true;
+    }
+
     // SOURCE: CDP Network.getResponseBody — retrieve response body for a network request
     pub fn getNetworkResponseBody(self: *CdpClient, request_id: []const u8) ![]u8 {
         var id_esc: [1024]u8 = undefined;

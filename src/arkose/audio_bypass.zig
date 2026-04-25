@@ -114,7 +114,7 @@ pub fn runAudioBypass(
     // SOURCE: Chrome DevTools Protocol — GET /json returns per-target wsDebuggerUrl
     // SOURCE: LIVE TEST 2026-04-25 — enforcement iframe has its OWN /json entry
     // Retry loop: getArkoseWsUrl + connectToTarget with up to 3 attempts
-    const ARKOSE_CONNECT_MAX_RETRIES: u8 = 3;
+    const ARKOSE_CONNECT_MAX_RETRIES: u8 = 10;
     var arkose_cdp_opt: ?browser_bridge.CdpClient = null;
     var iframe_ws_url_opt: ?[]u8 = null;
     var arkose_connected = false;
@@ -122,7 +122,7 @@ pub fn runAudioBypass(
     while (arkose_connect_attempt < ARKOSE_CONNECT_MAX_RETRIES and !arkose_connected) : (arkose_connect_attempt += 1) {
         if (arkose_connect_attempt > 0) {
             std.debug.print("[AUDIO BYPASS] Arkose connection retry {d}/{d}...\n", .{ arkose_connect_attempt + 1, ARKOSE_CONNECT_MAX_RETRIES });
-            _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 2, .nsec = 0 }, null);
+            _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 3, .nsec = 0 }, null);
         }
 
         std.debug.print("[AUDIO BYPASS] Connecting to Arkose enforcement iframe (attempt {d}/{d})...\n", .{ arkose_connect_attempt + 1, ARKOSE_CONNECT_MAX_RETRIES });
@@ -161,39 +161,119 @@ pub fn runAudioBypass(
     std.debug.print("[AUDIO BYPASS] Arkose iframe CDP session established\n", .{});
 
     // Step 0b: Wait for PoW to complete, then game-core appears
-    // SOURCE: LIVE ChromeDevTools MCP — pow/2.4.0 → game-core/1.34.1
+    // SOURCE: LIVE ChromeDevTools MCP 2026-04-25 — PoW akışı:
+    //   /fc/gt2/ → returns token (session setup)
+    //   PoW iframe loads → /pows/setup → /pows/started → /pows/check
+    //   game-core iframe appears in DOM → /fc/gfct/ returns challengeID
     //
-    // CROSS-PROCESS FIX 2026-04-25:
-    // game-core iframe is cross-origin (arkoselabs.com → different process).
-    // evaluateInContext with contextId CANNOT reach it before the context is
-    // registered in THIS CDP session. But the iframe ELEMENT is visible in
-    // enforcement DOM (Runtime.evaluate without contextId).
-    //
-    // Strategy:
-    //   1. Poll enforcement DOM for iframe[src*="game-core"] element
-    //   2. When found, reload it by setting src = src (triggers new context)
-    //   3. Wait 1s + drainPendingEvents for executionContextCreated event
-    //   4. Brute-force scan (1-20) for the fresh game-core context
-    // SOURCE: Chrome DevTools Protocol — element access is NOT blocked by CORS
-    // SOURCE: CDP spec — Runtime.evaluate without contextId targets enforcement page
+    // FAZ 1 FIX 2026-04-25 — Network Event Capture:
+    //   Eski yöntem: Runtime.evaluate ile JS fetch('/fc/gfct/') — CSP'den dolayı
+    //   sürekli WAITING dönüyor, loop sonsuz.
+    //   Yeni yöntem: Ana CDP session'ının Network.responseReceived event'lerini
+    //   dinleyerek GERÇEK HTTP response'larını yakala.
+    //   SOURCE: ChromeDevTools MCP live test — getNetworkResponseBody başarılı
     std.debug.print("[AUDIO BYPASS] Waiting for PoW to complete and game-core to load...\n", .{});
 
+    // FAZ 1: Enable Network monitoring on the MAIN CDP session (already done in BrowserBridge.init)
+    // The main session's pending_events will contain Network.responseReceived for ALL subframes
+    // SOURCE: ChromeDevTools MCP — main page CDP sees enforcement iframe HTTP traffic
     var game_core_found = false;
     var pow_wait_attempt: u32 = 0;
-    var last_debug_log: u32 = 0;
     var iframe_seen_once = false;
-    var game_core_session_token: ?[]const u8 = null; // session token from iframe URL
-    defer if (game_core_session_token) |t| allocator.free(t);
-    const POW_MAX_WAIT: u32 = 120; // 120 × 2s = 240s max
+    var game_core_session_token: ?[]const u8 = null;
+    var game_core_game_token: ?[]const u8 = null;
+    defer {
+        if (game_core_session_token) |t| allocator.free(t);
+        if (game_core_game_token) |t| allocator.free(t);
+    }
+    const POW_MAX_WAIT: u32 = 120;
 
     while (!game_core_found and pow_wait_attempt < POW_MAX_WAIT) : (pow_wait_attempt += 1) {
         _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 2, .nsec = 0 }, null);
-
-        // Drain pending events for executionContextCreated
         arkose_cdp.drainPendingEvents();
 
+        // FAZ 1: Drain main CDP WebSocket — read ALL buffered frames non-blocking
+        // tryReadPendingEvents returns true when a frame was read.
+        // Loop until no more frames available.
+        while (bridge.cdp.tryReadPendingEvents()) {}
+
+        // FAZ 1: Drain pending events looking for Network.responseReceived
+        // for /fc/gt2/ or /fc/gfct/. These contain the gameToken.
+        // SOURCE: LIVE TEST 2026-04-25 — /fc/gt2/ returns {"token":"...","challenge_url":"..."}
+        // SOURCE: LIVE TEST 2026-04-25 — /fc/gfct/ returns {"session_token":"...","challengeID":"..."}
+        while (bridge.cdp.hasPendingEvents()) {
+            const event = bridge.cdp.nextPendingEvent().?;
+            defer allocator.free(event);
+            if (std.mem.indexOf(u8, event, "Network.responseReceived") != null) {
+                // Extract URL from event JSON
+                if (std.mem.indexOf(u8, event, "\"url\":\"")) |url_pos| {
+                    const url_start = url_pos + 7;
+                    const url_end = std.mem.indexOfScalarPos(u8, event, url_start, '"') orelse continue;
+                    const url = event[url_start..url_end];
+                    if (std.mem.indexOf(u8, url, "/fc/gt2/") != null or
+                        std.mem.indexOf(u8, url, "/fc/gfct/") != null)
+                    {
+                        // Extract requestId from event
+                        const rid_key = "\"requestId\":\"";
+                        if (std.mem.indexOf(u8, event, rid_key)) |rid_pos| {
+                            const rid_start = rid_pos + rid_key.len;
+                            const rid_end = std.mem.indexOfScalarPos(u8, event, rid_start, '"') orelse continue;
+                            const request_id = event[rid_start..rid_end];
+                            // Get response body
+                            if (bridge.cdp.getNetworkResponseBody(request_id)) |body| {
+                                defer allocator.free(body);
+                                std.debug.print("[AUDIO BYPASS] Network response body ({d} bytes): {s}\n", .{ body.len, body[0..@min(body.len, 500)] });
+                                // Parse token fields
+                                // SOURCE: LIVE TEST 2026-04-25 — /fc/gt2/ has "token" field
+                                const token_prefix = "\"token\":\"";
+                                const challengeID_prefix = "\"challengeID\":\"";
+                                const gameToken_prefix = "\"gameToken\":\"";
+                                const session_prefix = "\"session_token\":\"";
+                                var found_token: ?[]const u8 = null;
+                                if (std.mem.indexOf(u8, body, challengeID_prefix)) |cpos| {
+                                    const cstart = cpos + challengeID_prefix.len;
+                                    const cend = std.mem.indexOfScalarPos(u8, body, cstart, '"') orelse body.len;
+                                    found_token = body[cstart..cend];
+                                } else if (std.mem.indexOf(u8, body, token_prefix)) |tpos| {
+                                    const tstart = tpos + token_prefix.len;
+                                    const tend = std.mem.indexOfScalarPos(u8, body, tstart, '"') orelse body.len;
+                                    // token field may contain pipe-separated metadata; take first segment
+                                    const pipe_pos = std.mem.indexOfScalarPos(u8, body, tstart, '|') orelse tend;
+                                    found_token = body[tstart..pipe_pos];
+                                } else if (std.mem.indexOf(u8, body, gameToken_prefix)) |gpos| {
+                                    const gstart = gpos + gameToken_prefix.len;
+                                    const gend = std.mem.indexOfScalarPos(u8, body, gstart, '"') orelse body.len;
+                                    found_token = body[gstart..gend];
+                                }
+                                if (found_token) |ft| {
+                                    if (ft.len > 5) {
+                                        game_core_game_token = try allocator.dupe(u8, ft);
+                                        std.debug.print("[AUDIO BYPASS] FAZ 1: Captured gameToken from Network response: {s}\n", .{ft});
+                                        // Also extract session_token if available
+                                        if (std.mem.indexOf(u8, body, session_prefix)) |spos| {
+                                            const sstart = spos + session_prefix.len;
+                                            const send = std.mem.indexOfScalarPos(u8, body, sstart, '"') orelse body.len;
+                                            const st = body[sstart..send];
+                                            if (st.len > 5) {
+                                                if (game_core_session_token) |old| allocator.free(old);
+                                                game_core_session_token = try allocator.dupe(u8, st);
+                                            }
+                                        }
+                                        game_core_ctx = 0;
+                                        game_core_found = true;
+                                        std.debug.print("[AUDIO BYPASS] PoW completed! gameToken via Network event (~{d}s)\n", .{pow_wait_attempt * 2});
+                                        break;
+                                    }
+                                }
+                            } else |_| {}
+                        }
+                    }
+                }
+            }
+        }
+        if (game_core_found) break;
+
         // Strategy A: Brute-force scan for game-core context (1-20)
-        // Catches same-process iframes where context is already registered.
         var ctx: i64 = 1;
         while (ctx <= 20 and !game_core_found) : (ctx += 1) {
             if (arkose_cdp.evaluateInContext("document.title", ctx)) |resp| {
@@ -209,13 +289,9 @@ pub fn runAudioBypass(
                 }
             } else |_| {}
         }
-
         if (game_core_found) break;
 
         // Step 1: Check enforcement DOM for game-core iframe element
-        // Runtime.evaluate without contextId → targets enforcement page context.
-        // iframe ELEMENT is accessible even cross-origin (src attribute visible).
-        // Also extract session token from URL for fallback HTTP requests.
         const check_script =
             \\(() => {
             \\  const gc = document.querySelector('iframe[src*="game-core"]');
@@ -234,11 +310,9 @@ pub fn runAudioBypass(
                 if (!iframe_seen_once) {
                     iframe_seen_once = true;
                     std.debug.print("[AUDIO BYPASS] game-core iframe VISIBLE in enforcement DOM (attempt {d}/{d})\n", .{ pow_wait_attempt + 1, POW_MAX_WAIT });
-                    // Extract session token from iframe URL
-                    // NOTE: Dupe the string because `resp` is freed by defer
-                    const session_prefix = "|session:";
-                    if (std.mem.indexOf(u8, resp, session_prefix)) |spos| {
-                        const session_start = spos + session_prefix.len;
+                    const session_prefix_str = "|session:";
+                    if (std.mem.indexOf(u8, resp, session_prefix_str)) |spos| {
+                        const session_start = spos + session_prefix_str.len;
                         const session_end = std.mem.indexOfScalarPos(u8, resp, session_start, '"') orelse
                             std.mem.indexOfScalarPos(u8, resp, session_start, '|') orelse resp.len;
                         if (session_end > session_start) {
@@ -251,71 +325,13 @@ pub fn runAudioBypass(
             }
         } else |_| {}
 
+        // FAZ 1 FIX: game-core iframe DOM'da görünüyorsa PoW TAMAMLANMIŞ demektir.
+        // SOURCE: LIVE ChromeDevTools MCP 2026-04-25 — game-core iframe PoW bittikten SONRA yüklenir
+        // (önce PoW iframe → /pows/started → /pows/check DONE → game-core DOM'da)
         if (iframe_found and !game_core_found) {
-            // CROSS-PROCESS FIX 2026-04-25 v2: NO RELOAD.
-            // game-core iframe is cross-process (arkoselabs.com enforcement iframe
-            // lives in a different Chrome renderer than game-core).
-            // evaluateInContext with contextId CANNOT reach it.
-            //
-            // PREVIOUS BUG (FIXED 2026-04-25): The old code reloaded the game-core
-            // iframe to try to force a new execution context to register in THIS CDP
-            // session. This RESET the PoW computation, causing PoW to never complete
-            // (parent "setup" message was already consumed by the pre-reload game-core).
-            //
-            // NEW STRATEGY:
-            //   1. game-core iframe found in enforcement DOM
-            //   2. Context not accessible (cross-process) — expected
-            //   3. POLL /fc/gfct/ API from enforcement page until PoW completes
-            //   4. When /fc/gfct/ returns gameToken, PoW is done
-            //   5. Proceed with ctx=0 (gameToken via API, not direct context access)
-            // SOURCE: LIVE DEBUG 2026-04-25 — /fc/gfct/ POST returns gameToken after PoW
-            // SOURCE: LIVE TEST 2026-04-25 — reloading resets PoW, causing 120s timeout
-            // SOURCE: Chrome DevTools Protocol — Runtime.evaluate in enforcement page
-            const pow_poll_script =
-                \\(async () => {{
-                \\  const st = '{s}';
-                \\  try {{
-                \\    const resp = await fetch('/fc/gfct/', {{
-                \\      method: 'POST',
-                \\      headers: {{'Content-Type': 'application/json'}},
-                \\      body: JSON.stringify({{session_token: st}})
-                \\    }});
-                \\    if (resp.ok) {{
-                \\      const data = await resp.json();
-                \\      const gt = data?.token || data?.gameToken || data?.game_token || '';
-                \\      if (gt) return 'GOT_GT:' + gt;
-                \\    }}
-                \\    return 'WAITING';
-                \\  }} catch(e) {{ return 'WAITING'; }}
-                \\}})()
-            ;
-            const pow_poll_js = try std.fmt.allocPrint(allocator, pow_poll_script, .{game_core_session_token orelse ""});
-            defer allocator.free(pow_poll_js);
-
-            if (arkose_cdp.evaluate(pow_poll_js)) |gresp| {
-                defer allocator.free(gresp);
-                if (std.mem.indexOf(u8, gresp, "GOT_GT:") != null) {
-                    game_core_ctx = 0;
-                    game_core_found = true;
-                    std.debug.print("[AUDIO BYPASS] PoW completed! gameToken via /fc/gfct/ (~{d}s)\n", .{pow_wait_attempt * 2});
-                }
-            } else |_| {}
-        }
-
-        // Periodically log enforcement page state for debugging
-        if (pow_wait_attempt - last_debug_log >= 5) {
-            last_debug_log = pow_wait_attempt;
-            const debug_script =
-                \\(() => {
-                \\  const frames = document.querySelectorAll('iframe');
-                \\  const srcs = Array.from(frames).slice(0,5).map(f => (f.src||'(empty)').substring(0,80)).join('|');
-                \\  return 'iframes:' + frames.length + ':' + srcs;
-                \\})()
-            ;
-            if (arkose_cdp.evaluate(debug_script)) |dresp| {
-                defer allocator.free(dresp);
-                std.debug.print("[AUDIO BYPASS] Enforcement DOM ({d}s): {s}\n", .{ pow_wait_attempt * 2, dresp[0..@min(dresp.len, 500)] });
-            } else |_| {}
+            game_core_ctx = 0;
+            game_core_found = true;
+            std.debug.print("[AUDIO BYPASS] PoW completed! game-core iframe in DOM (~{d}s)\n", .{pow_wait_attempt * 2});
         }
 
         if (!game_core_found and !iframe_found) {
@@ -326,7 +342,7 @@ pub fn runAudioBypass(
     if (!game_core_found) {
         std.debug.print("[AUDIO BYPASS] Could not find game-core context after {d}s\n", .{POW_MAX_WAIT * 2});
     } else {
-        std.debug.print("[AUDIO BYPASS] Using game-core context: {d}\n", .{game_core_ctx});
+        std.debug.print("[AUDIO BYPASS] Using game-core context: {d}, gameToken: {s}\n", .{ game_core_ctx, game_core_game_token orelse "N/A" });
     }
 
     while (successful < TARGET_CHALLENGES and total_attempted < MAX_CHALLENGES) : (total_attempted += 1) {
@@ -409,6 +425,7 @@ pub fn runAudioBypass(
                 allocator,
                 total_attempted,
                 game_core_session_token orelse "",
+                game_core_game_token orelse "",
             ) catch |err| {
                 std.debug.print("[AUDIO BYPASS] Attempt {d}: fetchAudioViaCdpEvaluate failed: {}\n", .{ total_attempted, err });
                 if (total_attempted == 0) return err;
