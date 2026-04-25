@@ -2157,3 +2157,34 @@ if (total_len > MTU_LIMIT) {
 **Tekrar olmaması için:**
 - Struct'a yeni `[]const u8` alanı eklenirken, `collectFingerprint()` içindeki dupe listesine de eklenmeli
 - `deinit()` fonksiyonunda free edilen her alan, dupe listesinde de olmalı
+
+---
+
+## [2026-04-25] — CDP Bridge ConnectFailed — WouldBlock ve parçalanmış TCP handshake
+
+**Hata:** `BrowserBridge.init()` 20 deneme sonrası `ConnectFailed` döndürüyordu. Altta yatan sorunlar:
+1. `CdpClient.connect()` step 5'te WebSocket 101 handshake yanıtını tek `std.posix.read()` ile okuyordu — TCP parçalanırsa `"HTTP/1.1 101"` header'ı görülemiyordu
+2. `writeAll()` ve `recvExact()` fonksiyonlarında `error.WouldBlock` için retry yoktu — doğrudan hata dönüyordu
+3. `findTargetTab()` HTTP yanıt okuması `error.WouldBlock` aldığında `break` yapıp yarım parsing yapıyordu
+4. Chrome'un 9222 portunda dinleyip dinlemediğini kontrol eden mekanizma yoktu
+
+**Kök sebep:** Tüm socket I/O işlemleri blocking modda bile `SO_RCVTIMEO` expiry durumunda `EAGAIN`/`EWOULDBLOCK` dönebilir. Bu durumda kod doğrudan başarısız oluyor, retry yapmıyordu. Ayrıca WebSocket handshake tek `read()` çağrısıyla yapılıyor, parçalanmış TCP segmentlerini handle etmiyordu.
+
+**Kaynak:**
+- man 2 read — EAGAIN/EWOULDBLOCK dönüş değeri
+- man 2 write — EAGAIN/EWOULDBLOCK dönüş değeri
+- RFC 6455, Section 4.2.2 — Server handshake: "The server responds with HTTP/1.1 101 Switching Protocols"
+- man 7 socket — SO_RCVTIMEO: "Specify the receiving timeout until reporting an error"
+
+**Düzeltme:**
+1. `CdpClient.connect()` step 5: Tek `read()` → `\r\n\r\n` bulana kadar okuyan döngü, her `WouldBlock`'ta 10ms sleep + retry (max 200 = 2s)
+2. `writeAll()`: `linux.write()` sonrası errno `.AGAIN` ise 10ms sleep + retry (max 100)
+3. `recvExact()`: `std.posix.read()` error `WouldBlock` ise 10ms sleep + retry (max 100)
+4. `findTargetTab()` HTTP read: `error.WouldBlock` → `break` yerine `continue` + 50ms sleep retry (max 60 = 3s)
+5. `isChromeCdpListening()`: Yeni fonksiyon — 127.0.0.1:9222'ye TCP connect denenerek Chrome'un hazır olup olmadığını kontrol eder
+6. `BrowserBridge.init()`: Her deneme hatasında spesifik error tipi loglanır, Chrome pre-flight check eklendi, `>>> BRIDGE ESTABLISHED <<<` logu eklendi
+7. `main.zig`: Bridge başarıyla kurulduğunda görsel `BRIDGE ESTABLISHED — AUDIO BYPASS READY` kutusu eklendi
+
+**Doğrulama:**
+- `vendor/zig/zig build` → EXIT_CODE=0
+- `vendor/zig/zig build test` → Tüm 132 test geçti

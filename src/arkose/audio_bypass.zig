@@ -75,6 +75,8 @@ fn currentMonotonicMs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1000000;
 }
 
+
+
 // ---------------------------------------------------------------------------
 // runAudioBypass — Ana pipeline orkestratörü
 // ---------------------------------------------------------------------------
@@ -97,10 +99,235 @@ pub fn runAudioBypass(
     var last_guess: u8 = 0;
     var successful: u8 = 0;
     var total_attempted: u8 = 0;
+    var audio_mode_activated: bool = false;
+    var game_core_ctx: i64 = 0;
 
     std.debug.print("\n[AUDIO BYPASS] Starting pipeline ({d} targets, max {d} attempts)...\n", .{
         TARGET_CHALLENGES, MAX_CHALLENGES,
     });
+
+    // Step 0: Connect directly to the Arkose enforcement iframe via its own CDP WebSocket
+    // The enforcement iframe has its own webSocketDebuggerUrl in GET /json.
+    // By connecting directly, we bypass cross-process execution context issues:
+    // the main page's CDP session cannot access cross-origin iframe DOM via
+    // Runtime.evaluate with contextId when the iframe lives in a different process.
+    // SOURCE: Chrome DevTools Protocol — GET /json returns per-target wsDebuggerUrl
+    // SOURCE: LIVE TEST 2026-04-25 — enforcement iframe has its OWN /json entry
+    // Retry loop: getArkoseWsUrl + connectToTarget with up to 3 attempts
+    const ARKOSE_CONNECT_MAX_RETRIES: u8 = 3;
+    var arkose_cdp_opt: ?browser_bridge.CdpClient = null;
+    var iframe_ws_url_opt: ?[]u8 = null;
+    var arkose_connected = false;
+    var arkose_connect_attempt: u8 = 0;
+    while (arkose_connect_attempt < ARKOSE_CONNECT_MAX_RETRIES and !arkose_connected) : (arkose_connect_attempt += 1) {
+        if (arkose_connect_attempt > 0) {
+            std.debug.print("[AUDIO BYPASS] Arkose connection retry {d}/{d}...\n", .{ arkose_connect_attempt + 1, ARKOSE_CONNECT_MAX_RETRIES });
+            _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 2, .nsec = 0 }, null);
+        }
+
+        std.debug.print("[AUDIO BYPASS] Connecting to Arkose enforcement iframe (attempt {d}/{d})...\n", .{ arkose_connect_attempt + 1, ARKOSE_CONNECT_MAX_RETRIES });
+
+        // Step A: Get iframe WS URL from /json
+        const ws_url = bridge.getArkoseWsUrl(allocator) catch |err| {
+            std.debug.print("[AUDIO BYPASS] getArkoseWsUrl failed (attempt {d}/{d}): {}\n", .{ arkose_connect_attempt + 1, ARKOSE_CONNECT_MAX_RETRIES, err });
+            continue;
+        };
+        iframe_ws_url_opt = ws_url;
+        std.debug.print("[AUDIO BYPASS] Iframe WS URL: {s}\n", .{ws_url});
+
+        // Step B: Connect WebSocket to iframe target
+        const cdp = browser_bridge.CdpClient.connectToTarget(allocator, ws_url) catch |err| {
+            std.debug.print("[AUDIO BYPASS] connectToTarget failed (attempt {d}/{d}): {}\n", .{ arkose_connect_attempt + 1, ARKOSE_CONNECT_MAX_RETRIES, err });
+            allocator.free(ws_url);
+            iframe_ws_url_opt = null;
+            continue;
+        };
+        arkose_cdp_opt = cdp;
+        arkose_connected = true;
+    }
+
+    if (!arkose_connected) {
+        std.debug.print("[AUDIO BYPASS] FATAL: Could not connect to Arkose iframe after {d} attempts\n", .{ARKOSE_CONNECT_MAX_RETRIES});
+        return error.ConnectionFailed;
+    }
+
+    var arkose_cdp = arkose_cdp_opt.?;
+    errdefer arkose_cdp.close();
+    const iframe_ws_url = iframe_ws_url_opt.?;
+    defer allocator.free(iframe_ws_url);
+
+    // Enable Runtime domain on the iframe CDP session for DOM interaction
+    _ = arkose_cdp.runtimeEnable() catch {};
+    std.debug.print("[AUDIO BYPASS] Arkose iframe CDP session established\n", .{});
+
+    // Step 0b: Wait for PoW to complete, then game-core appears
+    // SOURCE: LIVE ChromeDevTools MCP — pow/2.4.0 → game-core/1.34.1
+    //
+    // CROSS-PROCESS FIX 2026-04-25:
+    // game-core iframe is cross-origin (arkoselabs.com → different process).
+    // evaluateInContext with contextId CANNOT reach it before the context is
+    // registered in THIS CDP session. But the iframe ELEMENT is visible in
+    // enforcement DOM (Runtime.evaluate without contextId).
+    //
+    // Strategy:
+    //   1. Poll enforcement DOM for iframe[src*="game-core"] element
+    //   2. When found, reload it by setting src = src (triggers new context)
+    //   3. Wait 1s + drainPendingEvents for executionContextCreated event
+    //   4. Brute-force scan (1-20) for the fresh game-core context
+    // SOURCE: Chrome DevTools Protocol — element access is NOT blocked by CORS
+    // SOURCE: CDP spec — Runtime.evaluate without contextId targets enforcement page
+    std.debug.print("[AUDIO BYPASS] Waiting for PoW to complete and game-core to load...\n", .{});
+
+    var game_core_found = false;
+    var pow_wait_attempt: u32 = 0;
+    var last_debug_log: u32 = 0;
+    var iframe_seen_once = false;
+    var game_core_session_token: ?[]const u8 = null; // session token from iframe URL
+    defer if (game_core_session_token) |t| allocator.free(t);
+    const POW_MAX_WAIT: u32 = 120; // 120 × 2s = 240s max
+
+    while (!game_core_found and pow_wait_attempt < POW_MAX_WAIT) : (pow_wait_attempt += 1) {
+        _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 2, .nsec = 0 }, null);
+
+        // Drain pending events for executionContextCreated
+        arkose_cdp.drainPendingEvents();
+
+        // Strategy A: Brute-force scan for game-core context (1-20)
+        // Catches same-process iframes where context is already registered.
+        var ctx: i64 = 1;
+        while (ctx <= 20 and !game_core_found) : (ctx += 1) {
+            if (arkose_cdp.evaluateInContext("document.title", ctx)) |resp| {
+                defer allocator.free(resp);
+                if (std.mem.indexOf(u8, resp, "Audio") != null or
+                    std.mem.indexOf(u8, resp, "challenge") != null or
+                    std.mem.indexOf(u8, resp, "game-core") != null)
+                {
+                    game_core_ctx = ctx;
+                    game_core_found = true;
+                    std.debug.print("[AUDIO BYPASS] Found game-core context ID {d} after ~{d}s (direct scan)\n", .{ ctx, pow_wait_attempt * 2 });
+                    break;
+                }
+            } else |_| {}
+        }
+
+        if (game_core_found) break;
+
+        // Step 1: Check enforcement DOM for game-core iframe element
+        // Runtime.evaluate without contextId → targets enforcement page context.
+        // iframe ELEMENT is accessible even cross-origin (src attribute visible).
+        // Also extract session token from URL for fallback HTTP requests.
+        const check_script =
+            \\(() => {
+            \\  const gc = document.querySelector('iframe[src*="game-core"]');
+            \\  if (!gc) return 'waiting';
+            \\  const url = gc.src;
+            \\  const sm = url.match(/[?&]session=([^&]+)/);
+            \\  const session = sm ? sm[1] : '';
+            \\  return 'found:' + url + '|session:' + session;
+            \\})()
+        ;
+        var iframe_found = false;
+        if (arkose_cdp.evaluate(check_script)) |resp| {
+            defer allocator.free(resp);
+            if (std.mem.indexOf(u8, resp, "\"value\":\"found:") != null) {
+                iframe_found = true;
+                if (!iframe_seen_once) {
+                    iframe_seen_once = true;
+                    std.debug.print("[AUDIO BYPASS] game-core iframe VISIBLE in enforcement DOM (attempt {d}/{d})\n", .{ pow_wait_attempt + 1, POW_MAX_WAIT });
+                    // Extract session token from iframe URL
+                    // NOTE: Dupe the string because `resp` is freed by defer
+                    const session_prefix = "|session:";
+                    if (std.mem.indexOf(u8, resp, session_prefix)) |spos| {
+                        const session_start = spos + session_prefix.len;
+                        const session_end = std.mem.indexOfScalarPos(u8, resp, session_start, '"') orelse
+                            std.mem.indexOfScalarPos(u8, resp, session_start, '|') orelse resp.len;
+                        if (session_end > session_start) {
+                            const token_slice = resp[session_start..session_end];
+                            game_core_session_token = try allocator.dupe(u8, token_slice);
+                            std.debug.print("[AUDIO BYPASS] Extracted game-core session token: {s}\n", .{game_core_session_token.?});
+                        }
+                    }
+                }
+            }
+        } else |_| {}
+
+        if (iframe_found and !game_core_found) {
+            // CROSS-PROCESS FIX 2026-04-25 v2: NO RELOAD.
+            // game-core iframe is cross-process (arkoselabs.com enforcement iframe
+            // lives in a different Chrome renderer than game-core).
+            // evaluateInContext with contextId CANNOT reach it.
+            //
+            // PREVIOUS BUG (FIXED 2026-04-25): The old code reloaded the game-core
+            // iframe to try to force a new execution context to register in THIS CDP
+            // session. This RESET the PoW computation, causing PoW to never complete
+            // (parent "setup" message was already consumed by the pre-reload game-core).
+            //
+            // NEW STRATEGY:
+            //   1. game-core iframe found in enforcement DOM
+            //   2. Context not accessible (cross-process) — expected
+            //   3. POLL /fc/gfct/ API from enforcement page until PoW completes
+            //   4. When /fc/gfct/ returns gameToken, PoW is done
+            //   5. Proceed with ctx=0 (gameToken via API, not direct context access)
+            // SOURCE: LIVE DEBUG 2026-04-25 — /fc/gfct/ POST returns gameToken after PoW
+            // SOURCE: LIVE TEST 2026-04-25 — reloading resets PoW, causing 120s timeout
+            // SOURCE: Chrome DevTools Protocol — Runtime.evaluate in enforcement page
+            const pow_poll_script =
+                \\(async () => {{
+                \\  const st = '{s}';
+                \\  try {{
+                \\    const resp = await fetch('/fc/gfct/', {{
+                \\      method: 'POST',
+                \\      headers: {{'Content-Type': 'application/json'}},
+                \\      body: JSON.stringify({{session_token: st}})
+                \\    }});
+                \\    if (resp.ok) {{
+                \\      const data = await resp.json();
+                \\      const gt = data?.token || data?.gameToken || data?.game_token || '';
+                \\      if (gt) return 'GOT_GT:' + gt;
+                \\    }}
+                \\    return 'WAITING';
+                \\  }} catch(e) {{ return 'WAITING'; }}
+                \\}})()
+            ;
+            const pow_poll_js = try std.fmt.allocPrint(allocator, pow_poll_script, .{game_core_session_token orelse ""});
+            defer allocator.free(pow_poll_js);
+
+            if (arkose_cdp.evaluate(pow_poll_js)) |gresp| {
+                defer allocator.free(gresp);
+                if (std.mem.indexOf(u8, gresp, "GOT_GT:") != null) {
+                    game_core_ctx = 0;
+                    game_core_found = true;
+                    std.debug.print("[AUDIO BYPASS] PoW completed! gameToken via /fc/gfct/ (~{d}s)\n", .{pow_wait_attempt * 2});
+                }
+            } else |_| {}
+        }
+
+        // Periodically log enforcement page state for debugging
+        if (pow_wait_attempt - last_debug_log >= 5) {
+            last_debug_log = pow_wait_attempt;
+            const debug_script =
+                \\(() => {
+                \\  const frames = document.querySelectorAll('iframe');
+                \\  const srcs = Array.from(frames).slice(0,5).map(f => (f.src||'(empty)').substring(0,80)).join('|');
+                \\  return 'iframes:' + frames.length + ':' + srcs;
+                \\})()
+            ;
+            if (arkose_cdp.evaluate(debug_script)) |dresp| {
+                defer allocator.free(dresp);
+                std.debug.print("[AUDIO BYPASS] Enforcement DOM ({d}s): {s}\n", .{ pow_wait_attempt * 2, dresp[0..@min(dresp.len, 500)] });
+            } else |_| {}
+        }
+
+        if (!game_core_found and !iframe_found) {
+            std.debug.print("[AUDIO BYPASS] Still waiting for game-core (attempt {d}/{d})...\n", .{ pow_wait_attempt + 1, POW_MAX_WAIT });
+        }
+    }
+
+    if (!game_core_found) {
+        std.debug.print("[AUDIO BYPASS] Could not find game-core context after {d}s\n", .{POW_MAX_WAIT * 2});
+    } else {
+        std.debug.print("[AUDIO BYPASS] Using game-core context: {d}\n", .{game_core_ctx});
+    }
 
     while (successful < TARGET_CHALLENGES and total_attempted < MAX_CHALLENGES) : (total_attempted += 1) {
         const elapsed = currentMonotonicMs() - start_ms;
@@ -113,13 +340,83 @@ pub fn runAudioBypass(
             total_attempted + 1, MAX_CHALLENGES, successful, TARGET_CHALLENGES,
         });
 
+        // Step 0.5: Activate audio mode if not already active
+        if (!audio_mode_activated) {
+            std.debug.print("[AUDIO BYPASS] Finding Audio puzzle button...\n", .{});
+            const ascript =
+                \\(() => {
+                \\  const btns = document.querySelectorAll('button');
+                \\  for (const btn of btns) {
+                \\    if (btn.textContent.trim().includes('Audio') && btn.offsetParent !== null) {
+                \\      btn.click();
+                \\      return 'clicked';
+                \\    }
+                \\  }
+                \\  return 'not_found';
+                \\})()
+            ;
+            if (game_core_ctx > 0) {
+                if (arkose_cdp.evaluateInContext(ascript, game_core_ctx)) |resp| {
+                    defer allocator.free(resp);
+                    std.debug.print("[AUDIO BYPASS] Audio button response (game-core ctx={d}): {s}\n", .{ game_core_ctx, resp[0..@min(resp.len, 200)] });
+                } else |_| {}
+            } else {
+                if (arkose_cdp.evaluate(ascript)) |resp| {
+                    defer allocator.free(resp);
+                    std.debug.print("[AUDIO BYPASS] Audio button response: {s}\n", .{resp[0..@min(resp.len, 200)]});
+                } else |_| {}
+            }
+            _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 2, .nsec = 0 }, null);
+            audio_mode_activated = true;
+        }
+
         // Step 1-3: Capture URL, download MP3, save to disk
-        const result = audio_downloader.downloadAndSaveAudio(bridge, allocator, total_attempted) catch |err| {
-            std.debug.print("[AUDIO BYPASS] Attempt {d}: download failed: {}\n", .{ total_attempted, err });
-            if (total_attempted == 0) return err;
-            std.debug.print("[AUDIO BYPASS] Skipping to next attempt...\n", .{});
-            continue;
-        };
+        var dl_result: audio_downloader.FetchResult = undefined;
+        if (game_core_ctx > 0) {
+            // Normal flow: Click Play button, then capture via CDP Fetch.requestPaused
+            std.debug.print("[AUDIO BYPASS] Clicking Play button...\n", .{});
+            const pscript =
+                \\(() => {
+                \\  const btns = document.querySelectorAll('button');
+                \\  for (const btn of btns) {
+                \\    if (btn.textContent.trim() === 'Play' && btn.offsetParent !== null) {
+                \\      btn.click();
+                \\      return 'clicked';
+                \\    }
+                \\  }
+                \\  return 'not_found';
+                \\})()
+            ;
+            if (game_core_ctx > 0) {
+                _ = arkose_cdp.evaluateInContext(pscript, game_core_ctx) catch {};
+            } else {
+                _ = arkose_cdp.evaluate(pscript) catch {};
+            }
+            std.debug.print("[AUDIO BYPASS] Play button clicked, waiting for audio...\n", .{});
+
+            dl_result = audio_downloader.downloadAndSaveAudio(bridge, allocator, total_attempted) catch |err| {
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: downloadAndSaveAudio failed: {}\n", .{ total_attempted, err });
+                if (total_attempted == 0) return err;
+                std.debug.print("[AUDIO BYPASS] Skipping to next attempt...\n", .{});
+                continue;
+            };
+        } else {
+            // Fallback: game-core cross-process context unavailable.
+            // Use CDP evaluate on enforcement page to execute fetch() directly.
+            std.debug.print("[AUDIO BYPASS] game-core ctx=0, using CDP evaluate fetch fallback...\n", .{});
+            dl_result = audio_downloader.fetchAudioViaCdpEvaluate(
+                &arkose_cdp,
+                allocator,
+                total_attempted,
+                game_core_session_token orelse "",
+            ) catch |err| {
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: fetchAudioViaCdpEvaluate failed: {}\n", .{ total_attempted, err });
+                if (total_attempted == 0) return err;
+                std.debug.print("[AUDIO BYPASS] Skipping to next attempt...\n", .{});
+                continue;
+            };
+        }
+        const result = dl_result;
         defer {
             allocator.free(result.url);
             allocator.free(result.path);
@@ -177,8 +474,8 @@ pub fn runAudioBypass(
         std.debug.print("[AUDIO BYPASS] Guess (highest delta): {d} -> Answer: {d}\n", .{ flux_result.guess, answer });
         std.debug.print("[AUDIO BYPASS] Analysis time: {d}us\n", .{flux_result.execution_time_us});
 
-        // Step 9: Inject answer into browser and submit
-        audio_injector.injectAnswer(bridge, answer) catch |err| {
+        // Step 9: Inject answer into iframe and submit (via direct CDP session)
+        audio_injector.injectAnswerOnTarget(&arkose_cdp, allocator, answer, game_core_ctx) catch |err| {
             std.debug.print("[AUDIO BYPASS] Attempt {d}: inject/submit failed: {}\n", .{ total_attempted, err });
             continue;
         };

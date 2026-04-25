@@ -456,6 +456,7 @@ pub const StealthBrowser = struct {
     ///   3. Write harvest extension (manifest.json + harvest.js)
     ///   4. Build safe environment (purge GUI vars)
     ///   5. Configure and spawn Chrome with stealth flags
+    ///   5.5 Kill any existing Chrome on CDP_PORT before spawning
     ///
     /// Caller owns the returned StealthBrowser and must call deinit().
     pub fn init(
@@ -470,6 +471,22 @@ pub const StealthBrowser = struct {
         io: Io,
         chrome_binary: []const u8,
     ) BrowserInitError!StealthBrowser {
+        // Step 0: Kill any stale Chrome on port 9222 before doing anything
+        // SOURCE: pkill(1) — signal process by pattern match
+        // SOURCE: nanosleep(2) — give kernel time to release port bindings
+        {
+            if (process.spawn(io, .{
+                .argv = &[_][]const u8{ "pkill", "-f", "remote-debugging-port=9222" },
+                .stdin = .ignore,
+                .stdout = .ignore,
+                .stderr = .ignore,
+            })) |kc| {
+                var kill_child = kc;
+                _ = kill_child.wait(io) catch {};
+            } else |_| {}
+        }
+        _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 1, .nsec = 0 }, null);
+
         // Step 1: Generate temp profile directory
         var profile_dir = try generateTmpProfileDir(allocator);
         errdefer cleanupProfileDir(io, allocator, &profile_dir);

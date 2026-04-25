@@ -112,13 +112,29 @@ fn solveArkoseAudioChallenge(
     bridge: *browser_bridge.BrowserBridge,
     allocator: std.mem.Allocator,
     io: std.Io,
+    env: *network.BrowserEnvironment,
 ) !void {
+    std.debug.print("\n[AUDIO BYPASS] >>> STARTING AUDIO BYPASS PIPELINE <<<\n", .{});
     const result = try audio_bypass.runAudioBypass(bridge, allocator, io);
+
+    // SOURCE: Arkose Labs BDA format — audio_bypass optional field
+    // Map AudioBypassResult → AudioBypassInfo and write to BrowserEnvironment
+    env.audio_bypass = network.AudioBypassInfo{
+        .guess = result.guess,
+        .execution_time = result.execution_time_ms,
+    };
+
     if (result.success) {
+        std.debug.print("\n[AUDIO BYPASS] >>> PIPELINE COMPLETE <<<\n", .{});
         std.debug.print("[AUDIO BYPASS] All {d}/{d} challenges completed in {d}ms\n", .{
             result.total_challenges, audio_bypass.TARGET_CHALLENGES, result.execution_time_ms,
         });
+        std.debug.print("[AUDIO BYPASS] Last guess: {d} (answer: {d})\n", .{
+            result.guess, result.guess + 1,
+        });
+        std.debug.print("[AUDIO BYPASS] audio_bypass field written to BDA BrowserEnvironment\n", .{});
     } else {
+        std.debug.print("\n[AUDIO BYPASS] >>> PIPELINE ENDED (PARTIAL) <<<\n", .{});
         std.debug.print("[AUDIO BYPASS] Partial success: {d}/{d} challenges in {d}ms\n", .{
             result.total_challenges, audio_bypass.TARGET_CHALLENGES, result.execution_time_ms,
         });
@@ -397,6 +413,9 @@ pub fn main(init: std.process.Init) !void {
     // Step 3: Connect to Chrome CDP and install the browser session bridge.
     std.debug.print("[CDP] Connecting to Chrome CDP on localhost:{d}...\n", .{browser_bridge.CDP_PORT});
     var bridge = try browser_bridge.BrowserBridge.init(allocator, "https://github.com/signup");
+    std.debug.print("\n╔══════════════════════════════════════════════════════════╗\n", .{});
+    std.debug.print("║     >>> BRIDGE ESTABLISHED — AUDIO BYPASS READY <<<     ║\n", .{});
+    std.debug.print("╚══════════════════════════════════════════════════════════╝\n\n", .{});
     defer {
         bridge.verifyArtifacts();
         bridge.deinit();
@@ -553,14 +572,7 @@ pub fn main(init: std.process.Init) !void {
     if (!risk_status.challenge_required) {
         std.debug.print("[SUCCESS] Arkose Bypassed via Low-Risk Signature\n", .{});
     } else {
-        std.debug.print("[WARN] Challenge required! Activating Audio Bypass Pipeline...\n", .{});
-        // SOURCE: Arkose Labs Audio CAPTCHA — rtag/audio endpoint (live test 2026-04-24)
-        // Solve audio challenges before proceeding with signup
-        solveArkoseAudioChallenge(&bridge, allocator, io) catch |err| {
-            std.debug.print("[AUDIO BYPASS] Pipeline failed: {}\n", .{err});
-            std.debug.print("[AUDIO BYPASS] Continuing with signup anyway (challenge may be visual)\n", .{});
-        };
-        std.debug.print("[AUDIO BYPASS] Pipeline complete\n", .{});
+        std.debug.print("[WARN] Challenge required! Audio bypass integrated into captureSignupBundle\n", .{});
     }
 
     // =========================================================================
@@ -600,7 +612,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("[SIGNUP] Submitting POST to /signup...\n", .{});
 
     std.debug.print("[BROWSER] Capturing exact browser-owned signup bundle...\n", .{});
-    var signup_bundle = bridge.captureSignupBundle(username, email, password, "") catch |err| {
+    var signup_bundle = bridge.captureSignupBundle(username, email, password, "", io) catch |err| {
         std.debug.print("[BROWSER] FAILED: Could not capture signup bundle: {}\n", .{err});
         return err;
     };

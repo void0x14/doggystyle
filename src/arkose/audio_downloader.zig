@@ -41,6 +41,10 @@ pub const AudioDownloaderError = error{
     DirectoryCreateFailed,
     FileWriteFailed,
     UrlCaptureTimeout,
+    CdpEvalFailed,
+    Base64DecodeFailed,
+    GameTokenNotFound,
+    FetchFailed,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,6 +69,17 @@ const MAX_CHUNK_LINE_LEN: usize = 4096;
 // ---------------------------------------------------------------------------
 // Structs
 // ---------------------------------------------------------------------------
+
+/// Shared return type for download operations (used by audio_bypass.zig too)
+pub const FetchResult = struct {
+    url: []u8,
+    path: []u8,
+    data: []u8,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(FetchResult) > 0);
+}
 
 // SOURCE: Arkose Labs Audio API — rtag/audio returns MP3 per challenge
 pub const AudioClip = struct {
@@ -471,7 +486,7 @@ pub fn downloadAndSaveAudio(
     bridge: *browser_bridge.BrowserBridge,
     allocator: std.mem.Allocator,
     challenge_index: u8,
-) AudioDownloaderError!struct { url: []u8, path: []u8, data: []u8 } {
+) AudioDownloaderError!FetchResult {
     const url = try captureAudioUrl(bridge, allocator);
     errdefer allocator.free(url);
 
@@ -483,6 +498,135 @@ pub fn downloadAndSaveAudio(
 
     std.debug.print("[AUDIO] Challenge {d}: {d} bytes from {s} -> {s}\n", .{ challenge_index, data.len, url, path });
     return .{ .url = url, .path = path, .data = data };
+}
+
+// ---------------------------------------------------------------------------
+// fetchAudioViaCdpEvaluate — Enforcement page'de CDP evaluate() ile
+// fetch() çalıştırarak MP3 indirme (game-core cross-process fallback)
+// ---------------------------------------------------------------------------
+// SOURCE: Chrome DevTools Protocol — Runtime.evaluate executes JS in page context
+// SOURCE: Arkose Labs Audio API — rtag/audio?challenge=N&gameToken=X&sessionToken=Y
+// SOURCE: RFC 4648 — Base64 encoding
+// SOURCE: LIVE DEBUG 2026-04-25 — enforcement page CSP allows fetch to same origin
+//
+// game_core_ctx = 0 olduğunda game-core iframe'in JS context'ine erişilemez.
+// Ancak enforcement page'in kendi context'i (evaluate() without contextId)
+// çalışabilir. Bu fonksiyon enforcement page içinde fetch() yaparak:
+//   1. gameToken'ı window/locakStorage/iframe src'den bulur
+//   2. rtag/audio URL'ini oluşturur (sessionToken zaten biliniyor)
+//   3. Fetch'i enforcement page'den (same-origin) çalıştırır
+//   4. Yanıtı base64 encode edip döndürür
+//   5. Zig tarafında base64 decode edilip MP3 diske yazılır
+pub fn fetchAudioViaCdpEvaluate(
+    cdp: *browser_bridge.CdpClient,
+    allocator: std.mem.Allocator,
+    challenge_index: u8,
+    session_token: []const u8,
+) AudioDownloaderError!FetchResult {
+    const challenge_str = try std.fmt.allocPrint(allocator, "{d}", .{challenge_index});
+    defer allocator.free(challenge_str);
+
+    // Build JS that finds gameToken and fetches audio via same-origin fetch()
+    // SOURCE: ChromeDevTools MCP live test 2026-04-25 — enforcement page
+    // SOURCE: LIVE DEBUG 2026-04-25 — /fc/gfct/ POST endpoint returns gameToken after PoW
+    const js = try std.fmt.allocPrint(allocator,
+        \\(async () => {{
+        \\  let gt = '';
+        \\  try {{ gt = window.gameToken || window.__gameToken || ''; }} catch(e) {{}}
+        \\  if (!gt) try {{ gt = localStorage.getItem('gameToken') || ''; }} catch(e) {{}}
+        \\  if (!gt) {{
+        \\    try {{
+        \\      const k = Object.keys(window).find(k => k.startsWith('arkoseLabsClientApi'));
+        \\      if (k && window[k]) {{ gt = window[k].gameToken || window[k].game_token || ''; }}
+        \\    }} catch(e) {{}}
+        \\  }}
+        \\  if (!gt) {{
+        \\    try {{
+        \\      for (const f of document.querySelectorAll('iframe')) {{
+        \\        if (f.src) {{
+        \\          const m = f.src.match(/[?&]game_token=([^&]+)/);
+        \\          if (m) {{ gt = decodeURIComponent(m[1]); break; }}
+        \\        }}
+        \\      }}
+        \\    }} catch(e) {{}}
+        \\  }}
+        \\  // Fallback: fetch gameToken from fc/gfct API (same-origin)
+        \\  // SOURCE: LIVE DEBUG 2026-04-25 — enforcement page calls /fc/gfct/ after PoW
+        \\  if (!gt) {{
+        \\    try {{
+        \\      const st = window.location.hash.slice(1) || '{s}';
+        \\      const resp = await fetch('/fc/gfct/', {{
+        \\        method: 'POST',
+        \\        headers: {{'Content-Type':'application/json'}},
+        \\        body: JSON.stringify({{session_token: st}})
+        \\      }});
+        \\      if (resp.ok) {{
+        \\        const data = await resp.json();
+        \\        gt = data?.token || data?.gameToken || data?.game_token || '';
+        \\      }}
+        \\    }} catch(e) {{}}
+        \\  }}
+        \\  if (!gt) return 'ERROR:NO_GAME_TOKEN';
+        \\  const challenge = '{s}';
+        \\  const sessionTok = '{s}';
+        \\  let url = '/rtag/audio?challenge=' + challenge + '&gameToken=' + encodeURIComponent(gt);
+        \\  if (sessionTok) url += '&sessionToken=' + encodeURIComponent(sessionTok);
+        \\  try {{
+        \\    const resp = await fetch(url);
+        \\    if (!resp.ok) return 'ERROR:HTTP_' + resp.status;
+        \\    const buf = await resp.arrayBuffer();
+        \\    const bytes = new Uint8Array(buf);
+        \\    let binary = '';
+        \\    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        \\    return btoa(binary);
+        \\  }} catch(e) {{ return 'ERROR:FETCH'; }}
+        \\}})()
+    , .{ session_token, challenge_str, session_token });
+    defer allocator.free(js);
+
+    std.debug.print("[AUDIO] CDP evaluate fetch: challenge={s}, sessionToken={s}\n", .{ challenge_str, session_token });
+
+    const response = cdp.evaluate(js) catch |err| {
+        std.debug.print("[AUDIO] CDP evaluate call failed: {}\n", .{err});
+        return error.CdpEvalFailed;
+    };
+    defer allocator.free(response);
+
+    const b64_string = browser_bridge.extractRuntimeEvaluateStringValue(allocator, response) catch |err| {
+        std.debug.print("[AUDIO] CDP eval string extraction failed: {}\n", .{err});
+        return error.CdpEvalFailed;
+    };
+    defer allocator.free(b64_string);
+
+    if (mem.startsWith(u8, b64_string, "ERROR:")) {
+        std.debug.print("[AUDIO] CDP fetch error: {s}\n", .{b64_string});
+        if (mem.startsWith(u8, b64_string, "ERROR:NO_GAME_TOKEN")) return error.GameTokenNotFound;
+        if (mem.startsWith(u8, b64_string, "ERROR:HTTP_")) return error.FetchFailed;
+        if (mem.startsWith(u8, b64_string, "ERROR:FETCH")) return error.FetchFailed;
+        return error.FetchFailed;
+    }
+
+    std.debug.print("[AUDIO] CDP fetch got base64 response ({d} chars)\n", .{b64_string.len});
+
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(b64_string) catch |err| {
+        std.debug.print("[AUDIO] Base64 calcSizeForSlice failed: {}\n", .{err});
+        return error.Base64DecodeFailed;
+    };
+    const mp3_data = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(mp3_data);
+    decoder.decode(mp3_data, b64_string) catch |err| {
+        std.debug.print("[AUDIO] Base64 decode failed: {}\n", .{err});
+        return error.Base64DecodeFailed;
+    };
+
+    const path = try saveAudioDataToDisk(allocator, mp3_data, challenge_index);
+    errdefer allocator.free(path);
+
+    const url = try std.fmt.allocPrint(allocator, "cdp://challenge_{d}", .{challenge_index});
+
+    std.debug.print("[AUDIO] CDP fetch saved challenge {d}: {d} bytes -> {s}\n", .{ challenge_index, mp3_data.len, path });
+    return .{ .url = url, .path = path, .data = mp3_data };
 }
 
 fn currentTimestampNs() i64 {

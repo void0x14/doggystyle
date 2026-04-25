@@ -27,6 +27,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const browser_bundle = @import("browser_bundle.zig");
 const jitter_core = @import("jitter_core.zig");
+const audio_bypass = @import("arkose/audio_bypass.zig");
 
 // ---------------------------------------------------------------------------
 // Error Types
@@ -157,7 +158,7 @@ pub const CdpClient = struct {
         // SOURCE: man 3 getaddrinfo — protocol-independent name resolution
         var hints: std.c.addrinfo = .{
             .flags = .{ .NUMERICSERV = true },
-            .family = std.posix.AF.UNSPEC,
+            .family = std.posix.AF.INET,
             .socktype = std.posix.SOCK.STREAM,
             .protocol = 0,
             .addrlen = 0,
@@ -229,21 +230,194 @@ pub const CdpClient = struct {
         std.debug.print("[CDP] Step 4: Sending WebSocket upgrade...\n", .{});
         try writeAll(fd, handshake.ptr, handshake.len);
 
-        // Step 5: Read 101 Switching Protocols response
+        // Step 5: Read 101 Switching Protocols response (with WouldBlock retry)
+        // SOURCE: RFC 6455, Section 4.2.2 — Server opens connection and sends handshake
+        // TCP may fragment the response; read until \r\n\r\n or full buffer
         std.debug.print("[CDP] Step 5: Waiting for 101 response...\n", .{});
-        var resp_buf: [512]u8 = undefined;
-        const resp_n = std.posix.read(fd, &resp_buf) catch return error.HandshakeFailed;
-        if (resp_n < 15 or !mem.startsWith(u8, resp_buf[0..resp_n], "HTTP/1.1 101")) {
-            std.debug.print("[CDP] Handshake failed: got {d} bytes: {s}\n", .{ resp_n, resp_buf[0..@min(resp_n, 64)] });
+        var resp_buf: [2048]u8 = undefined;
+        var resp_total: usize = 0;
+        var retry_attempts: u32 = 0;
+        const WS_HANDSHAKE_MAX_RETRIES: u32 = 200; // 200 × 10ms = 2s timeout
+        while (resp_total == 0 or mem.indexOf(u8, resp_buf[0..resp_total], "\r\n\r\n") == null) : (retry_attempts += 1) {
+            if (retry_attempts >= WS_HANDSHAKE_MAX_RETRIES) {
+                std.debug.print("[CDP] Handshake timeout after {d} retries ({d} bytes so far: {s})\n", .{ retry_attempts, resp_total, resp_buf[0..@min(resp_total, 256)] });
+                return error.HandshakeFailed;
+            }
+            if (resp_total >= resp_buf.len) {
+                std.debug.print("[CDP] Handshake buffer overflow at {d} bytes\n", .{resp_total});
+                return error.HandshakeFailed;
+            }
+            const n = std.posix.read(fd, resp_buf[resp_total..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    const sleep_req = std.os.linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+                    _ = std.os.linux.nanosleep(&sleep_req, null);
+                    continue;
+                },
+                else => {
+                    std.debug.print("[CDP] Handshake read error at {d} bytes: {}\n", .{ resp_total, err });
+                    return error.HandshakeFailed;
+                },
+            };
+            if (n == 0) {
+                std.debug.print("[CDP] Handshake: connection closed at {d} bytes: {s}\n", .{ resp_total, resp_buf[0..@min(resp_total, 256)] });
+                return error.HandshakeFailed;
+            }
+            resp_total += n;
+        }
+        if (resp_total < 15 or !mem.startsWith(u8, resp_buf[0..resp_total], "HTTP/1.1 101")) {
+            std.debug.print("[CDP] Handshake failed: got {d} bytes: {s}\n", .{ resp_total, resp_buf[0..@min(resp_total, 64)] });
             return error.HandshakeFailed;
         }
 
-        std.debug.print("[CDP] WebSocket connected to Chrome\n", .{});
+        std.debug.print("[CDP] WebSocket connected to Chrome (101 response, {d} bytes)\n", .{resp_total});
 
         // Set socket receive timeout for WebSocket operations
         // SOURCE: man 7 socket — SO_RCVTIMEO prevents recvExact from blocking forever
-        const ws_timeout = std.os.linux.timeval{ .sec = 1, .usec = 0 };
-        _ = std.os.linux.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, @ptrCast(&ws_timeout), @sizeOf(std.os.linux.timeval));
+        const timeout = std.os.linux.timeval{ .sec = 3, .usec = 0 };
+        const sso_rc = linux.setsockopt(fd, 1, 20, @ptrCast(&timeout), @sizeOf(std.os.linux.timeval));
+        if (sso_rc == std.math.maxInt(usize)) {
+            std.debug.print("[CDP] WARNING: setsockopt SO_RCVTIMEO failed\n", .{});
+        }
+
+        return .{
+            .fd = fd,
+            .allocator = allocator,
+            .msg_id = 0,
+            .pending_events = std.array_list.Managed([]u8).init(allocator),
+        };
+    }
+
+    /// Connect directly to a known WebSocket URL (skip /json discovery).
+    /// Used by audio_bypass to connect directly to the Arkose enforcement iframe.
+    /// SOURCE: RFC 6455, Section 4.1 — Client-initiated handshake
+    pub fn connectToTarget(allocator: std.mem.Allocator, ws_url: []const u8) !CdpClient {
+        if (!mem.startsWith(u8, ws_url, "ws://")) return error.ParseFailed;
+        const after_scheme = ws_url["ws://".len..];
+        const path_start = mem.indexOfScalar(u8, after_scheme, '/') orelse return error.ParseFailed;
+        const host_port = after_scheme[0..path_start];
+        const path = after_scheme[path_start..];
+        const colon_idx = mem.lastIndexOfScalar(u8, host_port, ':') orelse return error.ParseFailed;
+        const host_str = host_port[0..colon_idx];
+        const port_str = host_port[colon_idx + 1 ..];
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return error.ParseFailed;
+
+        std.debug.print("[CDP] connectToTarget: host={s} port={d} path={s}\n", .{ host_str, port, path });
+
+        var hints: std.c.addrinfo = .{
+            .flags = .{ .NUMERICSERV = true },
+            .family = std.posix.AF.INET,
+            .socktype = std.posix.SOCK.STREAM,
+            .protocol = 0,
+            .addrlen = 0,
+            .canonname = null,
+            .addr = null,
+            .next = null,
+        };
+        var gai_port_buf: [8]u8 = undefined;
+        const gai_port_len = std.fmt.bufPrint(&gai_port_buf, "{d}\x00", .{port}) catch return error.OutOfMemory;
+        const gai_port_z: [:0]u8 = gai_port_buf[0 .. gai_port_len.len - 1 :0];
+        var host_buf: [256:0]u8 = undefined;
+        if (host_str.len >= host_buf.len) return error.ParseFailed;
+        @memcpy(host_buf[0..host_str.len], host_str);
+        host_buf[host_str.len] = 0;
+        var result: ?*std.c.addrinfo = null;
+        const gai_rc = std.c.getaddrinfo(host_buf[0..host_str.len :0].ptr, gai_port_z.ptr, &hints, &result);
+        if (@intFromEnum(gai_rc) != 0) return error.ResolveFailed;
+        defer std.c.freeaddrinfo(result.?);
+        const ai = result orelse return error.ResolveFailed;
+        var current_ai: ?*std.c.addrinfo = ai;
+        var connected_fd: i32 = -1;
+        while (current_ai) |cai| : (current_ai = cai.next) {
+            if (cai.addr == null) continue;
+            const rc_socket = linux.socket(@bitCast(cai.family), @bitCast(cai.socktype), @bitCast(cai.protocol));
+            if (@as(isize, @bitCast(rc_socket)) < 0) continue;
+            const try_fd: i32 = @intCast(rc_socket);
+            const rc_connect = linux.connect(try_fd, cai.addr.?, cai.addrlen);
+            if (@as(isize, @bitCast(rc_connect)) < 0) {
+                _ = std.c.close(try_fd);
+                continue;
+            }
+            connected_fd = try_fd;
+            break;
+        }
+        if (connected_fd < 0) {
+            std.debug.print("[CDP] connectToTarget: all connect attempts failed\n", .{});
+            return error.ConnectFailed;
+        }
+        const fd: i32 = connected_fd;
+        errdefer _ = std.c.close(fd);
+
+        // Set SO_RCVTIMEO BEFORE handshake read — without it, blocking socket
+        // std.posix.read can block indefinitely. Use 3s timeout.
+        const hs_timeout = std.os.linux.timeval{ .sec = 3, .usec = 0 };
+        const sso_rc = linux.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO,
+            @ptrCast(&hs_timeout), @sizeOf(std.os.linux.timeval));
+        if (sso_rc == std.math.maxInt(usize)) {
+            std.debug.print("[CDP] connectToTarget: WARNING: setsockopt SO_RCVTIMEO failed\n", .{});
+        }
+
+        const ws_key = "dGhlIHNhbXBsZSBub25jZQ==";
+        var handshake_buf: [1024]u8 = undefined;
+        const handshake = std.fmt.bufPrint(
+            &handshake_buf,
+            "GET {s} HTTP/1.1\r\n" ++
+                "Host: {s}\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Key: {s}\r\n" ++
+                "Sec-WebSocket-Version: 13\r\n\r\n",
+            .{ path, host_port, ws_key },
+        ) catch return error.OutOfMemory;
+        try writeAll(fd, handshake.ptr, handshake.len);
+        std.debug.print("[CDP] connectToTarget: WebSocket upgrade sent, reading handshake response...\n", .{});
+
+        var resp_buf: [2048]u8 = undefined;
+        var resp_total: usize = 0;
+        var retry_attempts: u32 = 0;
+        const WS_HANDSHAKE_MAX_RETRIES: u32 = 100; // 100 × 30ms = 3s (SO_RCVTIMEO provides the primary timeout)
+        while (resp_total == 0 or mem.indexOf(u8, resp_buf[0..resp_total], "\r\n\r\n") == null) : (retry_attempts += 1) {
+            if (retry_attempts >= WS_HANDSHAKE_MAX_RETRIES) {
+                std.debug.print("[CDP] connectToTarget: handshake timeout ({d} retries, {d} bytes)\n", .{ retry_attempts, resp_total });
+                return error.HandshakeFailed;
+            }
+            if (resp_total >= resp_buf.len) {
+                std.debug.print("[CDP] connectToTarget: handshake buffer overflow ({d} bytes)\n", .{resp_total});
+                return error.HandshakeFailed;
+            }
+            const n = std.posix.read(fd, resp_buf[resp_total..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    const sleep_req = std.os.linux.timespec{ .sec = 0, .nsec = 30 * std.time.ns_per_ms };
+                    _ = std.os.linux.nanosleep(&sleep_req, null);
+                    continue;
+                },
+                error.ConnectionResetByPeer => {
+                    std.debug.print("[CDP] connectToTarget: connection reset during handshake\n", .{});
+                    return error.HandshakeFailed;
+                },
+                else => {
+                    std.debug.print("[CDP] connectToTarget: handshake read failed: {}\n", .{err});
+                    return error.HandshakeFailed;
+                },
+            };
+            if (n == 0) {
+                std.debug.print("[CDP] connectToTarget: connection closed during handshake ({d} bytes)\n", .{resp_total});
+                return error.HandshakeFailed;
+            }
+            resp_total += n;
+        }
+        if (resp_total < 15 or !mem.startsWith(u8, resp_buf[0..resp_total], "HTTP/1.1 101")) {
+            std.debug.print("[CDP] connectToTarget: bad handshake response ({d} bytes): {s}\n", .{ resp_total, resp_buf[0..@min(resp_total, 64)] });
+            return error.HandshakeFailed;
+        }
+
+        std.debug.print("[CDP] connectToTarget: WebSocket connected (101, {d} bytes)\n", .{resp_total});
+        // Reset SO_RCVTIMEO for normal CDP message exchange (3s is appropriate for CDP)
+        const cdp_timeout = std.os.linux.timeval{ .sec = 3, .usec = 0 };
+        const sso_rc2 = linux.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO,
+            @ptrCast(&cdp_timeout), @sizeOf(std.os.linux.timeval));
+        if (sso_rc2 == std.math.maxInt(usize)) {
+            std.debug.print("[CDP] connectToTarget: WARNING: setsockopt SO_RCVTIMEO (post-handshake) failed\n", .{});
+        }
 
         return .{
             .fd = fd,
@@ -330,6 +504,44 @@ pub const CdpClient = struct {
         return self.evaluate(expression);
     }
 
+    /// Evaluate JavaScript in a specific execution context (e.g., iframe)
+    /// SOURCE: CDP spec — Runtime.evaluate supports "contextId" for targeting subframes
+    pub fn evaluateInContext(self: *CdpClient, expression: []const u8, context_id: i64) ![]u8 {
+        var params_buf: [MAX_CDP_BUF]u8 = undefined;
+        var expr_escaped: [MAX_CDP_BUF]u8 = undefined;
+        const escaped_len = escapeJsonString(expression, &expr_escaped);
+        const params = std.fmt.bufPrint(
+            &params_buf,
+            "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true,\"contextId\":{d}}}",
+            .{ expr_escaped[0..escaped_len], context_id },
+        ) catch {
+            std.debug.print("[CDP] evaluateInContext: params bufPrint failed\n", .{});
+            return error.OutOfMemory;
+        };
+
+        std.debug.print("[CDP] evaluateInContext: ctx={d}, expr_len={d}\n", .{ context_id, expression.len });
+        const response = self.sendCommand("Runtime.evaluate", params) catch |err| {
+            std.debug.print("[CDP] evaluateInContext: sendCommand failed: {}\n", .{err});
+            return err;
+        };
+        return response;
+    }
+
+    pub fn drainPendingEvents(self: *CdpClient) void {
+        for (self.pending_events.items) |event| {
+            self.allocator.free(event);
+        }
+        self.pending_events.items.len = 0;
+    }
+
+    /// Enable Runtime domain to receive execution context events
+    /// SOURCE: CDP spec — Runtime.enable sends Runtime.executionContextCreated events
+    pub fn runtimeEnable(self: *CdpClient) ![]u8 {
+        std.debug.print("[CDP] Runtime.enable — requesting execution context events\n", .{});
+        const response = try self.sendCommand("Runtime.enable", "{}");
+        return response;
+    }
+
     fn setReceiveTimeoutMs(self: *CdpClient, timeout_ms: u64) void {
         const timeout = std.os.linux.timeval{
             .sec = @intCast(timeout_ms / std.time.ms_per_s),
@@ -403,10 +615,13 @@ pub const CdpClient = struct {
     // SOURCE: Chrome DevTools Protocol Network.enable — enables network tracking,
     // sends Network.requestWillBeSent and Network.responseReceived events.
     pub fn enableNetworkMonitoring(self: *CdpClient) !void {
-        const response = try self.sendCommand("Network.enable", "{}");
+        // Enable with max buffer size to capture response bodies for token extraction
+        // SOURCE: CDP Network.enable — maxTotalBufferSize=10MB, maxResourceBufferSize=5MB
+        const params = "{\"maxTotalBufferSize\":10485760,\"maxResourceBufferSize\":5242880}";
+        const response = try self.sendCommand("Network.enable", params);
         defer self.allocator.free(response);
         try ensureCdpCommandSucceeded(self.allocator, "Network.enable", response);
-        std.debug.print("[CDP] Network.enable — CDP network monitoring active\n", .{});
+        std.debug.print("[CDP] Network.enable — CDP network monitoring active (buffer: 10MB)\n", .{});
     }
 
     pub fn hasPendingEvents(self: *const CdpClient) bool {
@@ -580,7 +795,7 @@ pub const CdpClient = struct {
         // SOURCE: man 3 getaddrinfo — protocol-independent name resolution
         var hints: std.c.addrinfo = .{
             .flags = .{ .NUMERICSERV = true },
-            .family = std.posix.AF.UNSPEC, // allow both IPv4 and IPv6
+            .family = std.posix.AF.INET, // force IPv4 (Chrome CDP IPv6 bug)
             .socktype = std.posix.SOCK.STREAM,
             .protocol = 0,
             .addrlen = 0,
@@ -631,30 +846,53 @@ pub const CdpClient = struct {
         // Send HTTP GET /json
         const request = "GET /json HTTP/1.1\r\nHost: localhost:9222\r\nConnection: close\r\n\r\n";
         try writeAll(fd, request.ptr, request.len);
+        std.debug.print("[CDP] HTTP GET /json sent, waiting for response...\n", .{});
 
-        // Set socket receive timeout (3 seconds)
-        // SOURCE: man 7 socket — SO_RCVTIMEO sets receive timeout
-        const timeout = std.os.linux.timeval{
-            .sec = 3,
-            .usec = 0,
-        };
-        _ = std.os.linux.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, @ptrCast(&timeout), @sizeOf(std.os.linux.timeval));
-
-        // Read response — Connection: close means server will close after sending
+        // poll() + read() loop with Content-Length parsing
         var resp_buf: [MAX_CDP_BUF]u8 = undefined;
         var total: usize = 0;
-        while (total < resp_buf.len - 1) {
-            const n = std.posix.read(fd, resp_buf[total..]) catch |err| {
-                std.debug.print("[CDP] read error at {d} bytes: {}\n", .{ total, err });
-                break;
-            };
-            if (n == 0) {
-                std.debug.print("[CDP] read returned 0 (connection closed) at {d} bytes\n", .{total});
-                break;
+        var poll_timeout_count: u32 = 0;
+        const MAX_POLL_TIMEOUTS: u32 = 10;
+        while (total < resp_buf.len) {
+            var pfd: [1]std.posix.pollfd = undefined;
+            pfd[0] = .{ .fd = fd, .events = @as(i16, @intCast(1)), .revents = 0 };
+            const poll_rc = std.posix.poll(&pfd, 1000) catch break;
+            if (poll_rc == 0) {
+                poll_timeout_count += 1;
+                if (poll_timeout_count >= MAX_POLL_TIMEOUTS) break;
+                continue;
             }
+            const revents: i16 = pfd[0].revents;
+            if ((revents & @as(i16, @intCast(1))) == 0) continue;
+            const n = std.posix.read(fd, resp_buf[total..]) catch break;
+            if (n == 0) break;
             total += n;
-        }
+            poll_timeout_count = 0;
 
+            // Content-Length check
+            if (total >= 4) {
+                if (std.mem.indexOf(u8, resp_buf[0..total], "\r\n\r\n")) |headers_end| {
+                    const body_start = headers_end + 4;
+                    const cl_prefix = "Content-Length";
+                    const header_block = resp_buf[0..headers_end];
+                    if (std.mem.indexOf(u8, header_block, cl_prefix)) |cl_key_pos| {
+                        const after_colon = cl_key_pos + cl_prefix.len;
+                        if (after_colon < headers_end and resp_buf[after_colon] == ':') {
+                            var cl_start = after_colon + 1;
+                            while (cl_start < headers_end and (resp_buf[cl_start] == ' ' or resp_buf[cl_start] == '\t')) cl_start += 1;
+                            var cl_end = cl_start;
+                            while (cl_end < headers_end and resp_buf[cl_end] >= '0' and resp_buf[cl_end] <= '9') cl_end += 1;
+                            if (cl_end > cl_start) {
+                                if (std.fmt.parseInt(usize, resp_buf[cl_start..cl_end], 10)) |content_len| {
+                                    const expected_total = body_start + content_len;
+                                    if (total >= expected_total) break;
+                                } else |_| {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
         std.debug.print("[CDP] Total HTTP response: {d} bytes\n", .{total});
         if (total == 0) return error.ParseFailed;
 
@@ -667,10 +905,16 @@ pub const CdpClient = struct {
         std.debug.print("[CDP] Body preview: {s}\n", .{body[0..body_preview]});
 
         // Parse JSON array of tab objects
-        // Look for "webSocketDebuggerUrl" and "url" fields
+        // Look for "type", "webSocketDebuggerUrl", and "url" fields
         // Minimal JSON parsing: find the tab with matching URL prefix
         // NOTE: CDP JSON includes spaces after colons: "url": "https://..."
         // We search for the key with space flexibility
+        //
+        // CRITICAL: Iframes (type:"iframe") are filtered out so we only target
+        // the main page tab. Captcha iframes (octocaptcha.com, arkoselabs.com)
+        // are handled via separate CDP session attachment.
+        // SOURCE: Chrome DevTools Protocol Target domain — GET /json returns type field
+        const type_key = "\"type\": \"";
         const ws_key = "\"webSocketDebuggerUrl\": \"";
         const url_key = "\"url\": \"";
 
@@ -684,18 +928,32 @@ pub const CdpClient = struct {
 
             std.debug.print("[CDP] Found tab URL: {s} (looking for prefix: {s})\n", .{ tab_url, url_prefix });
 
+            // Find the start of this JSON object to check type field and ws_url
+            const obj_start = if (mem.lastIndexOfScalar(u8, body[0..url_idx], '{')) |pos| pos else url_idx;
+            const obj_end = mem.indexOfScalarPos(u8, body, url_idx, '}') orelse break;
+
+            // Filter: skip iframe entries — only target main page tabs
+            // SOURCE: Chrome DevTools Protocol — GET /json returns "type":"iframe" for subframes
+            const type_idx = mem.indexOfPos(u8, body, obj_start, type_key) orelse {
+                idx = obj_end + 1;
+                continue;
+            };
+            const type_val_start = type_idx + type_key.len;
+            const type_val_end = mem.indexOfScalarPos(u8, body, type_val_start, '"') orelse obj_end;
+            const tab_type = body[type_val_start..type_val_end];
+            if (!mem.eql(u8, tab_type, "page")) {
+                std.debug.print("[CDP] Skipping non-page target (type={s}): {s}\n", .{ tab_type, tab_url[0..@min(tab_url.len, 80)] });
+                idx = obj_end + 1;
+                continue;
+            }
+
             // Check if this tab matches our target URL prefix
             if (mem.startsWith(u8, tab_url, url_prefix)) {
-                // Find the corresponding webSocketDebuggerUrl in the same object
-                // Search backwards from url_idx to find the start of this JSON object
-                const obj_start = mem.indexOfPos(u8, body, url_idx, "{") orelse idx;
-                const obj_end = mem.indexOfScalarPos(u8, body, url_idx, '}') orelse break;
-
                 const ws_idx = mem.indexOfPos(u8, body, obj_start, ws_key) orelse {
                     idx = obj_end + 1;
                     continue;
                 };
-                const ws_val_start = obj_start + ws_idx + ws_key.len;
+                const ws_val_start = ws_idx + ws_key.len;
                 const ws_val_end = mem.indexOfScalarPos(u8, body, ws_val_start, '"') orelse break;
                 const ws_url = body[ws_val_start..ws_val_end];
 
@@ -704,7 +962,7 @@ pub const CdpClient = struct {
                 };
             }
 
-            idx = url_val_end + 1;
+            idx = obj_end + 1;
         }
 
         return error.NoTarget;
@@ -715,38 +973,107 @@ pub const CdpClient = struct {
 // Helper functions
 // ---------------------------------------------------------------------------
 
-/// Write all bytes to fd, handling partial writes
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Quick pre-flight check: is Chrome listening on the CDP port?
+/// SOURCE: man 2 connect — returns ECONNREFUSED if port not open, success if listening
+fn isChromeCdpListening() bool {
+    var hints: std.c.addrinfo = .{
+        .flags = .{ .NUMERICSERV = true },
+        .family = std.posix.AF.INET,
+        .socktype = std.posix.SOCK.STREAM,
+        .protocol = 0,
+        .addrlen = 0,
+        .canonname = null,
+        .addr = null,
+        .next = null,
+    };
+    var port_buf: [8]u8 = undefined;
+    const port_len = std.fmt.bufPrint(&port_buf, "{d}\x00", .{CDP_PORT}) catch return false;
+    const port_z: [:0]u8 = port_buf[0 .. port_len.len - 1 :0];
+
+    var result: ?*std.c.addrinfo = null;
+    const gai_rc = std.c.getaddrinfo("127.0.0.1", port_z.ptr, &hints, &result);
+    if (@intFromEnum(gai_rc) != 0) return false;
+    defer if (result) |r| std.c.freeaddrinfo(r);
+
+    const ai = result orelse return false;
+    const rc_socket = linux.socket(@bitCast(ai.family), @bitCast(ai.socktype), @bitCast(ai.protocol));
+    if (@as(isize, @bitCast(rc_socket)) < 0) return false;
+    const try_fd: i32 = @intCast(rc_socket);
+    defer _ = std.c.close(try_fd);
+
+    const rc_connect = linux.connect(try_fd, ai.addr.?, ai.addrlen);
+    const rc_int: isize = @bitCast(rc_connect);
+    if (rc_int < 0) {
+        // errno will be ECONNREFUSED if nothing is listening
+        return false;
+    }
+    return true;
+}
+
+/// Write all bytes to fd, handling partial writes and WouldBlock
 /// SOURCE: man 2 write — may write fewer bytes than requested
+/// SOURCE: man 2 write — EAGAIN/EWOULDBLOCK on non-blocking or timed-out socket
 fn writeAll(fd: i32, data: [*]const u8, len: usize) !void {
     var written: usize = 0;
+    var wouldblock_retries: u32 = 0;
+    const WRITE_MAX_RETRIES: u32 = 100; // 100 × 10ms = 1s total
     while (written < len) {
-        // Use linux.write syscall directly — returns usize
-        // SOURCE: man 2 write — on error returns -1 (as usize: maxInt(usize))
         const rc = linux.write(fd, data + written, len - written);
         if (rc == std.math.maxInt(usize)) {
-            const err = std.posix.errno(rc);
-            std.debug.print("[CDP] writeAll: write failed (errno={})\n", .{err});
+            const errno_val = std.posix.errno(rc);
+            if (errno_val == .AGAIN) {
+                if (wouldblock_retries >= WRITE_MAX_RETRIES) {
+                    std.debug.print("[CDP] writeAll: WouldBlock timeout after {d} retries\n", .{wouldblock_retries});
+                    return error.WriteFailed;
+                }
+                wouldblock_retries += 1;
+                const sleep_req = std.os.linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+                _ = std.os.linux.nanosleep(&sleep_req, null);
+                continue;
+            }
+            std.debug.print("[CDP] writeAll: write failed (errno={})\n", .{errno_val});
             return error.WriteFailed;
         }
         const n: usize = @intCast(rc);
         if (n == 0) return error.WriteFailed;
         written += n;
+        wouldblock_retries = 0; // reset on progress
     }
 }
 
-/// Read exactly N bytes from a file descriptor
+/// Read exactly N bytes from a file descriptor, with WouldBlock retry
+/// SOURCE: man 2 read — EAGAIN/EWOULDBLOCK on non-blocking fd or SO_RCVTIMEO expiry
 fn recvExact(fd: i32, buf: []u8) ![]u8 {
     var total: usize = 0;
+    var wouldblock_retries: u32 = 0;
+    const READ_MAX_RETRIES: u32 = 100; // 100 × 10ms = 1s total
     while (total < buf.len) {
-        const n = std.posix.read(fd, buf[total..]) catch |err| {
-            std.debug.print("[CDP] recvExact: read failed after {d}/{d} bytes: {}\n", .{ total, buf.len, err });
-            return error.ReadFailed;
+        const n = std.posix.read(fd, buf[total..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                if (wouldblock_retries >= READ_MAX_RETRIES) {
+                    std.debug.print("[CDP] recvExact: WouldBlock timeout after {d} retries ({d}/{d} bytes)\n", .{ wouldblock_retries, total, buf.len });
+                    return error.ReadFailed;
+                }
+                wouldblock_retries += 1;
+                const sleep_req = std.os.linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+                _ = std.os.linux.nanosleep(&sleep_req, null);
+                continue;
+            },
+            else => {
+                std.debug.print("[CDP] recvExact: read failed after {d}/{d} bytes: {}\n", .{ total, buf.len, err });
+                return error.ReadFailed;
+            },
         };
         if (n == 0) {
             std.debug.print("[CDP] recvExact: EOF after {d}/{d} bytes\n", .{ total, buf.len });
             return error.ReadFailed;
         }
         total += n;
+        wouldblock_retries = 0; // reset on progress
     }
     return buf;
 }
@@ -955,6 +1282,13 @@ pub const BrowserAuditResult = struct {
     screenshot_path: ?[]const u8 = null,
     timestamp_ms: u64 = 0,
     err_msg: ?[]const u8 = null,
+
+    /// Free allocator-owned fields (screenshot_path dupe)
+    pub fn deinit(self: *BrowserAuditResult, allocator: std.mem.Allocator) void {
+        if (self.screenshot_path) |s| {
+            allocator.free(s);
+        }
+    }
 
     /// Serialize this audit result to the browser-actions.ndjson file.
     /// Must be called by the bridge after the result is fully constructed.
@@ -1343,14 +1677,27 @@ pub const BrowserBridge = struct {
         _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
         const now_ns = @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 
+        // Pre-flight check: verify Chrome is listening on CDP port
+        // SOURCE: man 2 connect — EAGAIN/ECONNREFUSED if port not open
+        const chrome_available = isChromeCdpListening();
+        std.debug.print("[BRIDGE] Pre-flight: Chrome CDP on port {d}: {s}\n", .{
+            CDP_PORT,
+            if (chrome_available) "LISTENING" else "NOT AVAILABLE",
+        });
+        if (!chrome_available) {
+            std.debug.print("[BRIDGE] Chrome CDP port {d} not reachable — is Chrome running with --remote-debugging-port={d}?\n", .{ CDP_PORT, CDP_PORT });
+        }
+
         // Wait for Chrome to start and load the target page
         // Retry connecting to CDP every 500ms for up to 10 seconds
         var cdp: CdpClient = undefined;
         var connected = false;
         var attempts: u32 = 0;
-        while (!connected and attempts < 20) {
-            cdp = CdpClient.connect(allocator, target_url_prefix) catch {
+        const MAX_ATTEMPTS: u32 = 20;
+        while (!connected and attempts < MAX_ATTEMPTS) {
+            cdp = CdpClient.connect(allocator, target_url_prefix) catch |err| {
                 attempts += 1;
+                std.debug.print("[BRIDGE] CDP connect attempt {d}/{d} failed: {} — retrying in 500ms...\n", .{ attempts, MAX_ATTEMPTS, err });
                 // Sleep 500ms between retries
                 // SOURCE: man 2 nanosleep — suspends execution for specified interval
                 const sleep_req = std.os.linux.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_ms };
@@ -1362,8 +1709,12 @@ pub const BrowserBridge = struct {
 
         if (!connected) {
             std.debug.print("[BRIDGE] Failed to connect to CDP after {d} attempts\n", .{attempts});
+            std.debug.print("[BRIDGE] Verify: Chrome --remote-debugging-port={d} is running\n", .{CDP_PORT});
+            std.debug.print("[BRIDGE] Check: `curl http://localhost:{d}/json` should return tab list\n", .{CDP_PORT});
             return BridgeError.ConnectFailed;
         }
+
+        std.debug.print("\n>>> BRIDGE ESTABLISHED — AUDIO BYPASS STARTING <<<\n", .{});
 
         var bridge = BrowserBridge{
             .allocator = allocator,
@@ -1547,8 +1898,8 @@ pub const BrowserBridge = struct {
         // Step 5: Duplicate strings into allocator-owned memory
         // (parsed struct fields point to temporary JSON buffer memory)
         var diagnostic = parsed.value;
-        diagnostic.navigator_plugins_names = self.allocator.dupe(u8, diagnostic.navigator_plugins_names) catch return BridgeError.OutOfMemory;
         diagnostic.navigator_languages = self.allocator.dupe(u8, diagnostic.navigator_languages) catch return BridgeError.OutOfMemory;
+        diagnostic.navigator_plugins_names = self.allocator.dupe(u8, diagnostic.navigator_plugins_names) catch return BridgeError.OutOfMemory;
         diagnostic.navigator_platform = self.allocator.dupe(u8, diagnostic.navigator_platform) catch return BridgeError.OutOfMemory;
         diagnostic.navigator_userAgent = self.allocator.dupe(u8, diagnostic.navigator_userAgent) catch return BridgeError.OutOfMemory;
         diagnostic.webgl_vendor = self.allocator.dupe(u8, diagnostic.webgl_vendor) catch return BridgeError.OutOfMemory;
@@ -1558,7 +1909,6 @@ pub const BrowserBridge = struct {
         diagnostic.notification_permission = self.allocator.dupe(u8, diagnostic.notification_permission) catch return BridgeError.OutOfMemory;
         diagnostic.permissions_notifications = self.allocator.dupe(u8, diagnostic.permissions_notifications) catch return BridgeError.OutOfMemory;
         diagnostic.permissions_geolocation = self.allocator.dupe(u8, diagnostic.permissions_geolocation) catch return BridgeError.OutOfMemory;
-        diagnostic.navigator_plugins_names = self.allocator.dupe(u8, diagnostic.navigator_plugins_names) catch return BridgeError.OutOfMemory;
         diagnostic.sourceurl_leak = parsed.value.sourceurl_leak;
         diagnostic.history_length = parsed.value.history_length;
         diagnostic.touch_support = parsed.value.touch_support;
@@ -1579,20 +1929,186 @@ pub const BrowserBridge = struct {
         return diagnostic;
     }
 
+    /// Find the Arkose Labs enforcement iframe's WebSocket debugger URL.
+    /// Connects to /json and searches for iframe targets whose URL contains "arkoselabs".
+    /// SOURCE: Chrome DevTools Protocol — GET /json returns iframe entries too
+    pub fn getArkoseWsUrl(self: *BrowserBridge, allocator: mem.Allocator) ![]u8 {
+        _ = self;
+        var hints: std.c.addrinfo = .{
+            .flags = .{ .NUMERICSERV = true },
+            .family = std.posix.AF.INET, // force IPv4 (Chrome CDP IPv6 bug)
+            .socktype = std.posix.SOCK.STREAM,
+            .protocol = 0,
+            .addrlen = 0,
+            .canonname = null,
+            .addr = null,
+            .next = null,
+        };
+        var port_buf: [8]u8 = undefined;
+        const port_len = std.fmt.bufPrint(&port_buf, "{d}\x00", .{CDP_PORT}) catch return error.OutOfMemory;
+        const port_z: [:0]u8 = port_buf[0 .. port_len.len - 1 :0];
+        var result: ?*std.c.addrinfo = null;
+        const gai_rc = std.c.getaddrinfo("localhost", port_z.ptr, &hints, &result);
+        if (@intFromEnum(gai_rc) != 0) return error.ResolveFailed;
+        defer std.c.freeaddrinfo(result.?);
+        const ai = result orelse return error.ResolveFailed;
+        var current_ai: ?*std.c.addrinfo = ai;
+        var connected_fd: i32 = -1;
+        while (current_ai) |cai| : (current_ai = cai.next) {
+            if (cai.addr == null) continue;
+            const rc_socket = linux.socket(@bitCast(cai.family), @bitCast(cai.socktype), @bitCast(cai.protocol));
+            if (@as(isize, @bitCast(rc_socket)) < 0) continue;
+            const try_fd: i32 = @intCast(rc_socket);
+            const rc_connect = linux.connect(try_fd, cai.addr.?, cai.addrlen);
+            if (@as(isize, @bitCast(rc_connect)) < 0) { _ = std.c.close(try_fd); continue; }
+            connected_fd = try_fd;
+            break;
+        }
+        if (connected_fd < 0) return error.ConnectFailed;
+        const fd: i32 = connected_fd;
+        defer _ = std.c.close(fd);
+
+        // Send HTTP GET /json
+        const request = "GET /json HTTP/1.1\r\nHost: localhost:9222\r\nConnection: close\r\n\r\n";
+        try writeAll(fd, request.ptr, request.len);
+        std.debug.print("[BRIDGE] getArkoseWsUrl: GET /json sent, waiting for response...\n", .{});
+
+        // poll() + read() loop with Content-Length parsing (same as findTargetTab)
+        var resp_buf: [MAX_CDP_BUF]u8 = undefined;
+        var total: usize = 0;
+        var poll_timeout_count: u32 = 0;
+        const MAX_POLL_TIMEOUTS: u32 = 10;
+        while (total < resp_buf.len) {
+            var pfd: [1]std.posix.pollfd = undefined;
+            pfd[0] = .{ .fd = fd, .events = @as(i16, @intCast(1)), .revents = 0 };
+            const poll_rc = std.posix.poll(&pfd, 1000) catch break;
+            if (poll_rc == 0) {
+                poll_timeout_count += 1;
+                if (poll_timeout_count >= MAX_POLL_TIMEOUTS) {
+                    std.debug.print("[BRIDGE] getArkoseWsUrl: poll timeout after {d}s ({d} bytes)\n", .{ poll_timeout_count, total });
+                    break;
+                }
+                continue;
+            }
+            const revents: i16 = pfd[0].revents;
+            if ((revents & @as(i16, @intCast(1))) == 0) continue;
+            const n = std.posix.read(fd, resp_buf[total..]) catch {
+                std.debug.print("[BRIDGE] getArkoseWsUrl: read failed at {d} bytes\n", .{total});
+                break;
+            };
+            if (n == 0) {
+                std.debug.print("[BRIDGE] getArkoseWsUrl: connection closed at {d} bytes\n", .{total});
+                break;
+            }
+            total += n;
+            poll_timeout_count = 0;
+
+            // Content-Length check
+            if (total >= 4) {
+                if (std.mem.indexOf(u8, resp_buf[0..total], "\r\n\r\n")) |headers_end| {
+                    const body_start = headers_end + 4;
+                    const cl_prefix = "Content-Length";
+                    const header_block = resp_buf[0..headers_end];
+                    if (std.mem.indexOf(u8, header_block, cl_prefix)) |cl_key_pos| {
+                        const after_colon = cl_key_pos + cl_prefix.len;
+                        if (after_colon < headers_end and resp_buf[after_colon] == ':') {
+                            var cl_start = after_colon + 1;
+                            while (cl_start < headers_end and (resp_buf[cl_start] == ' ' or resp_buf[cl_start] == '\t')) cl_start += 1;
+                            var cl_end = cl_start;
+                            while (cl_end < headers_end and resp_buf[cl_end] >= '0' and resp_buf[cl_end] <= '9') cl_end += 1;
+                            if (cl_end > cl_start) {
+                                if (std.fmt.parseInt(usize, resp_buf[cl_start..cl_end], 10)) |content_len| {
+                                    const expected_total = body_start + content_len;
+                                    if (total >= expected_total) break;
+                                } else |_| {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std.debug.print("[BRIDGE] getArkoseWsUrl: received {d} bytes from /json\n", .{total});
+        if (total == 0) {
+            std.debug.print("[BRIDGE] getArkoseWsUrl: FAILED — empty response\n", .{});
+            return error.ParseFailed;
+        }
+        const body_start = mem.indexOf(u8, resp_buf[0..total], "\r\n\r\n") orelse return error.ParseFailed;
+        const body = resp_buf[body_start + 4 .. total];
+        const type_key = "\"type\": \"";
+        const ws_key = "\"webSocketDebuggerUrl\": \"";
+        const url_key = "\"url\": \"";
+        var idx: usize = 0;
+        while (idx < body.len) {
+            const url_idx = mem.indexOfPos(u8, body, idx, url_key) orelse break;
+            const url_val_start = url_idx + url_key.len;
+            const url_val_end = mem.indexOfScalarPos(u8, body, url_val_start, '"') orelse break;
+            const tab_url = body[url_val_start..url_val_end];
+            const obj_start = if (mem.lastIndexOfScalar(u8, body[0..url_idx], '{')) |pos| pos else url_idx;
+            const obj_end = mem.indexOfScalarPos(u8, body, url_idx, '}') orelse break;
+            const type_idx = mem.indexOfPos(u8, body, obj_start, type_key) orelse {
+                idx = obj_end + 1;
+                continue;
+            };
+            const type_val_start = type_idx + type_key.len;
+            const type_val_end = mem.indexOfScalarPos(u8, body, type_val_start, '"') orelse obj_end;
+            const tab_type = body[type_val_start..type_val_end];
+            if (!mem.eql(u8, tab_type, "iframe")) {
+                idx = obj_end + 1;
+                continue;
+            }
+            if (mem.indexOf(u8, tab_url, "arkoselabs") != null) {
+                const ws_idx = mem.indexOfPos(u8, body, obj_start, ws_key) orelse {
+                    idx = obj_end + 1;
+                    continue;
+                };
+                const ws_val_start = ws_idx + ws_key.len;
+                const ws_val_end = mem.indexOfScalarPos(u8, body, ws_val_start, '"') orelse break;
+                const ws_url = try allocator.dupe(u8, body[ws_val_start..ws_val_end]);
+                std.debug.print("[BRIDGE] Found Arkose iframe WS URL: {s}\n", .{ws_url});
+                return ws_url;
+            }
+            idx = obj_end + 1;
+        }
+        return error.NoTarget;
+    }
+
     pub fn captureSignupBundle(
         self: *BrowserBridge,
         username: []const u8,
         email: []const u8,
         password: []const u8,
         country: []const u8,
+        io: std.Io,
     ) BridgeError!browser_bundle.SignupBundle {
         try self.ensureBridgeReadyOnCurrentPage(BRIDGE_INIT_READY_TIMEOUT_MS);
         try self.waitForTruthyExpression(SIGNUP_FORM_READY_EXPRESSION, REQUEST_CAPTURE_TIMEOUT_MS);
         try self.cdp.enableFetchInterception("*github.com/signup?social=false*");
         defer self.cdp.disableFetchInterception() catch {};
 
-        _ = try self.startSignupChallenge(username, email, password, country);
+        {
+            _ = self.dismissPageBlockers() catch {};
+            var audit = try self.startSignupChallenge(username, email, password, country);
+            audit.deinit(self.allocator);
+        }
         std.debug.print("[BRIDGE] Waiting for browser-owned final signup request after visible Create account trigger...\n", .{});
+
+        {
+            const captcha_check = self.cdp.evaluate(
+                "document.querySelector('iframe.js-octocaptcha-frame, iframe[src*=\"octocaptcha\"], iframe[src*=\"arkose\"], iframe[title*=\"captcha\"], div[data-octocaptcha]') ? 'challenge' : 'no-challenge'",
+            ) catch |err| blk: {
+                std.debug.print("[BRIDGE] Captcha check failed: {}\n", .{err});
+                break :blk "";
+            };
+            defer self.allocator.free(captcha_check);
+            if (captcha_check.len > 0 and std.mem.indexOf(u8, captcha_check, "\"challenge\"") != null) {
+                std.debug.print("[BRIDGE] Captcha detected! Running audio bypass...\n", .{});
+                _ = audio_bypass.runAudioBypass(self, self.allocator, io) catch |err| {
+                    std.debug.print("[BRIDGE] Audio bypass failed: {}\n", .{err});
+                };
+            } else {
+                std.debug.print("[BRIDGE] No captcha detected\n", .{});
+            }
+        }
 
         const paused = try self.waitForPausedRequest("/signup?social=false", REQUEST_CAPTURE_TIMEOUT_MS);
         defer self.allocator.free(paused.request_id);
@@ -1616,7 +2132,10 @@ pub const BrowserBridge = struct {
         try self.cdp.enableFetchInterception("*account_verifications*");
         defer self.cdp.disableFetchInterception() catch {};
 
-        _ = try self.triggerVerificationSubmit(verification_code);
+        {
+            var audit = try self.triggerVerificationSubmit(verification_code);
+            audit.deinit(self.allocator);
+        }
 
         const paused = try self.waitForPausedRequest("/account_verifications", REQUEST_CAPTURE_TIMEOUT_MS);
         defer self.allocator.free(paused.request_id);
@@ -1931,7 +2450,10 @@ pub const BrowserBridge = struct {
     pub fn waitForPausedRequest(self: *BrowserBridge, url_substring: []const u8, timeout_ms: u64) BridgeError!PausedRequestCapture {
         const start_ns = currentTimestampNs();
         while (@as(u64, @intCast(@divTrunc(currentTimestampNs() - start_ns, std.time.ns_per_ms))) < timeout_ms) {
-            _ = self.dismissPageBlockers() catch {};
+            if (self.dismissPageBlockers()) |audit| {
+                var mut = audit;
+                mut.deinit(self.allocator);
+            } else |_| {}
 
             // Process ALL pending CDP events buffered during previous sendCommand calls.
             // CRITICAL: Previously these events were silently discarded by sendCommand,
@@ -2907,7 +3429,7 @@ fn classifyRuntimeEvaluateFailure(response: []const u8) []const u8 {
     return "runtime_evaluate_failed";
 }
 
-fn extractRuntimeEvaluateStringValue(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+pub fn extractRuntimeEvaluateStringValue(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
     var parsed = std.json.parseFromSlice(RuntimeEvaluateStringEnvelope, allocator, response, .{
         .ignore_unknown_fields = true,
     }) catch return error.ParseFailed;
