@@ -99,6 +99,18 @@ pub const MAX_DIAGNOSTIC_JS_SIZE: usize = 65536;
 const WS_OPCODE_CONTINUATION: u8 = 0x00;
 const WS_OPCODE_TEXT: u8 = 0x01;
 const WS_OPCODE_CLOSE: u8 = 0x08;
+const WS_OPCODE_PING: u8 = 0x09;
+const WS_OPCODE_PONG: u8 = 0x0A;
+
+const RuntimeEvaluateOptions = struct {
+    context_id: ?i64 = null,
+    timeout_ms: ?u64 = null,
+};
+
+const RuntimeEvaluateTimeouts = struct {
+    cdp_timeout_ms: u64,
+    socket_timeout_ms: u64,
+};
 const WS_FIN_BIT: u8 = 0x80;
 const WS_MASK_BIT: u8 = 0x80;
 
@@ -466,6 +478,10 @@ pub const CdpClient = struct {
                 if (resp_id == self.msg_id) {
                     return response;
                 }
+                std.debug.print(
+                    "[CDP WIRE] drop unmatched response: method={s}, expected_id={d}, got_id={d}, preview={s}\n",
+                    .{ method, self.msg_id, resp_id, response[0..@min(response.len, 200)] },
+                );
                 self.allocator.free(response);
             } else {
                 try self.pending_events.append(response);
@@ -480,12 +496,8 @@ pub const CdpClient = struct {
         var params_buf: [MAX_CDP_BUF]u8 = undefined;
         // Escape double quotes in expression for JSON
         var expr_escaped: [MAX_CDP_BUF]u8 = undefined;
-        const escaped_len = escapeJsonString(expression, &expr_escaped);
-        const params = std.fmt.bufPrint(
-            &params_buf,
-            "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true}}",
-            .{expr_escaped[0..escaped_len]},
-        ) catch {
+        const params = buildRuntimeEvaluateParams(&params_buf, &expr_escaped, expression, .{}) catch {
+            const escaped_len = escapeJsonString(expression, &expr_escaped);
             std.debug.print("[CDP] evaluate: params bufPrint failed (expr_len={d}, escaped_len={d})\n", .{ expression.len, escaped_len });
             return error.OutOfMemory;
         };
@@ -500,21 +512,17 @@ pub const CdpClient = struct {
     }
 
     pub fn evaluateWithTimeout(self: *CdpClient, expression: []const u8, timeout_ms: u64) ![]u8 {
-        const cdp_timeout = @min(timeout_ms, @as(u64, 8000));
-        const sock_timeout = @min(timeout_ms, @as(u64, 5000));
-        self.setReceiveTimeoutMs(sock_timeout);
+        const timeouts = computeRuntimeEvaluateTimeouts(timeout_ms);
+        self.setReceiveTimeoutMs(timeouts.socket_timeout_ms);
         defer self.setReceiveTimeoutMs(DEFAULT_CDP_RECEIVE_TIMEOUT_MS);
         // SOURCE: CDP spec — Runtime.evaluate supports "timeout" parameter (ms)
         // Without it, async execution blocks indefinitely if awaitPromise:true.
         var params_buf: [MAX_CDP_BUF]u8 = undefined;
         var expr_escaped: [MAX_CDP_BUF]u8 = undefined;
-        const escaped_len = escapeJsonString(expression, &expr_escaped);
-        const params = std.fmt.bufPrint(
-            &params_buf,
-            "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true,\"timeout\":{d}}}",
-            .{ expr_escaped[0..escaped_len], cdp_timeout },
-        ) catch return error.OutOfMemory;
-        std.debug.print("[CDP] evaluateWithTimeout: sending Runtime.evaluate (expr_len={d}, cdp_timeout={d}ms, sock_timeout={d}ms)\n", .{ expression.len, cdp_timeout, sock_timeout });
+        const params = buildRuntimeEvaluateParams(&params_buf, &expr_escaped, expression, .{
+            .timeout_ms = timeouts.cdp_timeout_ms,
+        }) catch return error.OutOfMemory;
+        std.debug.print("[CDP] evaluateWithTimeout: sending Runtime.evaluate (expr_len={d}, cdp_timeout={d}ms, sock_timeout={d}ms)\n", .{ expression.len, timeouts.cdp_timeout_ms, timeouts.socket_timeout_ms });
         return self.sendCommand("Runtime.evaluate", params);
     }
 
@@ -523,12 +531,9 @@ pub const CdpClient = struct {
     pub fn evaluateInContext(self: *CdpClient, expression: []const u8, context_id: i64) ![]u8 {
         var params_buf: [MAX_CDP_BUF]u8 = undefined;
         var expr_escaped: [MAX_CDP_BUF]u8 = undefined;
-        const escaped_len = escapeJsonString(expression, &expr_escaped);
-        const params = std.fmt.bufPrint(
-            &params_buf,
-            "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true,\"contextId\":{d}}}",
-            .{ expr_escaped[0..escaped_len], context_id },
-        ) catch {
+        const params = buildRuntimeEvaluateParams(&params_buf, &expr_escaped, expression, .{
+            .context_id = context_id,
+        }) catch {
             std.debug.print("[CDP] evaluateInContext: params bufPrint failed\n", .{});
             return error.OutOfMemory;
         };
@@ -539,6 +544,26 @@ pub const CdpClient = struct {
             return err;
         };
         return response;
+    }
+
+    /// SOURCE: CDP Runtime.evaluate — contextId targets an execution context; timeout limits execution in milliseconds.
+    pub fn evaluateInContextWithTimeout(self: *CdpClient, expression: []const u8, context_id: i64, timeout_ms: u64) ![]u8 {
+        const timeouts = computeRuntimeEvaluateTimeouts(timeout_ms);
+        self.setReceiveTimeoutMs(timeouts.socket_timeout_ms);
+        defer self.setReceiveTimeoutMs(DEFAULT_CDP_RECEIVE_TIMEOUT_MS);
+
+        var params_buf: [MAX_CDP_BUF]u8 = undefined;
+        var expr_escaped: [MAX_CDP_BUF]u8 = undefined;
+        const params = buildRuntimeEvaluateParams(&params_buf, &expr_escaped, expression, .{
+            .context_id = context_id,
+            .timeout_ms = timeouts.cdp_timeout_ms,
+        }) catch {
+            std.debug.print("[CDP] evaluateInContextWithTimeout: params bufPrint failed\n", .{});
+            return error.OutOfMemory;
+        };
+
+        std.debug.print("[CDP] evaluateInContextWithTimeout: ctx={d}, expr_len={d}, cdp_timeout={d}ms, sock_timeout={d}ms\n", .{ context_id, expression.len, timeouts.cdp_timeout_ms, timeouts.socket_timeout_ms });
+        return self.sendCommand("Runtime.evaluate", params);
     }
 
     pub fn drainPendingEvents(self: *CdpClient) void {
@@ -556,7 +581,7 @@ pub const CdpClient = struct {
         return response;
     }
 
-    fn setReceiveTimeoutMs(self: *CdpClient, timeout_ms: u64) void {
+    pub fn setReceiveTimeoutMs(self: *CdpClient, timeout_ms: u64) void {
         const timeout = std.os.linux.timeval{
             .sec = @intCast(timeout_ms / std.time.ms_per_s),
             .usec = @intCast((timeout_ms % std.time.ms_per_s) * std.time.us_per_ms),
@@ -664,7 +689,11 @@ pub const CdpClient = struct {
         if ((pfd[0].revents & @as(i16, @intCast(1))) == 0) return false;
 
         const frame = self.recvWsTextAlloc() catch return false;
-        if (extractTopLevelMessageId(self.allocator, frame)) |_| {
+        if (extractTopLevelMessageId(self.allocator, frame)) |response_id| {
+            std.debug.print(
+                "[CDP WIRE] tryReadPendingEvents dropped command response: id={d}, preview={s}\n",
+                .{ response_id, frame[0..@min(frame.len, 200)] },
+            );
             self.allocator.free(frame);
         } else {
             self.pending_events.append(frame) catch {
@@ -766,19 +795,44 @@ pub const CdpClient = struct {
         // Write header
         try writeAll(self.fd, &header_buf, header_len);
 
-        // Write masked payload
-        // SOURCE: RFC 6455, Section 5.3 — j = i MOD 4, transformed = payload XOR mask_key[j]
-        var masked_buf: [MAX_CDP_BUF]u8 = undefined;
-        const write_len = @min(payload.len, masked_buf.len);
-        for (payload[0..write_len], 0..) |byte, i| {
-            masked_buf[i] = byte ^ mask_key[i % 4];
+        // Write masked payload in chunks to avoid MAX_CDP_BUF truncation
+        // SOURCE: RFC 6455, Section 5.2 — payload may exceed single buffer
+        var chunk_buf: [MAX_CDP_BUF]u8 = undefined;
+        var written: usize = 0;
+        while (written < payload.len) {
+            const chunk_len = @min(payload.len - written, chunk_buf.len);
+            for (payload[written..][0..chunk_len], 0..) |byte, i| {
+                chunk_buf[i] = byte ^ mask_key[(written + i) % 4];
+            }
+            try writeAll(self.fd, &chunk_buf, chunk_len);
+            written += chunk_len;
         }
-        try writeAll(self.fd, &masked_buf, write_len);
     }
 
-    /// Receive a WebSocket text frame and return the payload
+    /// Send a WebSocket Pong frame (control frame, client→server, masked)
+    /// SOURCE: RFC 6455, Section 5.5.3 — Pong frame must echo Ping payload
+    fn sendWsPong(self: *CdpClient, payload: []const u8) !void {
+        // Control frames MUST have payload length <= 125 bytes (RFC 6455, Section 5.5)
+        if (payload.len > 125) return error.WsFrameError;
+
+        var header_buf: [6]u8 = undefined;
+        header_buf[0] = WS_FIN_BIT | WS_OPCODE_PONG;
+        header_buf[1] = WS_MASK_BIT | @as(u8, @intCast(payload.len));
+        const mask_key: [4]u8 = .{ 0xAB, 0xCD, 0xEF, 0x01 };
+        header_buf[2..6].* = mask_key;
+        try writeAll(self.fd, &header_buf, 6);
+
+        var masked_buf: [125]u8 = undefined;
+        for (payload, 0..) |byte, i| {
+            masked_buf[i] = byte ^ mask_key[i % 4];
+        }
+        try writeAll(self.fd, &masked_buf, payload.len);
+    }
+
+    /// Receive a WebSocket text message and return the payload
     /// SOURCE: RFC 6455, Section 5.2 — Base framing protocol (server→client, no mask)
     /// SOURCE: RFC 6455, Section 5.4 — Fragmentation: a message may consist of multiple frames
+    /// SOURCE: RFC 6455, Section 5.5 — Control frames may be interjected in the middle of a fragmented message
     fn recvWsTextAlloc(self: *CdpClient) ![]u8 {
         var message = std.array_list.Managed(u8).init(self.allocator);
         errdefer message.deinit();
@@ -809,13 +863,41 @@ pub const CdpClient = struct {
             // Server frames are NOT masked (MASK bit should be 0)
             // SOURCE: RFC 6455, Section 5.3 — server-to-client frames are NOT masked
 
+            // SOURCE: RFC 6455, Section 5.5 — control frame handling
+            if (opcode == WS_OPCODE_PING) {
+                // Read PING payload and send PONG reply with identical payload
+                var ping_payload: [125]u8 = undefined;
+                _ = try recvExact(self.fd, ping_payload[0..payload_len]);
+                try self.sendWsPong(ping_payload[0..payload_len]);
+                continue;
+            }
+            if (opcode == WS_OPCODE_PONG) {
+                // Read and ignore PONG payload
+                var pong_payload: [125]u8 = undefined;
+                _ = try recvExact(self.fd, pong_payload[0..payload_len]);
+                continue;
+            }
+            if (opcode == WS_OPCODE_CLOSE) {
+                // Read close payload (optional 2-byte code + reason) then fail
+                var close_payload: [125]u8 = undefined;
+                _ = try recvExact(self.fd, close_payload[0..payload_len]);
+                return error.WsFrameError;
+            }
+            if (opcode != WS_OPCODE_TEXT and opcode != WS_OPCODE_CONTINUATION) {
+                // Unknown opcode — read and discard payload to keep stream synchronized
+                var discard: [8192]u8 = undefined;
+                var remaining = payload_len;
+                while (remaining > 0) {
+                    const chunk = @min(remaining, discard.len);
+                    _ = try recvExact(self.fd, discard[0..chunk]);
+                    remaining -= chunk;
+                }
+                return error.WsFrameError;
+            }
+
             const old_len = message.items.len;
             try message.resize(old_len + payload_len);
             _ = try recvExact(self.fd, message.items[old_len..]);
-
-            // Handle close frame
-            if (opcode == WS_OPCODE_CLOSE) return error.WsFrameError;
-            if (opcode != WS_OPCODE_TEXT and opcode != WS_OPCODE_CONTINUATION) return error.WsFrameError;
 
             if (fin) return message.toOwnedSlice();
         }
@@ -2071,44 +2153,12 @@ pub const BrowserBridge = struct {
         }
         const body_start = mem.indexOf(u8, resp_buf[0..total], "\r\n\r\n") orelse return error.ParseFailed;
         const body = resp_buf[body_start + 4 .. total];
-        const type_key = "\"type\": \"";
-        const ws_key = "\"webSocketDebuggerUrl\": \"";
-        const url_key = "\"url\": \"";
-        var idx: usize = 0;
-        while (idx < body.len) {
-            const url_idx = mem.indexOfPos(u8, body, idx, url_key) orelse break;
-            const url_val_start = url_idx + url_key.len;
-            const url_val_end = mem.indexOfScalarPos(u8, body, url_val_start, '"') orelse break;
-            const tab_url = body[url_val_start..url_val_end];
-            const obj_start = if (mem.lastIndexOfScalar(u8, body[0..url_idx], '{')) |pos| pos else url_idx;
-            const obj_end = mem.indexOfScalarPos(u8, body, url_idx, '}') orelse break;
-            const type_idx = mem.indexOfPos(u8, body, obj_start, type_key) orelse {
-                idx = obj_end + 1;
-                continue;
-            };
-            const type_val_start = type_idx + type_key.len;
-            const type_val_end = mem.indexOfScalarPos(u8, body, type_val_start, '"') orelse obj_end;
-            const tab_type = body[type_val_start..type_val_end];
-            // SOURCE: Chrome CDP — iframe targets are listed as type "page" when using --remote-debugging-port
-            // `type == "iframe"` may also appear. Accept both.
-            if (!mem.eql(u8, tab_type, "iframe") and !mem.eql(u8, tab_type, "page")) {
-                idx = obj_end + 1;
-                continue;
-            }
-            if (mem.indexOf(u8, tab_url, "arkoselabs") != null) {
-                const ws_idx = mem.indexOfPos(u8, body, obj_start, ws_key) orelse {
-                    idx = obj_end + 1;
-                    continue;
-                };
-                const ws_val_start = ws_idx + ws_key.len;
-                const ws_val_end = mem.indexOfScalarPos(u8, body, ws_val_start, '"') orelse break;
-                const ws_url = try allocator.dupe(u8, body[ws_val_start..ws_val_end]);
-                std.debug.print("[BRIDGE] Found Arkose iframe WS URL: {s}\n", .{ws_url});
-                return ws_url;
-            }
-            idx = obj_end + 1;
-        }
-        return error.NoTarget;
+        const ws_url = extractArkoseWsUrlFromJsonBody(allocator, body) catch |err| {
+            std.debug.print("[BRIDGE] getArkoseWsUrl: no Arkose target in /json body ({d} bytes): {s}\n", .{ body.len, body[0..@min(body.len, 1000)] });
+            return err;
+        };
+        std.debug.print("[BRIDGE] Found Arkose iframe WS URL: {s}\n", .{ws_url});
+        return ws_url;
     }
 
     pub fn captureSignupBundle(
@@ -3525,6 +3575,117 @@ fn extractTopLevelMessageId(allocator: std.mem.Allocator, response: []const u8) 
     return parsed.value.id;
 }
 
+fn buildRuntimeEvaluateParams(
+    params_buf: []u8,
+    expr_escaped: []u8,
+    expression: []const u8,
+    options: RuntimeEvaluateOptions,
+) ![]u8 {
+    const escaped_len = escapeJsonString(expression, expr_escaped);
+    const escaped = expr_escaped[0..escaped_len];
+
+    if (options.context_id) |context_id| {
+        if (options.timeout_ms) |timeout_ms| {
+            return std.fmt.bufPrint(
+                params_buf,
+                "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true,\"contextId\":{d},\"timeout\":{d}}}",
+                .{ escaped, context_id, timeout_ms },
+            );
+        }
+        return std.fmt.bufPrint(
+            params_buf,
+            "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true,\"contextId\":{d}}}",
+            .{ escaped, context_id },
+        );
+    }
+
+    if (options.timeout_ms) |timeout_ms| {
+        return std.fmt.bufPrint(
+            params_buf,
+            "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true,\"timeout\":{d}}}",
+            .{ escaped, timeout_ms },
+        );
+    }
+
+    return std.fmt.bufPrint(
+        params_buf,
+        "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true}}",
+        .{escaped},
+    );
+}
+
+fn computeRuntimeEvaluateTimeouts(timeout_ms: u64) RuntimeEvaluateTimeouts {
+    const cdp_timeout = @min(timeout_ms, @as(u64, 8000));
+    const response_margin_ms: u64 = 1000;
+    const socket_timeout = @min(timeout_ms + response_margin_ms, cdp_timeout + response_margin_ms);
+    return .{
+        .cdp_timeout_ms = cdp_timeout,
+        .socket_timeout_ms = socket_timeout,
+    };
+}
+
+fn jsonStringFieldValueInObject(object: []const u8, field_name: []const u8) ?[]const u8 {
+    var search_start: usize = 0;
+    while (search_start < object.len) {
+        const quote_start = mem.indexOfScalarPos(u8, object, search_start, '"') orelse return null;
+        const name_start = quote_start + 1;
+        const name_end = mem.indexOfScalarPos(u8, object, name_start, '"') orelse return null;
+        if (!mem.eql(u8, object[name_start..name_end], field_name)) {
+            search_start = name_end + 1;
+            continue;
+        }
+
+        var colon = name_end + 1;
+        while (colon < object.len and (object[colon] == ' ' or object[colon] == '\n' or object[colon] == '\r' or object[colon] == '\t')) colon += 1;
+        if (colon >= object.len or object[colon] != ':') {
+            search_start = name_end + 1;
+            continue;
+        }
+
+        var value_quote = colon + 1;
+        while (value_quote < object.len and (object[value_quote] == ' ' or object[value_quote] == '\n' or object[value_quote] == '\r' or object[value_quote] == '\t')) value_quote += 1;
+        if (value_quote >= object.len or object[value_quote] != '"') return null;
+        const value_start = value_quote + 1;
+        const value_end = mem.indexOfScalarPos(u8, object, value_start, '"') orelse return null;
+        return object[value_start..value_end];
+    }
+    return null;
+}
+
+fn extractArkoseWsUrlFromJsonBody(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var idx: usize = 0;
+    while (idx < body.len) {
+        const obj_start = mem.indexOfScalarPos(u8, body, idx, '{') orelse break;
+        const obj_end_inclusive = mem.indexOfScalarPos(u8, body, obj_start, '}') orelse break;
+        const object = body[obj_start .. obj_end_inclusive + 1];
+
+        const tab_type = jsonStringFieldValueInObject(object, "type") orelse {
+            idx = obj_end_inclusive + 1;
+            continue;
+        };
+        if (!mem.eql(u8, tab_type, "iframe") and !mem.eql(u8, tab_type, "page")) {
+            idx = obj_end_inclusive + 1;
+            continue;
+        }
+
+        const tab_url = jsonStringFieldValueInObject(object, "url") orelse {
+            idx = obj_end_inclusive + 1;
+            continue;
+        };
+        if (mem.indexOf(u8, tab_url, "arkoselabs") == null) {
+            idx = obj_end_inclusive + 1;
+            continue;
+        }
+
+        const ws_url = jsonStringFieldValueInObject(object, "webSocketDebuggerUrl") orelse {
+            idx = obj_end_inclusive + 1;
+            continue;
+        };
+        return try allocator.dupe(u8, ws_url);
+    }
+    return error.NoTarget;
+}
+
 fn parseBrowserUiStateFromEvaluateResponse(
     allocator: std.mem.Allocator,
     response: []const u8,
@@ -3747,6 +3908,59 @@ test "buildStartSignupExpression: embeds human pacing payload" {
     try std.testing.expect(mem.indexOf(u8, expression, "\"scroll_step_delays\"") != null);
 }
 
+test "buildRuntimeEvaluateParams: context evaluate includes CDP timeout" {
+    var params_buf: [MAX_CDP_BUF]u8 = undefined;
+    var expr_escaped: [MAX_CDP_BUF]u8 = undefined;
+
+    const params = try buildRuntimeEvaluateParams(&params_buf, &expr_escaped, "document.title", .{
+        .context_id = 7,
+        .timeout_ms = 8000,
+    });
+
+    try std.testing.expectEqualStrings(
+        "{\"expression\":\"document.title\",\"returnByValue\":true,\"awaitPromise\":true,\"contextId\":7,\"timeout\":8000}",
+        params,
+    );
+}
+
+test "buildRuntimeEvaluateParams: default evaluate omits context and timeout" {
+    var params_buf: [MAX_CDP_BUF]u8 = undefined;
+    var expr_escaped: [MAX_CDP_BUF]u8 = undefined;
+
+    const params = try buildRuntimeEvaluateParams(&params_buf, &expr_escaped, "1 + 1", .{});
+
+    try std.testing.expectEqualStrings(
+        "{\"expression\":\"1 + 1\",\"returnByValue\":true,\"awaitPromise\":true}",
+        params,
+    );
+}
+
+test "extractArkoseWsUrlFromJsonBody: accepts compact Chrome target JSON" {
+    const allocator = std.testing.allocator;
+    const body =
+        "[{\"id\":\"1\",\"type\":\"page\",\"url\":\"https://github.com/signup\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1/devtools/page/1\"}," ++
+        "{\"id\":\"2\",\"type\":\"iframe\",\"url\":\"https://client-api.arkoselabs.com/fc/gc/?token=x\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1/devtools/page/2\"}]";
+
+    const ws_url = try extractArkoseWsUrlFromJsonBody(allocator, body);
+    defer allocator.free(ws_url);
+
+    try std.testing.expectEqualStrings("ws://127.0.0.1/devtools/page/2", ws_url);
+}
+
+test "computeRuntimeEvaluateTimeouts: socket outlives CDP timeout" {
+    const timeouts = computeRuntimeEvaluateTimeouts(HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
+
+    try std.testing.expectEqual(@as(u64, 8000), timeouts.cdp_timeout_ms);
+    try std.testing.expect(timeouts.socket_timeout_ms > timeouts.cdp_timeout_ms);
+}
+
+test "computeRuntimeEvaluateTimeouts: short calls still leave socket response margin" {
+    const timeouts = computeRuntimeEvaluateTimeouts(4000);
+
+    try std.testing.expectEqual(@as(u64, 4000), timeouts.cdp_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 5000), timeouts.socket_timeout_ms);
+}
+
 test "parseIpv4Addr: parses 127.0.0.1" {
     const addr = try parseIpv4Addr("127.0.0.1");
     // Should be 0x7F000001 in big-endian (network byte order)
@@ -3915,6 +4129,139 @@ test "sendCommand: ignores event messages with nested id before matching top-lev
     defer allocator.free(response);
 
     try std.testing.expectEqualStrings(reply_message, response);
+}
+
+test "recvWsTextAlloc: handles ping frame and returns correct text message" {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+    if (rc == std.math.maxInt(usize)) return error.SocketFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const allocator = std.testing.allocator;
+    var client = CdpClient{
+        .fd = fds[0],
+        .allocator = allocator,
+        .msg_id = 0,
+        .pending_events = std.array_list.Managed([]u8).init(allocator),
+    };
+    defer {
+        for (client.pending_events.items) |event| allocator.free(event);
+        client.pending_events.deinit();
+    }
+
+    // SOURCE: RFC 6455, Section 5.5.2 — server may send PING at any time
+    const ping_payload = "hi";
+    var ping_header: [2]u8 = .{ WS_OPCODE_PING, @intCast(ping_payload.len) };
+    try writeAll(fds[1], &ping_header, ping_header.len);
+    try writeAll(fds[1], ping_payload.ptr, ping_payload.len);
+
+    const text_payload = "hello";
+    var text_header: [2]u8 = .{ WS_FIN_BIT | WS_OPCODE_TEXT, @intCast(text_payload.len) };
+    try writeAll(fds[1], &text_header, text_header.len);
+    try writeAll(fds[1], text_payload.ptr, text_payload.len);
+
+    const received = try client.recvWsTextAlloc();
+    defer allocator.free(received);
+    try std.testing.expectEqualStrings("hello", received);
+
+    // Verify PONG reply (masked client→server frame)
+    var pong_header: [2]u8 = undefined;
+    _ = try recvExact(fds[1], &pong_header);
+    const pong_opcode = pong_header[0] & 0x0F;
+    const pong_fin = (pong_header[0] & WS_FIN_BIT) != 0;
+    const pong_masked = (pong_header[1] & WS_MASK_BIT) != 0;
+    const pong_len = pong_header[1] & 0x7F;
+    try std.testing.expect(pong_fin);
+    try std.testing.expectEqual(@as(u8, WS_OPCODE_PONG), pong_opcode);
+    try std.testing.expect(pong_masked);
+    try std.testing.expectEqual(@as(usize, ping_payload.len), pong_len);
+
+    var mask_key: [4]u8 = undefined;
+    _ = try recvExact(fds[1], &mask_key);
+    var pong_payload: [2]u8 = undefined;
+    _ = try recvExact(fds[1], &pong_payload);
+    const unmasked = [2]u8{ pong_payload[0] ^ mask_key[0], pong_payload[1] ^ mask_key[1] };
+    try std.testing.expectEqualStrings(ping_payload, &unmasked);
+}
+
+test "recvWsTextAlloc: handles ping between fragmented text frames" {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+    if (rc == std.math.maxInt(usize)) return error.SocketFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const allocator = std.testing.allocator;
+    var client = CdpClient{
+        .fd = fds[0],
+        .allocator = allocator,
+        .msg_id = 0,
+        .pending_events = std.array_list.Managed([]u8).init(allocator),
+    };
+    defer {
+        for (client.pending_events.items) |event| allocator.free(event);
+        client.pending_events.deinit();
+    }
+
+    // SOURCE: RFC 6455, Section 5.5 — control frames may be interjected in fragmented message
+    const frag1 = "hel";
+    var h1: [2]u8 = .{ WS_OPCODE_TEXT, @intCast(frag1.len) };
+    try writeAll(fds[1], &h1, h1.len);
+    try writeAll(fds[1], frag1.ptr, frag1.len);
+
+    const ping_payload = "x";
+    var ping_h: [2]u8 = .{ WS_OPCODE_PING, @intCast(ping_payload.len) };
+    try writeAll(fds[1], &ping_h, ping_h.len);
+    try writeAll(fds[1], ping_payload.ptr, ping_payload.len);
+
+    const frag2 = "lo";
+    var h2: [2]u8 = .{ WS_FIN_BIT | WS_OPCODE_CONTINUATION, @intCast(frag2.len) };
+    try writeAll(fds[1], &h2, h2.len);
+    try writeAll(fds[1], frag2.ptr, frag2.len);
+
+    const received = try client.recvWsTextAlloc();
+    defer allocator.free(received);
+    try std.testing.expectEqualStrings("hello", received);
+
+    var pong_header: [2]u8 = undefined;
+    _ = try recvExact(fds[1], &pong_header);
+    try std.testing.expectEqual(@as(u8, WS_OPCODE_PONG), pong_header[0] & 0x0F);
+    const pong_len = pong_header[1] & 0x7F;
+    try std.testing.expectEqual(@as(usize, 1), pong_len);
+    var mask_key: [4]u8 = undefined;
+    _ = try recvExact(fds[1], &mask_key);
+    var pong_payload: [1]u8 = undefined;
+    _ = try recvExact(fds[1], &pong_payload);
+    try std.testing.expectEqual(@as(u8, 'x'), pong_payload[0] ^ mask_key[0]);
+}
+
+test "recvWsTextAlloc: close frame returns WsFrameError" {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+    if (rc == std.math.maxInt(usize)) return error.SocketFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const allocator = std.testing.allocator;
+    var client = CdpClient{
+        .fd = fds[0],
+        .allocator = allocator,
+        .msg_id = 0,
+        .pending_events = std.array_list.Managed([]u8).init(allocator),
+    };
+    defer {
+        for (client.pending_events.items) |event| allocator.free(event);
+        client.pending_events.deinit();
+    }
+
+    // SOURCE: RFC 6455, Section 5.5.1 — Close frame contains opcode 0x8
+    var close_payload: [2]u8 = .{ 0x03, 0xE8 };
+    var close_header: [2]u8 = .{ WS_FIN_BIT | WS_OPCODE_CLOSE, @intCast(close_payload.len) };
+    try writeAll(fds[1], &close_header, close_header.len);
+    try writeAll(fds[1], &close_payload, close_payload.len);
+
+    try std.testing.expectError(error.WsFrameError, client.recvWsTextAlloc());
 }
 
 test "parseFetchRequestPaused: extracts ordered headers and postData" {

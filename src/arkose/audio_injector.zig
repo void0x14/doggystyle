@@ -378,10 +378,16 @@ pub fn injectAnswerOnTarget(
 
     std.debug.print("[AUDIO INJECTOR] Answer JS ({d} bytes): {s}\n", .{ap, answer_script[0..@min(ap, 200)]});
 
+    // SOURCE: LIVE TEST 2026-04-25 — CDP Runtime.evaluate with "timeout" parameter
+    // causes Chrome to withhold the response in enforcement iframe contexts.
+    // Bypass: use raw evaluate (no CDP timeout) with extended socket timeout.
+    cdp.setReceiveTimeoutMs(browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
+    defer cdp.setReceiveTimeoutMs(browser_bridge.DEFAULT_CDP_RECEIVE_TIMEOUT_MS);
+
     const fill_response = if (context_id > 0)
         try cdp.evaluateInContext(answer_script, context_id)
     else
-        try cdp.evaluateWithTimeout(answer_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
+        try cdp.evaluate(answer_script);
     defer allocator.free(fill_response);
     std.debug.print("[AUDIO INJECTOR] Answer injection (target): {s}\n", .{fill_response[0..@min(fill_response.len, 200)]});
 
@@ -401,7 +407,7 @@ pub fn injectAnswerOnTarget(
     const submit_response = if (context_id > 0)
         try cdp.evaluateInContext(submit_script, context_id)
     else
-        try cdp.evaluateWithTimeout(submit_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
+        try cdp.evaluate(submit_script);
     defer allocator.free(submit_response);
     std.debug.print("[AUDIO INJECTOR] Submit (target): {s}\n", .{submit_response[0..@min(submit_response.len, 200)]});
 

@@ -2,6 +2,30 @@
 
 ---
 
+## [2026-04-25] — CDP Context Evaluate Timeout Eksikliği
+
+**Hata:** Arkose audio answer injection, `context_id > 0` yolunda `Runtime.evaluate` yanıtı gelmiyor gibi görünüyordu. Aynı action main-context fallback veya manual MCP ile çalışabiliyordu.
+
+**Kök sebep:** `injectAnswerOnTarget()` context dalında `CdpClient.evaluateInContext()` kullanıyordu. Bu helper CDP `Runtime.evaluate` parametrelerine `timeout` eklemiyor ve socket receive timeout'unu human action süresine yükseltmiyordu. `evaluateWithTimeout()` ise aynı evaluate için hem CDP `timeout` hem geçici socket timeout uyguluyordu.
+
+**Kaynak:** Chrome DevTools Protocol `Runtime.evaluate` — `contextId` execution context hedefler, `timeout` değerlendirme süresini ms cinsinden sınırlar, `awaitPromise:true` promise çözülene kadar bekler; `man 7 socket` — `SO_RCVTIMEO` socket read timeout davranışı.
+
+**Düzeltme:** `buildRuntimeEvaluateParams()` ortak params builder'ı eklendi. `evaluateInContextWithTimeout()` eklendi ve Arkose `injectAnswerOnTarget()` context dalı bu helper'a taşındı. Regresyon testleri `contextId + timeout` JSON parametrelerini ve default evaluate parametrelerini doğruluyor.
+
+---
+
+## [2026-04-25] — CDP WebSocket Fragmentation ve Timeout Katlanması
+
+**Hata:** `Runtime.evaluate` yanıtı gelmiyor gibi görünüyordu; `sendCommand()` `recvWsTextAlloc()` içinde bekliyor, `recvExact()` ise timeout sonrası 100 kez daha 10ms uyuyarak çağrı süresini büyütüyordu.
+
+**Kök sebep:** `recvWsTextAlloc()` RFC 6455 fragmented message davranışını uygulamıyordu. `FIN=0` text frame geldiğinde ilk fragment payload'unu doğrudan dönüyor, continuation frame'i sonraki bağımsız CDP mesajı gibi bırakıyordu. Ayrıca `recvExact()` zaten `SO_RCVTIMEO` ile zamanlanmış socket read'inden gelen `error.WouldBlock` sonrasında kendi 100×10ms retry loop'unu çalıştırıyordu.
+
+**Kaynak:** RFC 6455 Section 5.4 — WebSocket fragmentation; `vendor/zig-std/std/posix.zig` `read()` satır 400-430 — `EAGAIN` → `error.WouldBlock`; `man 2 read`/`man 7 socket` — `SO_RCVTIMEO` expiry read tarafında timeout üretir.
+
+**Düzeltme:** `recvWsTextAlloc()` text + continuation frame'leri tek message buffer'da birleştiriyor; `recvExact()` `error.WouldBlock` gördüğünde ek uyku/retry yapmadan `error.ReadFailed` döndürüyor. Regresyon testleri eklendi: fragmented server text message ve internal sleep retry loop olmaması.
+
+---
+
 ## [2026-04-24] — Arkose Audio Bypass LIVE Test — Endpoint ve Format Farklılıkları
 
 **Ne oldu:** Plan'da `fc/get_audio` endpoint'i, 22050Hz 12sn×3 clip, 0-indexed cevap varsayılmıştı. Canlı testte gerçek endpoint `rtag/audio?challenge=N` çıktı, format 44100Hz mono MP3 (~18-21sn single dosya), cevaplar 1-indexed.
