@@ -2079,7 +2079,9 @@ pub const BrowserBridge = struct {
             const type_val_start = type_idx + type_key.len;
             const type_val_end = mem.indexOfScalarPos(u8, body, type_val_start, '"') orelse obj_end;
             const tab_type = body[type_val_start..type_val_end];
-            if (!mem.eql(u8, tab_type, "iframe")) {
+            // SOURCE: Chrome CDP — iframe targets are listed as type "page" when using --remote-debugging-port
+            // `type == "iframe"` may also appear. Accept both.
+            if (!mem.eql(u8, tab_type, "iframe") and !mem.eql(u8, tab_type, "page")) {
                 idx = obj_end + 1;
                 continue;
             }

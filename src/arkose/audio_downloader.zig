@@ -159,13 +159,10 @@ fn extractQueryParam(url: []const u8, key: []const u8) AudioDownloaderError![]co
 pub fn saveAudioClipToDisk(allocator: std.mem.Allocator, data: []const u8, index: u8) AudioDownloaderError![]u8 {
     // SOURCE: man 2 mkdir — creates directory (EEXIST if exists)
     {
-        const rc = std.os.linux.mkdirat(std.posix.AT.FDCWD, "tmp", 0o755);
-        if (rc != 0) {
-            const err = std.posix.errno(rc);
-            switch (err) {
-                .EXIST => {},
-                else => return error.DirectoryCreateFailed,
-            }
+        const mkdir_rc = std.os.linux.mkdirat(std.posix.AT.FDCWD, "tmp", 0o755);
+        if (mkdir_rc != 0) {
+            const err_val = -@as(i64, @bitCast(mkdir_rc));
+            if (err_val != 17) return error.DirectoryCreateFailed; // EEXIST = 17 on Linux
         }
     }
 
@@ -303,6 +300,13 @@ fn hasFinalChunkedTransferCoding(value: []const u8) bool {
 // SOURCE: RFC 9112, Section 6.3 — Response body framing
 // ---------------------------------------------------------------------------
 pub fn downloadAudioClip(allocator: std.mem.Allocator, url: []const u8) AudioDownloaderError![]u8 {
+    return downloadAudioClipWithReferer(allocator, url, null);
+}
+
+    // SOURCE: RFC 7231, Section 5.5.2 — Referer header for request context
+    // SOURCE: ChromeDevTools MCP live capture 2026-04-25 — /rtag/audio requires Referer header
+    // game-core iframe URL serves as the Referer for the audio request
+pub fn downloadAudioClipWithReferer(allocator: std.mem.Allocator, url: []const u8, referer: ?[]const u8) AudioDownloaderError![]u8 {
     const parts = try parseUrlParts(url);
 
     // SOURCE: vendor/zig-std/std/Io/Threaded.zig — default POSIX networking backend
@@ -356,18 +360,33 @@ pub fn downloadAudioClip(allocator: std.mem.Allocator, url: []const u8) AudioDow
         },
     ) catch return error.TlsHandshakeFailed;
 
-    // Build and send HTTP/1.1 GET request
+    // Build and send HTTP/1.1 GET request with optional Referer header
     // SOURCE: RFC 7230, Section 5.3.1 — request-target (absolute path)
+    // SOURCE: RFC 7231, Section 5.5.2 — Referer header
+    // SOURCE: ChromeDevTools MCP live capture 2026-04-25 — Chrome 147 User-Agent
     var req_buf: [HTTP_REQ_BUF_LEN]u8 = undefined;
-    const req = std.fmt.bufPrint(&req_buf,
-        "GET {s} HTTP/1.1\r\n" ++
-        "Host: {s}\r\n" ++
-        "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36\r\n" ++
-        "Accept: */*\r\n" ++
-        "Accept-Encoding: identity\r\n" ++
-        "Connection: close\r\n\r\n",
-        .{ parts.path, parts.host },
-    ) catch return error.BufferTooSmall;
+    const req = if (referer) |ref| blk: {
+        break :blk std.fmt.bufPrint(&req_buf,
+            "GET {s} HTTP/1.1\r\n" ++
+            "Host: {s}\r\n" ++
+            "Referer: {s}\r\n" ++
+            "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36\r\n" ++
+            "Accept: */*\r\n" ++
+            "Accept-Encoding: identity\r\n" ++
+            "Connection: close\r\n\r\n",
+            .{ parts.path, parts.host, ref },
+        ) catch return error.BufferTooSmall;
+    } else blk: {
+        break :blk std.fmt.bufPrint(&req_buf,
+            "GET {s} HTTP/1.1\r\n" ++
+            "Host: {s}\r\n" ++
+            "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36\r\n" ++
+            "Accept: */*\r\n" ++
+            "Accept-Encoding: identity\r\n" ++
+            "Connection: close\r\n\r\n",
+            .{ parts.path, parts.host },
+        ) catch return error.BufferTooSmall;
+    };
 
     // SOURCE: RFC 8446, Section 5.2 — TLS record writing
     tls.writer.writeAll(req) catch return error.TcpSendFailed;
@@ -445,14 +464,14 @@ pub fn captureAudioUrl(bridge: *browser_bridge.BrowserBridge, allocator: std.mem
 // SOURCE: POSIX filesystem API — open/write/close (man 2 open, man 2 write)
 // ---------------------------------------------------------------------------
 pub fn saveAudioDataToDisk(allocator: std.mem.Allocator, data: []const u8, challenge_index: u8) AudioDownloaderError![]u8 {
+    // SOURCE: POSIX filesystem API — mkdir + open/write/close (man 2 open, man 2 write)
+    // mkdir returns 0 on success, or -errno cast to usize on failure
+    // EEXIST (17) means directory already exists — not an error
     {
-        const rc = std.os.linux.mkdirat(std.posix.AT.FDCWD, "tmp", 0o755);
-        if (rc != 0) {
-            const err = std.posix.errno(rc);
-            switch (err) {
-                .EXIST => {},
-                else => return error.DirectoryCreateFailed,
-            }
+        const mkdir_rc = std.os.linux.mkdirat(std.posix.AT.FDCWD, "tmp", 0o755);
+        if (mkdir_rc != 0) {
+            const err_val = -@as(i64, @bitCast(mkdir_rc));
+            if (err_val != 17) return error.DirectoryCreateFailed; // EEXIST = 17 on Linux
         }
     }
 
@@ -468,9 +487,10 @@ pub fn saveAudioDataToDisk(allocator: std.mem.Allocator, data: []const u8, chall
 
     var written: usize = 0;
     while (written < data.len) {
-        const rc = std.os.linux.write(fd, data.ptr + written, data.len - written);
-        if (rc == std.math.maxInt(usize)) return error.FileWriteFailed;
-        const n: usize = @intCast(rc);
+        // SOURCE: man 2 write — returns number of bytes written
+        const rc_write = std.os.linux.write(fd, data.ptr + written, data.len - written);
+        if (rc_write == std.math.maxInt(usize)) return error.FileWriteFailed;
+        const n: usize = @intCast(rc_write);
         if (n == 0) return error.FileWriteFailed;
         written += n;
     }

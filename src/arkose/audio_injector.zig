@@ -99,9 +99,14 @@ pub const SUBMIT_BTN_TEXT_MATCHER =
 
 /// Build JSON array string from Zig selector slices: `["s1","s2",...]`
 fn selectorsToJson(allocator: std.mem.Allocator, selectors: []const []const u8) ![]u8 {
-    // Pre-calculate buffer size
-    var total_len: usize = 3; // [ ] + null
-    for (selectors) |sel| total_len += sel.len + 3; // "x",
+    var total_len: usize = 3;
+    for (selectors) |sel| {
+        var escaped_extra: usize = 0;
+        for (sel) |ch| {
+            if (ch == '\\' or ch == '"') escaped_extra += 1;
+        }
+        total_len += sel.len + escaped_extra + 3;
+    }
     const json = try allocator.alloc(u8, total_len);
     var pos: usize = 0;
     json[pos] = '['; pos += 1;
@@ -115,7 +120,7 @@ fn selectorsToJson(allocator: std.mem.Allocator, selectors: []const []const u8) 
         json[pos] = '"'; pos += 1;
     }
     json[pos] = ']';
-    return json[0 .. pos + 1];
+    return json[0..pos];
 }
 
 // =============================================================================

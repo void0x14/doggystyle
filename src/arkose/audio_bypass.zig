@@ -345,6 +345,54 @@ pub fn runAudioBypass(
         std.debug.print("[AUDIO BYPASS] Using game-core context: {d}, gameToken: {s}\n", .{ game_core_ctx, game_core_game_token orelse "N/A" });
     }
 
+    // FAZ 2: If gameToken is still missing, fetch it directly from /fc/gfct/ via enforcement iframe CDP.
+    // SOURCE: ChromeDevTools MCP live capture 2026-04-25 — /fc/gfct/ POST returns challengeID as gameToken
+    // SOURCE: RFC 7231, Section 4.3.3 — POST semantics
+    if (game_core_game_token == null and game_core_session_token != null) {
+        std.debug.print("[AUDIO BYPASS] FAZ 2: Fetching gameToken from /fc/gfct/ via enforcement CDP...\n", .{});
+
+        const gfct_js = try std.fmt.allocPrint(allocator,
+            \\(async () => {{
+            \\  const body = 'token={s}&sid=eu-west-1&render_type=canvas&lang=en&isAudioGame=true&analytics_tier=40&is_compatibility_mode=false&apiBreakerVersion=green';
+            \\  try {{
+            \\    const resp = await fetch('/fc/gfct/', {{
+            \\      method: 'POST',
+            \\      body: body,
+            \\      headers: {{'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest', 'Cache-Control': 'no-cache'}}
+            \\    }});
+            \\    if (!resp.ok) return 'ERROR:HTTP_' + resp.status;
+            \\    const text = await resp.text();
+            \\    return text;
+            \\  }} catch(e) {{ return 'ERROR:FETCH:' + e.message; }}
+            \\}})()
+        , .{game_core_session_token.?});
+        defer allocator.free(gfct_js);
+
+        const gfct_response = try arkose_cdp.evaluate(gfct_js);
+        defer allocator.free(gfct_response);
+        std.debug.print("[AUDIO BYPASS] /fc/gfct/ response: {s}\n", .{gfct_response[0..@min(gfct_response.len, 300)]});
+
+        // Extract challengeID (gameToken) from JSON response
+        // SOURCE: LIVE capture — /fc/gfct/ response has "challengeID":"..."
+        const resp_value = browser_bridge.extractRuntimeEvaluateStringValue(allocator, gfct_response) catch null;
+        if (resp_value) |rv| {
+            defer allocator.free(rv);
+            const challengeID_prefix = "\"challengeID\":\"";
+            if (std.mem.indexOf(u8, rv, challengeID_prefix)) |cpos| {
+                const cstart = cpos + challengeID_prefix.len;
+                const cend = std.mem.indexOfScalarPos(u8, rv, cstart, '"') orelse rv.len;
+                if (cend > cstart and cend - cstart > 5) {
+                    game_core_game_token = try allocator.dupe(u8, rv[cstart..cend]);
+                    std.debug.print("[AUDIO BYPASS] FAZ 2: Captured gameToken from /fc/gfct/: {s}\n", .{game_core_game_token.?});
+                }
+            }
+        }
+    }
+
+    if (game_core_game_token == null) {
+        std.debug.print("[AUDIO BYPASS] WARNING: gameToken not available, pipeline may fail\n", .{});
+    }
+
     while (successful < TARGET_CHALLENGES and total_attempted < MAX_CHALLENGES) : (total_attempted += 1) {
         const elapsed = currentMonotonicMs() - start_ms;
         if (elapsed > PIPELINE_TIMEOUT_MS) {
