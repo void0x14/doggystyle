@@ -96,6 +96,7 @@ pub const MAX_DIAGNOSTIC_JS_SIZE: usize = 65536;
 
 /// WebSocket opcodes
 /// SOURCE: RFC 6455, Section 5.2 — Base Framing Protocol
+const WS_OPCODE_CONTINUATION: u8 = 0x00;
 const WS_OPCODE_TEXT: u8 = 0x01;
 const WS_OPCODE_CLOSE: u8 = 0x08;
 const WS_FIN_BIT: u8 = 0x80;
@@ -499,9 +500,22 @@ pub const CdpClient = struct {
     }
 
     pub fn evaluateWithTimeout(self: *CdpClient, expression: []const u8, timeout_ms: u64) ![]u8 {
-        self.setReceiveTimeoutMs(timeout_ms);
+        const cdp_timeout = @min(timeout_ms, @as(u64, 8000));
+        const sock_timeout = @min(timeout_ms, @as(u64, 5000));
+        self.setReceiveTimeoutMs(sock_timeout);
         defer self.setReceiveTimeoutMs(DEFAULT_CDP_RECEIVE_TIMEOUT_MS);
-        return self.evaluate(expression);
+        // SOURCE: CDP spec — Runtime.evaluate supports "timeout" parameter (ms)
+        // Without it, async execution blocks indefinitely if awaitPromise:true.
+        var params_buf: [MAX_CDP_BUF]u8 = undefined;
+        var expr_escaped: [MAX_CDP_BUF]u8 = undefined;
+        const escaped_len = escapeJsonString(expression, &expr_escaped);
+        const params = std.fmt.bufPrint(
+            &params_buf,
+            "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true,\"timeout\":{d}}}",
+            .{ expr_escaped[0..escaped_len], cdp_timeout },
+        ) catch return error.OutOfMemory;
+        std.debug.print("[CDP] evaluateWithTimeout: sending Runtime.evaluate (expr_len={d}, cdp_timeout={d}ms, sock_timeout={d}ms)\n", .{ expression.len, cdp_timeout, sock_timeout });
+        return self.sendCommand("Runtime.evaluate", params);
     }
 
     /// Evaluate JavaScript in a specific execution context (e.g., iframe)
@@ -764,42 +778,47 @@ pub const CdpClient = struct {
 
     /// Receive a WebSocket text frame and return the payload
     /// SOURCE: RFC 6455, Section 5.2 — Base framing protocol (server→client, no mask)
+    /// SOURCE: RFC 6455, Section 5.4 — Fragmentation: a message may consist of multiple frames
     fn recvWsTextAlloc(self: *CdpClient) ![]u8 {
+        var message = std.array_list.Managed(u8).init(self.allocator);
+        errdefer message.deinit();
+
         // Read frame header (at least 2 bytes)
-        var header: [2]u8 = undefined;
-        _ = try recvExact(self.fd, &header);
+        while (true) {
+            var header: [2]u8 = undefined;
+            _ = try recvExact(self.fd, &header);
 
-        // Parse opcode and FIN bit
-        const opcode = header[0] & 0x0F;
-        const fin = (header[0] & WS_FIN_BIT) != 0;
+            // Parse opcode and FIN bit
+            const opcode = header[0] & 0x0F;
+            const fin = (header[0] & WS_FIN_BIT) != 0;
 
-        // Parse payload length
-        // SOURCE: RFC 6455, Section 5.2 — payload length encoding
-        var payload_len: usize = header[1] & 0x7F;
-        if (payload_len == 126) {
-            var ext_len: [2]u8 = undefined;
-            _ = try recvExact(self.fd, &ext_len);
-            payload_len = (@as(usize, ext_len[0]) << 8) | @as(usize, ext_len[1]);
-        } else if (payload_len == 127) {
-            var ext_len: [8]u8 = undefined;
-            _ = try recvExact(self.fd, &ext_len);
-            payload_len = 0;
-            for (ext_len) |b| payload_len = (payload_len << 8) | b;
+            // Parse payload length
+            // SOURCE: RFC 6455, Section 5.2 — payload length encoding
+            var payload_len: usize = header[1] & 0x7F;
+            if (payload_len == 126) {
+                var ext_len: [2]u8 = undefined;
+                _ = try recvExact(self.fd, &ext_len);
+                payload_len = (@as(usize, ext_len[0]) << 8) | @as(usize, ext_len[1]);
+            } else if (payload_len == 127) {
+                var ext_len: [8]u8 = undefined;
+                _ = try recvExact(self.fd, &ext_len);
+                payload_len = 0;
+                for (ext_len) |b| payload_len = (payload_len << 8) | b;
+            }
+
+            // Server frames are NOT masked (MASK bit should be 0)
+            // SOURCE: RFC 6455, Section 5.3 — server-to-client frames are NOT masked
+
+            const old_len = message.items.len;
+            try message.resize(old_len + payload_len);
+            _ = try recvExact(self.fd, message.items[old_len..]);
+
+            // Handle close frame
+            if (opcode == WS_OPCODE_CLOSE) return error.WsFrameError;
+            if (opcode != WS_OPCODE_TEXT and opcode != WS_OPCODE_CONTINUATION) return error.WsFrameError;
+
+            if (fin) return message.toOwnedSlice();
         }
-
-        // Server frames are NOT masked (MASK bit should be 0)
-        // SOURCE: RFC 6455, Section 5.3 — server-to-client frames are NOT masked
-
-        const payload = try self.allocator.alloc(u8, payload_len);
-        errdefer self.allocator.free(payload);
-        _ = try recvExact(self.fd, payload);
-
-        // Handle close frame
-        if (opcode == WS_OPCODE_CLOSE) return error.WsFrameError;
-
-        // If not FIN, read continuation frames (simplified: just return what we have)
-        _ = fin;
-        return payload;
     }
 
     /// Send a raw WebSocket frame (for close frame etc.)
@@ -1076,19 +1095,11 @@ fn writeAll(fd: i32, data: [*]const u8, len: usize) !void {
 /// SOURCE: man 2 read — EAGAIN/EWOULDBLOCK on non-blocking fd or SO_RCVTIMEO expiry
 fn recvExact(fd: i32, buf: []u8) ![]u8 {
     var total: usize = 0;
-    var wouldblock_retries: u32 = 0;
-    const READ_MAX_RETRIES: u32 = 100; // 100 × 10ms = 1s total
     while (total < buf.len) {
         const n = std.posix.read(fd, buf[total..]) catch |err| switch (err) {
             error.WouldBlock => {
-                if (wouldblock_retries >= READ_MAX_RETRIES) {
-                    std.debug.print("[CDP] recvExact: WouldBlock timeout after {d} retries ({d}/{d} bytes)\n", .{ wouldblock_retries, total, buf.len });
-                    return error.ReadFailed;
-                }
-                wouldblock_retries += 1;
-                const sleep_req = std.os.linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-                _ = std.os.linux.nanosleep(&sleep_req, null);
-                continue;
+                std.debug.print("[CDP] recvExact: WouldBlock after {d}/{d} bytes\n", .{ total, buf.len });
+                return error.ReadFailed;
             },
             else => {
                 std.debug.print("[CDP] recvExact: read failed after {d}/{d} bytes: {}\n", .{ total, buf.len, err });
@@ -1100,7 +1111,6 @@ fn recvExact(fd: i32, buf: []u8) ![]u8 {
             return error.ReadFailed;
         }
         total += n;
-        wouldblock_retries = 0; // reset on progress
     }
     return buf;
 }
@@ -3813,6 +3823,61 @@ test "recvWsTextAlloc: supports server text frames larger than MAX_CDP_BUF" {
     try std.testing.expectEqual(payload_len, received.len);
     try std.testing.expectEqual(@as(u8, 'Z'), received[0]);
     try std.testing.expectEqual(@as(u8, 'Z'), received[received.len - 1]);
+}
+
+test "recvWsTextAlloc: reassembles fragmented server text message" {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+    if (rc == std.math.maxInt(usize)) return error.SocketFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const allocator = std.testing.allocator;
+    var client = CdpClient{
+        .fd = fds[0],
+        .allocator = allocator,
+        .msg_id = 0,
+        .pending_events = std.array_list.Managed([]u8).init(allocator),
+    };
+    defer {
+        for (client.pending_events.items) |event| allocator.free(event);
+        client.pending_events.deinit();
+    }
+
+    // SOURCE: RFC 6455, Section 5.4 — one message may be split across
+    // an initial text frame and one or more continuation frames.
+    const first = "{\"id\":1,";
+    const second = "\"result\":{}}";
+    var first_header: [2]u8 = .{ WS_OPCODE_TEXT, @intCast(first.len) };
+    var second_header: [2]u8 = .{ WS_FIN_BIT | 0x00, @intCast(second.len) };
+    try writeAll(fds[1], &first_header, first_header.len);
+    try writeAll(fds[1], first.ptr, first.len);
+    try writeAll(fds[1], &second_header, second_header.len);
+    try writeAll(fds[1], second.ptr, second.len);
+
+    const received = try client.recvWsTextAlloc();
+    defer allocator.free(received);
+
+    try std.testing.expectEqualStrings("{\"id\":1,\"result\":{}}", received);
+}
+
+test "recvExact: SO_RCVTIMEO WouldBlock returns without internal sleep retry loop" {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+    if (rc == std.math.maxInt(usize)) return error.SocketFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const timeout = std.os.linux.timeval{ .sec = 0, .usec = 1000 };
+    const sso_rc = linux.setsockopt(fds[0], 1, 20, @ptrCast(&timeout), @sizeOf(std.os.linux.timeval));
+    if (sso_rc == std.math.maxInt(usize)) return error.SocketFailed;
+
+    var buf: [1]u8 = undefined;
+    const before = currentTimestampNs();
+    try std.testing.expectError(error.ReadFailed, recvExact(fds[0], &buf));
+    const elapsed_ns = currentTimestampNs() - before;
+
+    try std.testing.expect(elapsed_ns < 200 * std.time.ns_per_ms);
 }
 
 test "sendCommand: ignores event messages with nested id before matching top-level response id" {

@@ -99,28 +99,31 @@ pub const SUBMIT_BTN_TEXT_MATCHER =
 
 /// Build JSON array string from Zig selector slices: `["s1","s2",...]`
 fn selectorsToJson(allocator: std.mem.Allocator, selectors: []const []const u8) ![]u8 {
-    var total_len: usize = 3;
-    for (selectors) |sel| {
-        var escaped_extra: usize = 0;
-        for (sel) |ch| {
-            if (ch == '\\' or ch == '"') escaped_extra += 1;
-        }
-        total_len += sel.len + escaped_extra + 3;
-    }
-    const json = try allocator.alloc(u8, total_len);
-    var pos: usize = 0;
-    json[pos] = '['; pos += 1;
+    var total: usize = 1;
     for (selectors, 0..) |sel, i| {
-        if (i > 0) { json[pos] = ','; pos += 1; }
-        json[pos] = '"'; pos += 1;
+        total += 2; // quotes around value
+        if (i > 0) total += 1; // comma
         for (sel) |ch| {
-            if (ch == '\\' or ch == '"') { json[pos] = '\\'; pos += 1; }
-            json[pos] = ch; pos += 1;
+            total += 1;
+            if (ch == '\\' or ch == '"') total += 1; // escape
         }
-        json[pos] = '"'; pos += 1;
     }
-    json[pos] = ']';
-    return json[0..pos];
+    total += 1; // closing bracket
+    const buf = try allocator.alloc(u8, total);
+    var pos: usize = 0;
+    buf[pos] = '['; pos += 1;
+    for (selectors, 0..) |sel, i| {
+        if (i > 0) { buf[pos] = ','; pos += 1; }
+        buf[pos] = '"'; pos += 1;
+        for (sel) |ch| {
+            if (ch == '\\' or ch == '"') { buf[pos] = '\\'; pos += 1; }
+            buf[pos] = ch; pos += 1;
+        }
+        buf[pos] = '"'; pos += 1;
+    }
+    buf[pos] = ']';
+    std.debug.assert(pos + 1 == total);
+    return buf[0..pos + 1];
 }
 
 // =============================================================================
@@ -354,22 +357,26 @@ pub fn injectAnswerOnTarget(
     const sub_json = try selectorsToJson(allocator, &SUBMIT_BUTTON_SELECTORS);
     defer allocator.free(sub_json);
 
-    const answer_script = try std.fmt.allocPrint(allocator,
-        \\(() => {{
-        \\  const selectors = {s};
-        \\  for (const sel of selectors) {{
-        \\    const el = document.querySelector(sel);
-        \\    if (el) {{
-        \\      el.value = {any};
-        \\      el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        \\      el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        \\      return 'filled_' + sel;
-        \\    }}
-        \\  }}
-        \\  return 'no_input_found';
-        \\}})()
-    , .{ ans_json, answer });
+    // Build answer injection JS manually (Zig 0.16 fmt can't handle {s} with []u8)
+    const ans_parts = [_][]const u8{
+        "(() => { const s=",
+        ans_json,
+        "; for(const sel of s) { const el = document.querySelector(sel); if(el) { el.value=",
+    };
+    var ans_total: usize = 0;
+    for (&ans_parts) |p| ans_total += p.len;
+    ans_total += 4; // max 4 digits for answer
+    ans_total += "; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return 'filled_'+sel; } } return 'no_input'; })()".len;
+    const answer_script = try allocator.alloc(u8, ans_total);
+    var ap: usize = 0;
+    for (&ans_parts) |p| { @memcpy(answer_script[ap..ap+p.len], p); ap += p.len; }
+    const ans_digits = try std.fmt.bufPrint(answer_script[ap..], "{d}", .{answer});
+    ap += ans_digits.len;
+    const ans_tail = "; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return 'filled_'+sel; } } return 'no_input'; })()";
+    @memcpy(answer_script[ap..ap+ans_tail.len], ans_tail); ap += ans_tail.len;
     defer allocator.free(answer_script);
+
+    std.debug.print("[AUDIO INJECTOR] Answer JS ({d} bytes): {s}\n", .{ap, answer_script[0..@min(ap, 200)]});
 
     const fill_response = if (context_id > 0)
         try cdp.evaluateInContext(answer_script, context_id)
@@ -378,26 +385,17 @@ pub fn injectAnswerOnTarget(
     defer allocator.free(fill_response);
     std.debug.print("[AUDIO INJECTOR] Answer injection (target): {s}\n", .{fill_response[0..@min(fill_response.len, 200)]});
 
-    const submit_script = try std.fmt.allocPrint(allocator,
-        \\(() => {{
-        \\  const selectors = {s};
-        \\  for (const sel of selectors) {{
-        \\    const btn = document.querySelector(sel);
-        \\    if (btn && btn.offsetParent !== null) {{
-        \\      btn.click();
-        \\      return 'clicked_' + sel;
-        \\    }}
-        \\  }}
-        \\  const btns = document.querySelectorAll('button');
-        \\  for (const btn of btns) {{
-        \\    if (btn.textContent.trim() === 'Submit' && btn.offsetParent !== null) {{
-        \\      btn.click();
-        \\      return 'clicked_text_Submit';
-        \\    }}
-        \\  }}
-        \\  return 'no_submit_found';
-        \\}})()
-    , .{sub_json});
+    // Build submit JS
+    const sub_parts = [_][]const u8{
+        "(() => { const s=",
+        sub_json,
+        "; for(const sel of s) { const btn = document.querySelector(sel); if(btn&&btn.offsetParent!==null) { btn.click(); return 'clicked_'+sel; } } const btns=document.querySelectorAll('button'); for(const bt of btns) { if(bt.textContent.trim()==='Submit'&&bt.offsetParent!==null) { bt.click(); return 'clicked_text_Submit'; } } return 'no_submit'; })()",
+    };
+    var sub_total: usize = 0;
+    for (&sub_parts) |p| sub_total += p.len;
+    const submit_script = try allocator.alloc(u8, sub_total);
+    var sp: usize = 0;
+    for (&sub_parts) |p| { @memcpy(submit_script[sp..sp+p.len], p); sp += p.len; }
     defer allocator.free(submit_script);
 
     const submit_response = if (context_id > 0)
