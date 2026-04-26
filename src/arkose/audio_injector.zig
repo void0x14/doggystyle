@@ -111,19 +111,29 @@ fn selectorsToJson(allocator: std.mem.Allocator, selectors: []const []const u8) 
     total += 1; // closing bracket
     const buf = try allocator.alloc(u8, total);
     var pos: usize = 0;
-    buf[pos] = '['; pos += 1;
+    buf[pos] = '[';
+    pos += 1;
     for (selectors, 0..) |sel, i| {
-        if (i > 0) { buf[pos] = ','; pos += 1; }
-        buf[pos] = '"'; pos += 1;
-        for (sel) |ch| {
-            if (ch == '\\' or ch == '"') { buf[pos] = '\\'; pos += 1; }
-            buf[pos] = ch; pos += 1;
+        if (i > 0) {
+            buf[pos] = ',';
+            pos += 1;
         }
-        buf[pos] = '"'; pos += 1;
+        buf[pos] = '"';
+        pos += 1;
+        for (sel) |ch| {
+            if (ch == '\\' or ch == '"') {
+                buf[pos] = '\\';
+                pos += 1;
+            }
+            buf[pos] = ch;
+            pos += 1;
+        }
+        buf[pos] = '"';
+        pos += 1;
     }
     buf[pos] = ']';
     std.debug.assert(pos + 1 == total);
-    return buf[0..pos + 1];
+    return buf[0 .. pos + 1];
 }
 
 // =============================================================================
@@ -277,26 +287,9 @@ pub fn injectAnswer(bridge: *browser_bridge.BrowserBridge, answer: u8) !void {
         \\      return 'filled_' + sel;
         \\    }}
         \\  }}
-        \\  const frames = document.querySelectorAll('iframe');
-        \\  for (const f of frames) {{
-        \\    try {{
-        \\      const idoc = f.contentDocument || f.contentWindow.document;
-        \\      if (idoc) {{
-        \\        for (const sel of selectors) {{
-        \\          const el = idoc.querySelector(sel);
-        \\          if (el) {{
-        \\            el.value = {any};
-        \\            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        \\            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        \\            return 'filled_iframe_' + sel;
-        \\          }}
-        \\        }}
-        \\      }}
-        \\    }} catch(e) {{ continue; }}
-        \\  }}
         \\  return 'no_input_found';
         \\}})()
-    , .{ ans_json, answer, answer });
+    , .{ ans_json, answer });
     defer bridge.allocator.free(answer_script);
 
     const fill_response = try bridge.cdp.evaluateWithTimeout(answer_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
@@ -312,21 +305,6 @@ pub fn injectAnswer(bridge: *browser_bridge.BrowserBridge, answer: u8) !void {
         \\      btn.click();
         \\      return 'clicked_' + sel;
         \\    }}
-        \\  }}
-        \\  const frames = document.querySelectorAll('iframe');
-        \\  for (const f of frames) {{
-        \\    try {{
-        \\      const idoc = f.contentDocument || f.contentWindow.document;
-        \\      if (idoc) {{
-        \\        for (const sel of selectors) {{
-        \\          const el = idoc.querySelector(sel);
-        \\          if (el) {{
-        \\            el.click();
-        \\            return 'clicked_iframe_' + sel;
-        \\          }}
-        \\        }}
-        \\      }}
-        \\    }} catch(e) {{ continue; }}
         \\  }}
         \\  return 'no_submit_found';
         \\}})()
@@ -352,62 +330,82 @@ pub fn injectAnswerOnTarget(
     answer: u8,
     context_id: i64,
 ) !void {
-    const ans_json = try selectorsToJson(allocator, &ANSWER_INPUT_SELECTORS);
-    defer allocator.free(ans_json);
-    const sub_json = try selectorsToJson(allocator, &SUBMIT_BUTTON_SELECTORS);
-    defer allocator.free(sub_json);
+    // SESSION VALIDATION TEST: 1+1 evaluate before injection
+    // If this drops silently → session invalid (timing değil escape)
+    // If returns 2 → session valid, look elsewhere (escape or JS error)
+    std.debug.print("[AUDIO INJECTOR] SESSION TEST: Evaluating 1+1 (ctx={d})...\n", .{context_id});
+    const session_test = if (context_id > 0)
+        cdp.evaluateInContext("1+1", context_id)
+    else
+        cdp.evaluate("1+1");
+    if (session_test) |test_result| {
+        defer allocator.free(test_result);
+        std.debug.print("[AUDIO INJECTOR] SESSION TEST RESULT: {s}\n", .{test_result[0..@min(test_result.len, 50)]});
+        if (test_result.len == 0) {
+            std.debug.print("[AUDIO INJECTOR] SESSION INVALID: 1+1 returned empty → session dropped, not timing!\n", .{});
+            return error.CdpSessionInvalid;
+        }
+    } else |err| {
+        std.debug.print("[AUDIO INJECTOR] SESSION TEST FAILED: {} → session invalid\n", .{err});
+        return error.CdpSessionInvalid;
+    }
 
-    // Build answer injection JS manually (Zig 0.16 fmt can't handle {s} with []u8)
-    const ans_parts = [_][]const u8{
-        "(() => { const s=",
-        ans_json,
-        "; for(const sel of s) { const el = document.querySelector(sel); if(el) { el.value=",
-    };
-    var ans_total: usize = 0;
-    for (&ans_parts) |p| ans_total += p.len;
-    ans_total += 4; // max 4 digits for answer
-    ans_total += "; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return 'filled_'+sel; } } return 'no_input'; })()".len;
-    const answer_script = try allocator.alloc(u8, ans_total);
-    var ap: usize = 0;
-    for (&ans_parts) |p| { @memcpy(answer_script[ap..ap+p.len], p); ap += p.len; }
-    const ans_digits = try std.fmt.bufPrint(answer_script[ap..], "{d}", .{answer});
-    ap += ans_digits.len;
-    const ans_tail = "; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return 'filled_'+sel; } } return 'no_input'; })()";
-    @memcpy(answer_script[ap..ap+ans_tail.len], ans_tail); ap += ans_tail.len;
+    // FIX: Always use the discovered context_id for injection (matches audio_bypass.zig pattern)
+    // FIX: Wrap JS in IIFE to avoid "Illegal return statement" SyntaxError in global scope
+    // FIX: Use direct document selectors since contextId is the game-core execution context itself
+    // FIX: Use evaluateWithTimeout / evaluateInContextWithTimeout for infinite-loop protection
+
+    const answer_script = try std.fmt.allocPrint(allocator,
+        \\(() => {{
+        \\  const inp = document.querySelector('input[type="text"]') || document.querySelector('input');
+        \\  if (!inp) return 'no_input';
+        \\  inp.value = {d};
+        \\  inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        \\  inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        \\  return 'filled';
+        \\}})()
+    , .{answer});
     defer allocator.free(answer_script);
 
-    std.debug.print("[AUDIO INJECTOR] Answer JS ({d} bytes): {s}\n", .{ap, answer_script[0..@min(ap, 200)]});
-
-    // SOURCE: LIVE TEST 2026-04-25 — CDP Runtime.evaluate with "timeout" parameter
-    // causes Chrome to withhold the response in enforcement iframe contexts.
-    // Bypass: use raw evaluate (no CDP timeout) with extended socket timeout.
-    cdp.setReceiveTimeoutMs(browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
-    defer cdp.setReceiveTimeoutMs(browser_bridge.DEFAULT_CDP_RECEIVE_TIMEOUT_MS);
-
     const fill_response = if (context_id > 0)
-        try cdp.evaluateInContext(answer_script, context_id)
+        try cdp.evaluateInContextWithTimeout(answer_script, context_id, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS)
     else
-        try cdp.evaluate(answer_script);
+        try cdp.evaluateWithTimeout(answer_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
     defer allocator.free(fill_response);
     std.debug.print("[AUDIO INJECTOR] Answer injection (target): {s}\n", .{fill_response[0..@min(fill_response.len, 200)]});
 
-    // Build submit JS
-    const sub_parts = [_][]const u8{
-        "(() => { const s=",
-        sub_json,
-        "; for(const sel of s) { const btn = document.querySelector(sel); if(btn&&btn.offsetParent!==null) { btn.click(); return 'clicked_'+sel; } } const btns=document.querySelectorAll('button'); for(const bt of btns) { if(bt.textContent.trim()==='Submit'&&bt.offsetParent!==null) { bt.click(); return 'clicked_text_Submit'; } } return 'no_submit'; })()",
-    };
-    var sub_total: usize = 0;
-    for (&sub_parts) |p| sub_total += p.len;
-    const submit_script = try allocator.alloc(u8, sub_total);
-    var sp: usize = 0;
-    for (&sub_parts) |p| { @memcpy(submit_script[sp..sp+p.len], p); sp += p.len; }
+    const submit_script = try std.fmt.allocPrint(allocator,
+        \\(() => {{
+        \\  const btn = document.querySelector('button[type="submit"]');
+        \\  if (btn && btn.offsetParent !== null) {{
+        \\    btn.click();
+        \\    return 'clicked_type_submit';
+        \\  }}
+        \\  const btns = document.querySelectorAll('button');
+        \\  for (const bt of btns) {{
+        \\    const txt = bt.textContent.trim().toLowerCase();
+        \\    if (bt.offsetParent !== null && (txt.includes('submit') || txt.includes('verify') || txt.includes('next'))) {{
+        \\      bt.click();
+        \\      return 'clicked_text_' + txt;
+        \\    }}
+        \\  }}
+        \\  // Last resort: click first visible button that is not audio-related
+        \\  for (const bt of btns) {{
+        \\    const txt = bt.textContent.trim().toLowerCase();
+        \\    if (bt.offsetParent !== null && !txt.includes('audio') && !txt.includes('play')) {{
+        \\      bt.click();
+        \\      return 'clicked_fallback';
+        \\    }}
+        \\  }}
+        \\  return 'no_submit';
+        \\}})()
+    , .{});
     defer allocator.free(submit_script);
 
     const submit_response = if (context_id > 0)
-        try cdp.evaluateInContext(submit_script, context_id)
+        try cdp.evaluateInContextWithTimeout(submit_script, context_id, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS)
     else
-        try cdp.evaluate(submit_script);
+        try cdp.evaluateWithTimeout(submit_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
     defer allocator.free(submit_response);
     std.debug.print("[AUDIO INJECTOR] Submit (target): {s}\n", .{submit_response[0..@min(submit_response.len, 200)]});
 

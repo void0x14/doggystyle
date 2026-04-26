@@ -7,7 +7,13 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // FIX: gcc 15.2.1 crt1.o has .sframe section with R_X86_64_PC64 relocation
+    // that zig 0.16.0-dev linker does not support. Use musl libc instead.
+    const target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .linux,
+        .abi = .musl,
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
