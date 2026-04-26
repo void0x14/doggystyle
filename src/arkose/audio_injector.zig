@@ -76,19 +76,27 @@ pub const ANSWER_INPUT_SELECTORS = [_][]const u8{
 
 // SUBMIT BUTTON SELECTORS — real DOM: button text "Submit", game-core iframe
 // SOURCE: LIVE DOM 2026-04-25
+// NOTE: Arkose commonly uses <input type="submit">, not <button>. Also include
+// input[type="button"] and [role="button"] for modern framework compatibility.
+// EVIDENCE: browser_bridge.zig:2855 already queries input[type="submit"]
 pub const SUBMIT_BUTTON_SELECTORS = [_][]const u8{
+    "input[type=\"submit\"]",
     "button[type=\"submit\"]",
     "button[class*=\"submit\"]",
     "button[class*=\"Submit\"]",
     "button[id*=\"submit\"]",
+    "input[type=\"button\"][value*=\"Submit\"]",
+    "[role=\"button\"]",
 };
 
-// TEXT-based submit button finder: button text "Submit"
+// TEXT-based submit button finder: queries ALL interactive elements and checks
+// both .textContent (for <button>) and .value (for <input>)
 pub const SUBMIT_BTN_TEXT_MATCHER =
     \\(() => {
-    \\  const btns = document.querySelectorAll('button');
+    \\  const btns = document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]');
     \\  for (const btn of btns) {
-    \\    if (btn.textContent.trim() === 'Submit' && btn.offsetParent !== null) {
+    \\    const txt = (btn.textContent || btn.value || '').trim();
+    \\    if (txt === 'Submit' && btn.offsetParent !== null) {
     \\      btn.click();
     \\      return 'clicked_submit';
     \\    }
@@ -233,10 +241,11 @@ pub fn injectAnswerInContext(bridge: *browser_bridge.BrowserBridge, answer: u8, 
         \\      return 'clicked_ctx_' + sel;
         \\    }}
         \\  }}
-        \\  // TEXT fallback: real Arkose game-core button text "Submit"
-        \\  const btns = document.querySelectorAll('button');
+        \\  // TEXT fallback: real Arkose game-core uses <input type="submit" value="Submit">
+        \\  const btns = document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]');
         \\  for (const btn of btns) {{
-        \\    if (btn.textContent.trim() === 'Submit' && btn.offsetParent !== null) {{
+        \\    const txt = (btn.textContent || btn.value || '').trim();
+        \\    if (txt === 'Submit' && btn.offsetParent !== null) {{
         \\      btn.click();
         \\      return 'clicked_text_Submit';
         \\    }}
@@ -304,6 +313,15 @@ pub fn injectAnswer(bridge: *browser_bridge.BrowserBridge, answer: u8) !void {
         \\    if (btn) {{
         \\      btn.click();
         \\      return 'clicked_' + sel;
+        \\    }}
+        \\  }}
+        \\  // Fallback for <input type="submit"> and [role="button"]
+        \\  const btns = document.querySelectorAll('input[type="submit"], input[type="button"], [role="button"]');
+        \\  for (const btn of btns) {{
+        \\    const txt = (btn.value || btn.textContent || '').trim();
+        \\    if (txt.toLowerCase().includes('submit')) {{
+        \\      btn.click();
+        \\      return 'clicked_fallback_' + txt;
         \\    }}
         \\  }}
         \\  return 'no_submit_found';
@@ -376,23 +394,41 @@ pub fn injectAnswerOnTarget(
 
     const submit_script = try std.fmt.allocPrint(allocator,
         \\(() => {{
+        \\  // Primary: <button>Submit</button> (no type attr) or <input type="submit" value="Submit">
+        \\  // We search BOTH button and input[type="submit"] and match by visible text.
+        \\  const allBtns = document.querySelectorAll('button, input[type="submit"]');
+        \\  for (const bt of allBtns) {{
+        \\    const txt = (bt.textContent || bt.value || '').trim();
+        \\    if (txt === 'Submit' && bt.offsetParent !== null && !bt.disabled) {{
+        \\      bt.click();
+        \\      return 'clicked_text_submit';
+        \\    }}
+        \\  }}
+        \\  // Fallback 1: generic input[type="submit"] (catches value-less or non-Submit text)
+        \\  const inpSubmit = document.querySelector('input[type="submit"]');
+        \\  if (inpSubmit && inpSubmit.offsetParent !== null && !inpSubmit.disabled) {{
+        \\    inpSubmit.click();
+        \\    return 'clicked_input_submit';
+        \\  }}
+        \\  // Fallback 2: button[type="submit"]
         \\  const btn = document.querySelector('button[type="submit"]');
-        \\  if (btn && btn.offsetParent !== null) {{
+        \\  if (btn && btn.offsetParent !== null && !btn.disabled) {{
         \\    btn.click();
         \\    return 'clicked_type_submit';
         \\  }}
-        \\  const btns = document.querySelectorAll('button');
+        \\  // Fallback 3: ANY interactive element with submit/verify/next text
+        \\  const btns = document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]');
         \\  for (const bt of btns) {{
-        \\    const txt = bt.textContent.trim().toLowerCase();
-        \\    if (bt.offsetParent !== null && (txt.includes('submit') || txt.includes('verify') || txt.includes('next'))) {{
+        \\    const txt = (bt.textContent || bt.value || '').trim().toLowerCase();
+        \\    if (bt.offsetParent !== null && !bt.disabled && (txt.includes('submit') || txt.includes('verify') || txt.includes('next'))) {{
         \\      bt.click();
         \\      return 'clicked_text_' + txt;
         \\    }}
         \\  }}
-        \\  // Last resort: click first visible button that is not audio-related
+        \\  // Last resort: first visible non-audio button
         \\  for (const bt of btns) {{
-        \\    const txt = bt.textContent.trim().toLowerCase();
-        \\    if (bt.offsetParent !== null && !txt.includes('audio') && !txt.includes('play')) {{
+        \\    const txt = (bt.textContent || bt.value || '').trim().toLowerCase();
+        \\    if (bt.offsetParent !== null && !bt.disabled && !txt.includes('audio') && !txt.includes('play')) {{
         \\      bt.click();
         \\      return 'clicked_fallback';
         \\    }}

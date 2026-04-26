@@ -70,6 +70,7 @@ pub const HUMAN_ACTION_EVALUATE_TIMEOUT_MS: u64 = 15000;
 /// Readiness expressions must require the bridge global after reload/navigation to avoid
 /// observing stale pre-reload DOM state.
 /// SOURCE: Chrome DevTools Protocol Page.addScriptToEvaluateOnNewDocument — script runs on new documents.
+pub const GHOST_BRIDGE_EXISTS_EXPRESSION = "!!window.__ghostBridge";
 pub const BRIDGE_READY_EXPRESSION = "document.readyState === 'complete' && !!window.__ghostBridge";
 pub const SIGNUP_FORM_READY_EXPRESSION =
     BRIDGE_READY_EXPRESSION ++ " && !!document.querySelector('form[action=\"/signup?social=false\"]')";
@@ -608,6 +609,15 @@ pub const CdpClient = struct {
         const response = try self.sendCommand("Page.addScriptToEvaluateOnNewDocument", params);
         defer self.allocator.free(response);
         try ensureCdpCommandSucceeded(self.allocator, "Page.addScriptToEvaluateOnNewDocument", response);
+    }
+
+    // SOURCE: Chrome DevTools Protocol Page.setBypassCSP — bypass Content Security Policy.
+    pub fn setBypassCSP(self: *CdpClient, enabled: bool) !void {
+        const params = if (enabled) "{\"enabled\":true}" else "{\"enabled\":false}";
+        const response = try self.sendCommand("Page.setBypassCSP", params);
+        defer self.allocator.free(response);
+        try ensureCdpCommandSucceeded(self.allocator, "Page.setBypassCSP", response);
+        std.debug.print("[CDP] Page.setBypassCSP — CSP bypass {s}\n", .{if (enabled) "enabled" else "disabled"});
     }
 
     // SOURCE: Chrome DevTools Protocol Page.reload — reload the inspected page.
@@ -1848,6 +1858,12 @@ pub const BrowserBridge = struct {
             std.debug.print("[BRIDGE] ⚠️ Network.enable failed: {} — network events won't be logged\n", .{err});
         };
 
+        // STEP 0.5: Bypass CSP so Runtime.evaluate can inject scripts on CSP-restricted pages
+        // SOURCE: Chrome DevTools Protocol Page.setBypassCSP
+        bridge.cdp.setBypassCSP(true) catch |err| {
+            std.debug.print("[BRIDGE] ⚠️ Page.setBypassCSP failed: {} — injection may be blocked by CSP\n", .{err});
+        };
+
         // STEP 1: Inject bridge script (runs on new documents)
         var bridge_script_buf: [MAX_BRIDGE_SCRIPT_SIZE]u8 = undefined;
         const bridge_script = readBrowserSessionBridgeScript(&bridge_script_buf) catch return BridgeError.ReadFailed;
@@ -1872,7 +1888,7 @@ pub const BrowserBridge = struct {
         const bridge_script = readBrowserSessionBridgeScript(&bridge_script_buf) catch return BridgeError.ReadFailed;
         std.debug.print("[BRIDGE] __ghostBridge missing on current page — injecting directly before continuing\n", .{});
         try self.injectBridgeScriptDirect(bridge_script);
-        try self.waitForTruthyExpression(BRIDGE_READY_EXPRESSION, timeout_ms);
+        try self.waitForTruthyExpression(GHOST_BRIDGE_EXISTS_EXPRESSION, timeout_ms);
     }
 
     // SOURCE: Chrome DevTools Protocol Runtime.evaluate — evaluates JavaScript in the page execution context.
@@ -1889,7 +1905,7 @@ pub const BrowserBridge = struct {
     }
 
     fn isGhostBridgeReady(self: *BrowserBridge) bool {
-        const response = self.cdp.evaluate(BRIDGE_READY_EXPRESSION) catch return false;
+        const response = self.cdp.evaluate(GHOST_BRIDGE_EXISTS_EXPRESSION) catch return false;
         defer self.allocator.free(response);
         return mem.indexOf(u8, response, "\"value\":true") != null;
     }
@@ -2049,116 +2065,85 @@ pub const BrowserBridge = struct {
     }
 
     /// Find the Arkose Labs enforcement iframe's WebSocket debugger URL.
-    /// Connects to /json and searches for iframe targets whose URL contains "arkoselabs".
-    /// SOURCE: Chrome DevTools Protocol — GET /json returns iframe entries too
-    pub fn getArkoseWsUrl(self: *BrowserBridge, allocator: mem.Allocator) ![]u8 {
-        _ = self;
-        var hints: std.c.addrinfo = .{
-            .flags = .{ .NUMERICSERV = true },
-            .family = std.posix.AF.INET, // force IPv4 (Chrome CDP IPv6 bug)
-            .socktype = std.posix.SOCK.STREAM,
-            .protocol = 0,
-            .addrlen = 0,
-            .canonname = null,
-            .addr = null,
-            .next = null,
+    /// Probes the main page DOM first (same-origin iframes do not appear in /json),
+    /// then retries Target.getTargets to find the iframe's own CDP target.
+    /// Falls back to the main page WS URL for non-OOPIF same-origin iframes.
+    /// SOURCE: Chrome DevTools Protocol — Target.getTargets returns all discoverable targets
+    pub fn getArkoseWsUrl(self: *BrowserBridge, allocator: std.mem.Allocator) ![]u8 {
+        // STEP 1: Probe main page DOM to confirm Arkose iframe exists.
+        // Same-origin (non-OOPIF) iframes will NOT appear in GET /json or
+        // Target.getTargets, so we must detect them via JS evaluation first.
+        const probe_resp = self.cdp.evaluate(
+            \\(() => {
+            \\  const f = document.querySelector('iframe[src*="octocaptcha"], iframe[src*="arkoselabs"], iframe[src*="game-core"], iframe.js-octocaptcha-frame');
+            \\  return f ? f.src : "";
+            \\})()
+        ) catch |err| {
+            std.debug.print("[BRIDGE] getArkoseWsUrl: iframe probe evaluate failed: {}\n", .{err});
+            return error.NoTarget;
         };
-        var port_buf: [8]u8 = undefined;
-        const port_len = std.fmt.bufPrint(&port_buf, "{d}\x00", .{CDP_PORT}) catch return error.OutOfMemory;
-        const port_z: [:0]u8 = port_buf[0 .. port_len.len - 1 :0];
-        var result: ?*std.c.addrinfo = null;
-        const gai_rc = std.c.getaddrinfo("localhost", port_z.ptr, &hints, &result);
-        if (@intFromEnum(gai_rc) != 0) return error.ResolveFailed;
-        defer std.c.freeaddrinfo(result.?);
-        const ai = result orelse return error.ResolveFailed;
-        var current_ai: ?*std.c.addrinfo = ai;
-        var connected_fd: i32 = -1;
-        while (current_ai) |cai| : (current_ai = cai.next) {
-            if (cai.addr == null) continue;
-            const rc_socket = linux.socket(@bitCast(cai.family), @bitCast(cai.socktype), @bitCast(cai.protocol));
-            if (@as(isize, @bitCast(rc_socket)) < 0) continue;
-            const try_fd: i32 = @intCast(rc_socket);
-            const rc_connect = linux.connect(try_fd, cai.addr.?, cai.addrlen);
-            if (@as(isize, @bitCast(rc_connect)) < 0) { _ = std.c.close(try_fd); continue; }
-            connected_fd = try_fd;
-            break;
+        defer allocator.free(probe_resp);
+        const iframe_src = extractRuntimeEvaluateStringValue(allocator, probe_resp) catch |err| {
+            std.debug.print("[BRIDGE] getArkoseWsUrl: iframe src parse failed: {}\n", .{err});
+            return error.NoTarget;
+        };
+        defer allocator.free(iframe_src);
+        if (iframe_src.len == 0) {
+            std.debug.print("[BRIDGE] getArkoseWsUrl: no Arkose iframe found in main page DOM\n", .{});
+            return error.NoTarget;
         }
-        if (connected_fd < 0) return error.ConnectFailed;
-        const fd: i32 = connected_fd;
-        defer _ = std.c.close(fd);
+        std.debug.print("[BRIDGE] getArkoseWsUrl: detected Arkose iframe src={s}\n", .{iframe_src});
 
-        // Send HTTP GET /json
-        const request = "GET /json HTTP/1.1\r\nHost: localhost:9222\r\nConnection: close\r\n\r\n";
-        try writeAll(fd, request.ptr, request.len);
-        std.debug.print("[BRIDGE] getArkoseWsUrl: GET /json sent, waiting for response...\n", .{});
+        // STEP 2a: Retry Target.getTargets to locate the ENFORCEMENT iframe CDP target.
+        // The enforcement iframe (github-api.arkoselabs.com) is nested inside the
+        // wrapper iframe (octocaptcha.com) and may take time to appear as a separate
+        // CDP target after the wrapper target is created.
+        // SOURCE: Live test 2026-04-26 — enforcement iframe target not present
+        //         immediately; wrapper target appears first.
+        const max_retries: u32 = 20;
+        var attempt: u32 = 0;
+        while (attempt < max_retries) : (attempt += 1) {
+            if (attempt > 0) {
+                std.debug.print("[BRIDGE] getArkoseWsUrl: enforcement target retry {d}/{d}...\n", .{ attempt + 1, max_retries });
+                _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_ms }, null);
+            }
 
-        // poll() + read() loop with Content-Length parsing (same as findTargetTab)
-        var resp_buf: [MAX_CDP_BUF]u8 = undefined;
-        var total: usize = 0;
-        var poll_timeout_count: u32 = 0;
-        const MAX_POLL_TIMEOUTS: u32 = 10;
-        while (total < resp_buf.len) {
-            var pfd: [1]std.posix.pollfd = undefined;
-            pfd[0] = .{ .fd = fd, .events = @as(i16, @intCast(1)), .revents = 0 };
-            const poll_rc = std.posix.poll(&pfd, 1000) catch break;
-            if (poll_rc == 0) {
-                poll_timeout_count += 1;
-                if (poll_timeout_count >= MAX_POLL_TIMEOUTS) {
-                    std.debug.print("[BRIDGE] getArkoseWsUrl: poll timeout after {d}s ({d} bytes)\n", .{ poll_timeout_count, total });
-                    break;
-                }
+            const target_resp = self.cdp.sendCommand("Target.getTargets", "{}") catch |err| {
+                std.debug.print("[BRIDGE] getArkoseWsUrl: Target.getTargets command failed: {}\n", .{err});
+                continue;
+            };
+            defer allocator.free(target_resp);
+
+            if (extractEnforcementWsUrlFromTargetGetTargets(allocator, target_resp, CDP_PORT)) |ws_url| {
+                std.debug.print("[BRIDGE] Found Arkose enforcement iframe WS URL: {s}\n", .{ws_url});
+                return ws_url;
+            } else |_| {
+                // enforcement iframe not found yet, keep retrying
                 continue;
             }
-            const revents: i16 = pfd[0].revents;
-            if ((revents & @as(i16, @intCast(1))) == 0) continue;
-            const n = std.posix.read(fd, resp_buf[total..]) catch {
-                std.debug.print("[BRIDGE] getArkoseWsUrl: read failed at {d} bytes\n", .{total});
-                break;
-            };
-            if (n == 0) {
-                std.debug.print("[BRIDGE] getArkoseWsUrl: connection closed at {d} bytes\n", .{total});
-                break;
-            }
-            total += n;
-            poll_timeout_count = 0;
+        }
 
-            // Content-Length check
-            if (total >= 4) {
-                if (std.mem.indexOf(u8, resp_buf[0..total], "\r\n\r\n")) |headers_end| {
-                    const body_start = headers_end + 4;
-                    const cl_prefix = "Content-Length";
-                    const header_block = resp_buf[0..headers_end];
-                    if (std.mem.indexOf(u8, header_block, cl_prefix)) |cl_key_pos| {
-                        const after_colon = cl_key_pos + cl_prefix.len;
-                        if (after_colon < headers_end and resp_buf[after_colon] == ':') {
-                            var cl_start = after_colon + 1;
-                            while (cl_start < headers_end and (resp_buf[cl_start] == ' ' or resp_buf[cl_start] == '\t')) cl_start += 1;
-                            var cl_end = cl_start;
-                            while (cl_end < headers_end and resp_buf[cl_end] >= '0' and resp_buf[cl_end] <= '9') cl_end += 1;
-                            if (cl_end > cl_start) {
-                                if (std.fmt.parseInt(usize, resp_buf[cl_start..cl_end], 10)) |content_len| {
-                                    const expected_total = body_start + content_len;
-                                    if (total >= expected_total) break;
-                                } else |_| {}
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        std.debug.print("[BRIDGE] getArkoseWsUrl: received {d} bytes from /json\n", .{total});
-        if (total == 0) {
-            std.debug.print("[BRIDGE] getArkoseWsUrl: FAILED — empty response\n", .{});
-            return error.ParseFailed;
-        }
-        const body_start = mem.indexOf(u8, resp_buf[0..total], "\r\n\r\n") orelse return error.ParseFailed;
-        const body = resp_buf[body_start + 4 .. total];
-        const ws_url = extractArkoseWsUrlFromJsonBody(allocator, body) catch |err| {
-            std.debug.print("[BRIDGE] getArkoseWsUrl: no Arkose target in /json body ({d} bytes): {s}\n", .{ body.len, body[0..@min(body.len, 1000)] });
+        // STEP 2b: Fallback — enforcement iframe has no separate target.
+        // Try the wrapper iframe or main page instead.
+        std.debug.print("[BRIDGE] getArkoseWsUrl: enforcement target not found after {d} retries, trying fallback...\n", .{max_retries});
+        const target_resp = self.cdp.sendCommand("Target.getTargets", "{}") catch |err| {
+            std.debug.print("[BRIDGE] getArkoseWsUrl: Target.getTargets fallback command failed: {}\n", .{err});
             return err;
         };
-        std.debug.print("[BRIDGE] Found Arkose iframe WS URL: {s}\n", .{ws_url});
-        return ws_url;
+        defer allocator.free(target_resp);
+
+        if (extractArkoseWsUrlFromTargetGetTargets(allocator, target_resp, CDP_PORT)) |ws_url| {
+            std.debug.print("[BRIDGE] Found Arkose iframe WS URL via fallback: {s}\n", .{ws_url});
+            return ws_url;
+        } else |err| {
+            std.debug.print("[BRIDGE] getArkoseWsUrl: no Arkose target in Target.getTargets, falling back to main page WS URL\n", .{});
+            if (extractMainPageWsUrlFromTargetGetTargets(allocator, target_resp, CDP_PORT)) |main_ws_url| {
+                std.debug.print("[BRIDGE] getArkoseWsUrl: returning main page WS URL: {s}\n", .{main_ws_url});
+                return main_ws_url;
+            } else |_| {
+                return err;
+            }
+        }
     }
 
     pub fn captureSignupBundle(
@@ -2197,6 +2182,11 @@ pub const BrowserBridge = struct {
             } else {
                 std.debug.print("[BRIDGE] No captcha detected\n", .{});
             }
+        }
+
+        {
+            var audit = try self.finishSignupSubmit();
+            audit.deinit(self.allocator);
         }
 
         const paused = try self.waitForPausedRequest("/signup?social=false", REQUEST_CAPTURE_TIMEOUT_MS);
@@ -2639,6 +2629,12 @@ pub const BrowserBridge = struct {
             const sleep_req = std.os.linux.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
             _ = std.os.linux.nanosleep(&sleep_req, null);
         }
+        // Diagnostic: log why the expression never became true
+        const ready_state = self.cdp.evaluate("document.readyState") catch "unknown";
+        defer self.allocator.free(ready_state);
+        const bridge_type = self.cdp.evaluate("typeof window.__ghostBridge") catch "unknown";
+        defer self.allocator.free(bridge_type);
+        std.debug.print("[BRIDGE] waitForTruthyExpression timeout: readyState={s}, typeof __ghostBridge={s}\n", .{ ready_state, bridge_type });
         self.logSignupBrowserState() catch {};
         return BridgeError.Timeout;
     }
@@ -3615,12 +3611,10 @@ fn buildRuntimeEvaluateParams(
 }
 
 fn computeRuntimeEvaluateTimeouts(timeout_ms: u64) RuntimeEvaluateTimeouts {
-    const cdp_timeout = @min(timeout_ms, @as(u64, 8000));
     const response_margin_ms: u64 = 1000;
-    const socket_timeout = @min(timeout_ms + response_margin_ms, cdp_timeout + response_margin_ms);
     return .{
-        .cdp_timeout_ms = cdp_timeout,
-        .socket_timeout_ms = socket_timeout,
+        .cdp_timeout_ms = timeout_ms,
+        .socket_timeout_ms = timeout_ms + response_margin_ms,
     };
 }
 
@@ -3653,35 +3647,198 @@ fn jsonStringFieldValueInObject(object: []const u8, field_name: []const u8) ?[]c
 }
 
 fn extractArkoseWsUrlFromJsonBody(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    // PASS 1: Prefer game-core iframe directly.
+    // The game-core iframe (github-api.arkoselabs.com/.../game-core/...) is the
+    // actual document containing the audio challenge input + submit elements.
+    // Connecting to the enforcement iframe (octocaptcha.com or /enforcement/)
+    // often yields the wrong execution context because Chrome isolates nested
+    // same-origin iframes into separate targets/processes.
+    // SOURCE: Chrome DevTools Protocol — GET /json lists each iframe as its own target
     var idx: usize = 0;
     while (idx < body.len) {
         const obj_start = mem.indexOfScalarPos(u8, body, idx, '{') orelse break;
         const obj_end_inclusive = mem.indexOfScalarPos(u8, body, obj_start, '}') orelse break;
         const object = body[obj_start .. obj_end_inclusive + 1];
+        idx = obj_end_inclusive + 1;
 
-        const tab_type = jsonStringFieldValueInObject(object, "type") orelse {
-            idx = obj_end_inclusive + 1;
-            continue;
-        };
-        if (!mem.eql(u8, tab_type, "iframe") and !mem.eql(u8, tab_type, "page")) {
-            idx = obj_end_inclusive + 1;
+        const tab_type = jsonStringFieldValueInObject(object, "type") orelse continue;
+        if (!mem.eql(u8, tab_type, "iframe") and !mem.eql(u8, tab_type, "page")) continue;
+
+        const tab_url = jsonStringFieldValueInObject(object, "url") orelse continue;
+        if (mem.indexOf(u8, tab_url, "game-core") == null) continue;
+        if (mem.indexOf(u8, tab_url, "arkoselabs") == null and
+            mem.indexOf(u8, tab_url, "octocaptcha") == null)
+        {
             continue;
         }
 
-        const tab_url = jsonStringFieldValueInObject(object, "url") orelse {
-            idx = obj_end_inclusive + 1;
-            continue;
-        };
-        if (mem.indexOf(u8, tab_url, "arkoselabs") == null) {
-            idx = obj_end_inclusive + 1;
-            continue;
-        }
-
-        const ws_url = jsonStringFieldValueInObject(object, "webSocketDebuggerUrl") orelse {
-            idx = obj_end_inclusive + 1;
-            continue;
-        };
+        const ws_url = jsonStringFieldValueInObject(object, "webSocketDebuggerUrl") orelse continue;
+        std.debug.print("[BRIDGE] Found game-core target WS URL: {s}\n", .{ws_url});
         return try allocator.dupe(u8, ws_url);
+    }
+
+    // PASS 2: Fallback to any arkoselabs/octocaptcha iframe.
+    // This may be the enforcement iframe; the caller must verify the context
+    // via DOM probe (document.querySelector('input')).
+    idx = 0;
+    while (idx < body.len) {
+        const obj_start = mem.indexOfScalarPos(u8, body, idx, '{') orelse break;
+        const obj_end_inclusive = mem.indexOfScalarPos(u8, body, obj_start, '}') orelse break;
+        const object = body[obj_start .. obj_end_inclusive + 1];
+        idx = obj_end_inclusive + 1;
+
+        const tab_type = jsonStringFieldValueInObject(object, "type") orelse continue;
+        if (!mem.eql(u8, tab_type, "iframe") and !mem.eql(u8, tab_type, "page")) continue;
+
+        const tab_url = jsonStringFieldValueInObject(object, "url") orelse continue;
+        if (mem.indexOf(u8, tab_url, "arkoselabs") == null and
+            mem.indexOf(u8, tab_url, "octocaptcha") == null)
+        {
+            continue;
+        }
+
+        const ws_url = jsonStringFieldValueInObject(object, "webSocketDebuggerUrl") orelse continue;
+        std.debug.print("[BRIDGE] Fallback Arkose target WS URL: {s}\n", .{ws_url});
+        return try allocator.dupe(u8, ws_url);
+    }
+    return error.NoTarget;
+}
+
+/// Extract Arkose ENFORCEMENT iframe WS URL from CDP Target.getTargets response.
+/// Only matches github-api.arkoselabs.com or "enforcement" in URL.
+/// This is the REAL Arkose UI iframe, not the octocaptcha.com wrapper.
+fn extractEnforcementWsUrlFromTargetGetTargets(allocator: std.mem.Allocator, cdp_response: []const u8, port: u16) ![]u8 {
+    const ti_key = "\"targetInfos\"";
+    const ti_pos = mem.indexOf(u8, cdp_response, ti_key) orelse return error.NoTarget;
+    const arr_start = mem.indexOfScalarPos(u8, cdp_response, ti_pos + ti_key.len, '[') orelse return error.NoTarget;
+
+    var idx: usize = arr_start + 1;
+    while (idx < cdp_response.len) {
+        const obj_start = mem.indexOfScalarPos(u8, cdp_response, idx, '{') orelse break;
+        const obj_end_inclusive = mem.indexOfScalarPos(u8, cdp_response, obj_start, '}') orelse break;
+        const object = cdp_response[obj_start .. obj_end_inclusive + 1];
+        idx = obj_end_inclusive + 1;
+
+        const tab_type = jsonStringFieldValueInObject(object, "type") orelse continue;
+        if (!mem.eql(u8, tab_type, "iframe") and !mem.eql(u8, tab_type, "page")) continue;
+
+        const tab_url = jsonStringFieldValueInObject(object, "url") orelse continue;
+        if (mem.indexOf(u8, tab_url, "github-api.arkoselabs.com") == null and
+            mem.indexOf(u8, tab_url, "enforcement") == null)
+        {
+            continue;
+        }
+
+        const target_id = jsonStringFieldValueInObject(object, "targetId") orelse continue;
+        std.debug.print("[BRIDGE] Found Arkose enforcement iframe target: {s}\n", .{tab_url});
+        return try std.fmt.allocPrint(allocator, "ws://localhost:{d}/devtools/page/{s}", .{ port, target_id });
+    }
+    return error.NoTarget;
+}
+
+/// Extract Arkose iframe WS URL from CDP Target.getTargets response.
+/// CDP response format: {"id":N,"result":{"targetInfos":[{"targetId":"...","type":"iframe","url":"..."},...]}}
+/// Constructs the WebSocket URL manually since Target.getTargets does not return webSocketDebuggerUrl.
+/// SOURCE: Chrome DevTools Protocol — Target.getTargets returns targetInfos array
+/// SOURCE: Chrome CDP — all targets use ws://host:port/devtools/page/<targetId>
+fn extractArkoseWsUrlFromTargetGetTargets(allocator: std.mem.Allocator, cdp_response: []const u8, port: u16) ![]u8 {
+    const ti_key = "\"targetInfos\"";
+    const ti_pos = mem.indexOf(u8, cdp_response, ti_key) orelse return error.NoTarget;
+    const arr_start = mem.indexOfScalarPos(u8, cdp_response, ti_pos + ti_key.len, '[') orelse return error.NoTarget;
+
+    // DIAGNOSTIC: Log all iframe/page targets so we can see what's available
+    {
+        var diag_idx: usize = arr_start + 1;
+        std.debug.print("[BRIDGE] Target.getTargets diagnostic dump:\n", .{});
+        while (diag_idx < cdp_response.len) {
+            const obj_start = mem.indexOfScalarPos(u8, cdp_response, diag_idx, '{') orelse break;
+            const obj_end_inclusive = mem.indexOfScalarPos(u8, cdp_response, obj_start, '}') orelse break;
+            const object = cdp_response[obj_start .. obj_end_inclusive + 1];
+            diag_idx = obj_end_inclusive + 1;
+
+            const tab_type = jsonStringFieldValueInObject(object, "type") orelse continue;
+            if (!mem.eql(u8, tab_type, "iframe") and !mem.eql(u8, tab_type, "page")) continue;
+            const tab_url = jsonStringFieldValueInObject(object, "url") orelse continue;
+            std.debug.print("[BRIDGE]   target type={s} url={s}\n", .{ tab_type, tab_url });
+        }
+    }
+
+    // PASS 1: Prefer the actual Arkose enforcement iframe (github-api.arkoselabs.com)
+    // over the octocaptcha.com wrapper. The wrapper iframe is mostly empty and
+    // contains a cross-origin iframe pointing to the real enforcement URL.
+    // SOURCE: Live test 2026-04-26 — octocaptcha wrapper has empty DOM,
+    //         actual UI is inside github-api.arkoselabs.com enforcement iframe.
+    var idx: usize = arr_start + 1;
+    while (idx < cdp_response.len) {
+        const obj_start = mem.indexOfScalarPos(u8, cdp_response, idx, '{') orelse break;
+        const obj_end_inclusive = mem.indexOfScalarPos(u8, cdp_response, obj_start, '}') orelse break;
+        const object = cdp_response[obj_start .. obj_end_inclusive + 1];
+        idx = obj_end_inclusive + 1;
+
+        const tab_type = jsonStringFieldValueInObject(object, "type") orelse continue;
+        if (!mem.eql(u8, tab_type, "iframe") and !mem.eql(u8, tab_type, "page")) continue;
+
+        const tab_url = jsonStringFieldValueInObject(object, "url") orelse continue;
+        if (mem.indexOf(u8, tab_url, "github-api.arkoselabs.com") == null and
+            mem.indexOf(u8, tab_url, "enforcement") == null)
+        {
+            continue;
+        }
+
+        const target_id = jsonStringFieldValueInObject(object, "targetId") orelse continue;
+        std.debug.print("[BRIDGE] Found Arkose enforcement iframe target: {s}\n", .{tab_url});
+        return try std.fmt.allocPrint(allocator, "ws://localhost:{d}/devtools/page/{s}", .{ port, target_id });
+    }
+
+    // PASS 2: Fall back to any arkose/octocaptcha/game-core match
+    idx = arr_start + 1;
+    while (idx < cdp_response.len) {
+        const obj_start = mem.indexOfScalarPos(u8, cdp_response, idx, '{') orelse break;
+        const obj_end_inclusive = mem.indexOfScalarPos(u8, cdp_response, obj_start, '}') orelse break;
+        const object = cdp_response[obj_start .. obj_end_inclusive + 1];
+        idx = obj_end_inclusive + 1;
+
+        const tab_type = jsonStringFieldValueInObject(object, "type") orelse continue;
+        if (!mem.eql(u8, tab_type, "iframe") and !mem.eql(u8, tab_type, "page")) continue;
+
+        const tab_url = jsonStringFieldValueInObject(object, "url") orelse continue;
+        if (mem.indexOf(u8, tab_url, "arkoselabs") == null and
+            mem.indexOf(u8, tab_url, "octocaptcha") == null and
+            mem.indexOf(u8, tab_url, "game-core") == null)
+        {
+            continue;
+        }
+
+        const target_id = jsonStringFieldValueInObject(object, "targetId") orelse continue;
+        std.debug.print("[BRIDGE] Found Arkose wrapper iframe target (fallback): {s}\n", .{tab_url});
+        return try std.fmt.allocPrint(allocator, "ws://localhost:{d}/devtools/page/{s}", .{ port, target_id });
+    }
+    return error.NoTarget;
+}
+
+/// Extract main page WS URL from CDP Target.getTargets response.
+/// Used as fallback when the Arkose iframe is same-origin (non-OOPIF)
+/// and does not have its own CDP target.
+fn extractMainPageWsUrlFromTargetGetTargets(allocator: std.mem.Allocator, cdp_response: []const u8, port: u16) ![]u8 {
+    const ti_key = "\"targetInfos\"";
+    const ti_pos = mem.indexOf(u8, cdp_response, ti_key) orelse return error.NoTarget;
+    const arr_start = mem.indexOfScalarPos(u8, cdp_response, ti_pos + ti_key.len, '[') orelse return error.NoTarget;
+
+    var idx: usize = arr_start + 1;
+    while (idx < cdp_response.len) {
+        const obj_start = mem.indexOfScalarPos(u8, cdp_response, idx, '{') orelse break;
+        const obj_end_inclusive = mem.indexOfScalarPos(u8, cdp_response, obj_start, '}') orelse break;
+        const object = cdp_response[obj_start .. obj_end_inclusive + 1];
+        idx = obj_end_inclusive + 1;
+
+        const tab_type = jsonStringFieldValueInObject(object, "type") orelse continue;
+        if (!mem.eql(u8, tab_type, "page")) continue;
+
+        const tab_url = jsonStringFieldValueInObject(object, "url") orelse continue;
+        if (mem.indexOf(u8, tab_url, "github.com/signup") == null) continue;
+
+        const target_id = jsonStringFieldValueInObject(object, "targetId") orelse continue;
+        return try std.fmt.allocPrint(allocator, "ws://localhost:{d}/devtools/page/{s}", .{ port, target_id });
     }
     return error.NoTarget;
 }
@@ -3945,6 +4102,19 @@ test "extractArkoseWsUrlFromJsonBody: accepts compact Chrome target JSON" {
     defer allocator.free(ws_url);
 
     try std.testing.expectEqualStrings("ws://127.0.0.1/devtools/page/2", ws_url);
+}
+
+test "extractArkoseWsUrlFromJsonBody: prefers game-core target over enforcement" {
+    const allocator = std.testing.allocator;
+    const body =
+        "[{\"id\":\"1\",\"type\":\"page\",\"url\":\"https://github.com/signup\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1/devtools/page/1\"}," ++
+        "{\"id\":\"2\",\"type\":\"iframe\",\"url\":\"https://github-api.arkoselabs.com/enforcement/123\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1/devtools/page/2\"}," ++
+        "{\"id\":\"3\",\"type\":\"iframe\",\"url\":\"https://github-api.arkoselabs.com/game-core/456\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1/devtools/page/3\"}]";
+
+    const ws_url = try extractArkoseWsUrlFromJsonBody(allocator, body);
+    defer allocator.free(ws_url);
+
+    try std.testing.expectEqualStrings("ws://127.0.0.1/devtools/page/3", ws_url);
 }
 
 test "computeRuntimeEvaluateTimeouts: socket outlives CDP timeout" {

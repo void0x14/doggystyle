@@ -251,13 +251,15 @@
       }
 
       const captchaButton = form.querySelector("button.js-octocaptcha-load-captcha");
-      if (!captchaButton) {
-        throw new Error("missing captcha trigger button");
+      const submitButton = form.querySelector("button.js-octocaptcha-form-submit");
+      const triggerButton = captchaButton || submitButton || findVisibleButtonMatching([/create account/i, /sign up/i], form);
+      if (!triggerButton) {
+        throw new Error("missing signup trigger button");
       }
 
       audit.captcha_button_found = true;
-      audit.captcha_button_label = labelOf(captchaButton);
-      audit.captcha_click_dispatched = await triggerHumanClick(captchaButton, human);
+      audit.captcha_button_label = labelOf(triggerButton);
+      audit.captcha_click_dispatched = await triggerHumanClick(triggerButton, human);
       audit.blockers_after = await dismissPageBlockersInternal(human);
     } catch (error) {
       audit.error = String(error && error.message ? error.message : error);

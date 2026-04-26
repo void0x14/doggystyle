@@ -81,7 +81,7 @@ pub const CHROME_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.3
 pub const PROFILE_PREFIX = "/tmp/ghost_";
 
 /// Number of arguments passed to Chrome
-pub const CHROME_ARG_COUNT: usize = 25;
+pub const CHROME_ARG_COUNT: usize = 26;
 
 /// Maximum attempts to generate a unique profile directory
 pub const MAX_MKDTEMP_ATTEMPTS: usize = 10;
@@ -97,7 +97,7 @@ pub const SIGNUP_URL = "https://github.com/signup";
 /// Manifest V3 JSON for harvest extension (kept for fallback, but CDP is primary)
 /// SOURCE: Chrome Extension Manifest V3 spec
 pub const MANIFEST_JSON: []const u8 =
-    "{\"manifest_version\":3,\"name\":\"Harvest\",\"version\":\"1.0\",\"content_scripts\":[{\"matches\":[\"*://*.github.com/*\",\"*://*.arkoselabs.com/*\"],\"js\":[\"harvest.js\"],\"run_at\":\"document_start\"}]}";
+    "{\"manifest_version\":3,\"name\":\"Harvest\",\"version\":\"1.0\",\"content_scripts\":[{\"matches\":[\"*://*.github.com/*\",\"*://*.arkoselabs.com/*\",\"*://*.octocaptcha.com/*\"],\"js\":[\"harvest.js\"],\"run_at\":\"document_start\"}]}";
 
 /// Preferences JSON content — forces "Normal" exit type to avoid restore prompts
 /// SOURCE: Chrome Preferences file format — internal Chrome config structure
@@ -388,6 +388,7 @@ fn buildChromeArgvWithBinary(
         "--headless=new",
         "--enable-unsafe-webgpu",
         "--ignore-gpu-blocklist",
+        "--disable-blink-features=AutomationControlled",
     };
 }
 
@@ -736,6 +737,7 @@ test "StealthBrowser: argv contains required stealth flags" {
         "--headless=new",
         "--enable-unsafe-webgpu",
         "--ignore-gpu-blocklist",
+        "--disable-blink-features=AutomationControlled",
     };
 
     for (expected_flags) |flag| {
