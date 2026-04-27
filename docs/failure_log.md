@@ -11,15 +11,27 @@
 
 ---
 
+## [2026-04-27] — Arkose Audio Submit Hedefini Captcha Başarısı Sandı
+
+**Hata:** `audioBypassFinalSuccess()` runtime hedef kadar submit yapılınca `challenge_complete=false` olsa bile success true döndürüyordu. Canlı motor `Pipeline ended: 1/1 submitted, complete=false` ve hemen ardından `captcha_frame=true` / `error.Timeout` gösterdi.
+
+**Kök sebep:** Submit sayacı ile captcha çözülme durumu aynı başarı semantiğine bağlandı. `clicked_text_submit` yalnız form submit denemesidir; Arkose completion veya captcha iframe kapanması kanıtı değildir.
+
+**Kaynak:** Canlı motor logu `/home/void0x14/.local/share/opencode/tool-output/tool_dcef88252001e38uS0LZIV8lYT` — satır 3384-3388 submit sonrası completion `continue`, satır 3395 ve devamı `captcha_frame=true`, satır 3673 `error.Timeout`.
+
+**Düzeltme:** Final success yalnız `challenge_complete` sinyaline bağlandı. Runtime hedef sayısı loop sınırı/progress için kullanılmaya devam ediyor; captcha başarısı olarak raporlanmıyor.
+
+---
+
 ## [2026-04-27] — Arkose Audio Final Success Completion Flag'e Bağlı Kaldı
 
 **Hata:** Audio bypass döngüsü runtime hedef submit sayısına ulaştığında durabiliyor, ancak final `AudioBypassResult.success` yalnız `challenge_complete` değerine bağlı kaldığı için `complete=false` durumunda sonuç PARTIAL kalabiliyordu.
 
-**Kök sebep:** Döngü sonlandırma semantiği ile final başarı semantiği ayrıştırılmamıştı. Runtime hedefe ulaşmak başarılı submit hedefinin tamamlandığını gösterir; Arkose completion flag'i ayrıca loglanır ama hedef submit başarısını false yapmamalıdır.
+**Kök sebep:** Bu kayıt sonradan yanlışlandı. Döngü sonlandırma semantiği ile final başarı semantiği ayrıştırılmalıydı; ancak runtime hedefe ulaşmak captcha çözümünü kanıtlamaz. Arkose completion flag'i veya captcha iframe kapanması olmadan success true olmamalıdır.
 
-**Kaynak:** Kullanıcı gereksinimi 2026-04-27 — `audio_challenge_urls` hedefi kadar gerçek submit başarıysa final başarı true olmalı; `no_submit` başarı sayılmamalı.
+**Kaynak:** Canlı motor logu `/home/void0x14/.local/share/opencode/tool-output/tool_dcef88252001e38uS0LZIV8lYT` — `1/1 submitted`, `complete=false`, `captcha_frame=true`, ardından `error.Timeout`.
 
-**Düzeltme:** `audioBypassFinalSuccess()` helper'ı eklendi. Final başarı artık `challenge_complete` veya `successful_submits >= target_challenges` ile hesaplanıyor; hedef parse edilemeyen erken dönüş ve `no_submit` sayacı değişmeden kaldı.
+**Düzeltme:** Bu kayıttaki eski düzeltme geri alındı. Final success yalnız `challenge_complete` olduğunda true döner; submit hedefi yalnız progress/loop için kullanılır.
 
 ---
 

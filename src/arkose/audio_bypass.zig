@@ -78,8 +78,9 @@ pub fn shouldContinueAudioChallengeLoop(state: ChallengeLoopState) bool {
 }
 
 pub fn audioBypassFinalSuccess(state: ChallengeLoopState) bool {
-    return state.challenge_complete or
-        (state.target_challenges > 0 and state.successful_submits >= state.target_challenges);
+    _ = state.successful_submits;
+    _ = state.target_challenges;
+    return state.challenge_complete;
 }
 
 pub fn parseAudioChallengeTargetFromGfctResponse(

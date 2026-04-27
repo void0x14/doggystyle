@@ -78,12 +78,19 @@ test "audio_bypass: challenge loop uses successful target not static count" {
     }));
 }
 
-test "audio_bypass: final success is true when runtime target submissions reached" {
-    try std.testing.expect(audio_bypass.audioBypassFinalSuccess(.{
+test "audio_bypass: final success requires completion after target submissions reached" {
+    try std.testing.expect(!audio_bypass.audioBypassFinalSuccess(.{
         .successful_submits = 3,
         .attempted = 3,
         .target_challenges = 3,
         .challenge_complete = false,
+    }));
+
+    try std.testing.expect(audio_bypass.audioBypassFinalSuccess(.{
+        .successful_submits = 3,
+        .attempted = 3,
+        .target_challenges = 3,
+        .challenge_complete = true,
     }));
 }
 
