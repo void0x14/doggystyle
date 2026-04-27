@@ -192,7 +192,17 @@ pub fn runAudioBypass(
     while (arkose_connect_attempt < ARKOSE_CONNECT_MAX_RETRIES and !arkose_connected) : (arkose_connect_attempt += 1) {
         if (arkose_connect_attempt > 0) {
             std.debug.print("[AUDIO BYPASS] Arkose connection retry {d}/{d}...\n", .{ arkose_connect_attempt + 1, ARKOSE_CONNECT_MAX_RETRIES });
-            _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 3, .nsec = 0 }, null);
+            
+            // Her 3 başarısız denemede bir sayfayı yenile
+            if (arkose_connect_attempt % 3 == 0) {
+                std.debug.print("[AUDIO BYPASS] Reloading page to force Arkose iframe load (attempt {d}/{d})...\n", .{ arkose_connect_attempt, ARKOSE_CONNECT_MAX_RETRIES });
+                bridge.cdp.reloadPage() catch |err| {
+                    std.debug.print("[AUDIO BYPASS] Page reload failed: {}\n", .{err});
+                };
+                _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 5, .nsec = 0 }, null);
+            } else {
+                _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 3, .nsec = 0 }, null);
+            }
         }
 
         std.debug.print("[AUDIO BYPASS] Connecting to Arkose enforcement iframe (attempt {d}/{d})...\n", .{ arkose_connect_attempt + 1, ARKOSE_CONNECT_MAX_RETRIES });
@@ -603,10 +613,19 @@ pub fn runAudioBypass(
         if (iframe_found and !game_core_found) {
             // CRITICAL: Re-resolve context now that game-core iframe is visible.
             // The earlier resolution may have captured the enforcement iframe.
-            game_core_ctx = 0;
-            _ = tryResolveGameCoreContext(&arkose_cdp, allocator, &game_core_ctx);
-            game_core_found = true;
-            std.debug.print("[AUDIO BYPASS] PoW completed! game-core iframe in DOM (~{d}s)\n", .{pow_wait_attempt * 2});
+            // Keep a verified positive context if the pending CDP event queue was already drained.
+            var resolved_game_core_ctx: i64 = 0;
+            const resolved = tryResolveGameCoreContext(&arkose_cdp, allocator, &resolved_game_core_ctx);
+            if (resolved) {
+                game_core_ctx = resolved_game_core_ctx;
+                game_core_found = true;
+                std.debug.print("[AUDIO BYPASS] PoW completed! game-core iframe in DOM (~{d}s)\n", .{pow_wait_attempt * 2});
+            } else if (game_core_ctx > 0) {
+                game_core_found = true;
+                std.debug.print("[AUDIO BYPASS] Reusing verified game-core execution context ID={d}\n", .{game_core_ctx});
+            } else {
+                std.debug.print("[AUDIO BYPASS] WARNING: tryResolveGameCoreContext returned false, no verified previous context\n", .{});
+            }
         }
 
         if (!game_core_found and !iframe_found) {

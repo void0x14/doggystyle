@@ -177,6 +177,39 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // =========================================================================
+    // RETRY LOOP: Arkose iframe bulunana kadar tekrar dene
+    // =========================================================================
+    const MAX_RETRIES: u8 = 5;
+    var retry_attempt: u8 = 0;
+    
+    while (retry_attempt < MAX_RETRIES) : (retry_attempt += 1) {
+        if (retry_attempt > 0) {
+            std.debug.print("\n╔══════════════════════════════════════════════════════════╗\n", .{});
+            std.debug.print("║  RETRY {d}/{d} - Arkose iframe bulunamadı, yeniden başlatılıyor  ║\n", .{retry_attempt + 1, MAX_RETRIES});
+            std.debug.print("╚══════════════════════════════════════════════════════════╝\n", .{});
+            std.debug.print("\n", .{});
+        }
+        
+        const result = runSingleAttempt(init, allocator, iface_name) catch |err| {
+            if (err == error.ConnectFailed or err == error.Timeout) {
+                std.debug.print("[RETRY] Hata: {}, tekrar deneniyor...\n", .{err});
+                continue;
+            }
+            return err;
+        };
+        
+        if (result) {
+            std.debug.print("\n🎉 BAŞARILI! Arkose bypass tamamlandı.\n", .{});
+            return;
+        }
+    }
+    
+    std.debug.print("\n❌ FATAL: {d} denemeden sonra Arkose iframe bulunamadı.\n", .{MAX_RETRIES});
+    return error.MaxRetriesExceeded;
+}
+
+fn runSingleAttempt(init: std.process.Init, allocator: std.mem.Allocator, iface_name: []const u8) !bool {
+    // =========================================================================
     // SABITLER: GitHub Hedefi
     // =========================================================================
     const target_host = "github.com";
@@ -773,4 +806,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("[SHUTDOWN] Socket cleanup (defer sock.deinit)...\n", .{});
     std.debug.print("[SHUTDOWN] Siege Engine shutdown complete.\n", .{});
     std.debug.print("\n", .{});
+    
+    return true;
 }

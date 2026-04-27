@@ -2178,6 +2178,7 @@ pub const BrowserBridge = struct {
                 std.debug.print("[BRIDGE] Captcha detected! Running audio bypass...\n", .{});
                 _ = audio_bypass.runAudioBypass(self, self.allocator, io) catch |err| {
                     std.debug.print("[BRIDGE] Audio bypass failed: {}\n", .{err});
+                    return BridgeError.ConnectFailed;
                 };
             } else {
                 std.debug.print("[BRIDGE] No captcha detected\n", .{});
