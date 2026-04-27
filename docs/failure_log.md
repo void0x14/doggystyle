@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-04-27] — Arkose Audio Direct Submitted/Success Complete Sayıldı
+
+**Hata:** Runtime.evaluate direct string `submitted` veya `success` sonucu, post-submit sayfa durumu okunmadan `.complete` kabul edildi.
+**Kök sebep:** Submit action sonucu ile Arkose completion kanıtı aynı semantiğe bağlandı. Direct string yalnız JS action dönüşüdür; completion text veya yanlış cevap metni içermez.
+**Kaynak:** Kullanıcı review gereksinimi 2026-04-27 — yalnız structured post-submit payload içinde `completion_text=true` complete kanıtıdır; direct `submitted`/`success` unknown kalmalıdır.
+**Düzeltme:** `submitResponseSucceeded()` direct `submitted`/`success` için false döndürüyor. `classifyPostSubmitProof()` direct stringleri `.unknown` bırakıyor; `.complete` yalnız structured `completion_text=true` için üretiliyor. Regresyon testleri eklendi.
+
+---
+
+## [2026-04-27] — Arkose Audio Submit Click Kanıt Sanıldı
+
+**Hata:** `clicked_text_submit` Runtime.evaluate sonucu submit sonrası başarı kanıtı sayıldı. Canlı UI aynı anda `Incorrect. Only enter the number of your chosen answer, e.g. 1` gösterdiği halde akış `continue` verdict ile frame içinde kaldı.
+**Kök sebep:** Click denemesi ile post-submit Arkose verdict aynı semantiğe bağlandı. Butona tıklanması yalnız `click_attempted` kanıtıdır; yanlış cevap metni veya completion metni ayrıca okunmadan accepted proof olamaz.
+**Kaynak:** Canlı kullanıcı kanıtı 2026-04-27 — `Answer injection: filled`, `Submit: clicked_text_submit`, ardından UI wrong text ve completion `continue`; Chrome DevTools Protocol `Runtime.evaluate` string value yalnız evaluate dönüşünü bildirir, sayfa durumunu otomatik başarı kanıtı yapmaz.
+**Düzeltme:** `clicked_*` başarı kabulünden çıkarıldı. `classifyPostSubmitProof()` eklendi; post-submit body/input payload'u `wrong`, `complete`, `clicked`, `unknown` verdict'e çevriliyor. `injectAnswerOnTarget()` click sonucunu sadece `click_attempted` logluyor ve yalnız `complete` verdict'i accepted sayıyor.
+
+---
+
 ## [2026-04-27] — Arkose Audio Final Success Sıfır Hedefi Başarı Saydı
 
 **Hata:** `audioBypassFinalSuccess()` `target_challenges=0` ve `challenge_complete=false` durumunda `0 >= 0` karşılaştırmasıyla true dönebiliyordu.

@@ -6,17 +6,21 @@ fn runtimeStringValue(comptime value: []const u8) []const u8 {
     return "{\"result\":{\"result\":{\"type\":\"string\",\"value\":\"" ++ value ++ "\"}}}";
 }
 
+fn runtimeStringValueJson(comptime value: []const u8) []const u8 {
+    return "{\"result\":{\"result\":{\"type\":\"string\",\"value\":\"" ++ value ++ "\"}}}";
+}
+
 test "audio_injector: submit response classification uses only Runtime.evaluate string value" {
     const cases = [_]struct {
         name: []const u8,
         response: []const u8,
         expected: bool,
     }{
-        .{ .name = "clicked_text_submit", .response = runtimeStringValue("clicked_text_submit"), .expected = true },
-        .{ .name = "clicked_input_submit", .response = runtimeStringValue("clicked_input_submit"), .expected = true },
-        .{ .name = "clicked_fallback_button", .response = runtimeStringValue("clicked_fallback_button"), .expected = true },
-        .{ .name = "submitted", .response = runtimeStringValue("submitted"), .expected = true },
-        .{ .name = "success", .response = runtimeStringValue("success"), .expected = true },
+        .{ .name = "clicked_text_submit", .response = runtimeStringValue("clicked_text_submit"), .expected = false },
+        .{ .name = "clicked_input_submit", .response = runtimeStringValue("clicked_input_submit"), .expected = false },
+        .{ .name = "clicked_fallback_button", .response = runtimeStringValue("clicked_fallback_button"), .expected = false },
+        .{ .name = "submitted", .response = runtimeStringValue("submitted"), .expected = false },
+        .{ .name = "success", .response = runtimeStringValue("success"), .expected = false },
         .{ .name = "no_submit", .response = runtimeStringValue("no_submit"), .expected = false },
         .{ .name = "not_clicked", .response = runtimeStringValue("not_clicked"), .expected = false },
         .{ .name = "not_submitted", .response = runtimeStringValue("not_submitted"), .expected = false },
@@ -27,6 +31,58 @@ test "audio_injector: submit response classification uses only Runtime.evaluate 
     for (cases) |case| {
         try std.testing.expectEqual(case.expected, audio_injector.submitResponseSucceeded(case.response));
     }
+}
+
+test "audio_injector: clicked_text_submit alone is not accepted proof" {
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, runtimeStringValue("clicked_text_submit"));
+
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.clicked, proof.verdict);
+    try std.testing.expect(!proof.accepted());
+}
+
+test "audio_injector: wrong post-submit text produces wrong verdict" {
+    const response = runtimeStringValueJson("{\\\"submit_result\\\":\\\"clicked_text_submit\\\",\\\"input_value\\\":\\\"2\\\",\\\"body_text_snippet\\\":\\\"Incorrect. Only enter the number of your chosen answer, e.g. 1\\\",\\\"wrong_text\\\":true,\\\"completion_text\\\":false}");
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, response);
+
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.wrong, proof.verdict);
+    try std.testing.expect(!proof.accepted());
+}
+
+test "audio_injector: completion post-submit text produces complete verdict" {
+    const response = runtimeStringValueJson("{\\\"submit_result\\\":\\\"clicked_text_submit\\\",\\\"input_value\\\":\\\"3\\\",\\\"body_text_snippet\\\":\\\"Verification complete. You are all set.\\\",\\\"wrong_text\\\":false,\\\"completion_text\\\":true}");
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, response);
+
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.complete, proof.verdict);
+    try std.testing.expect(proof.accepted());
+}
+
+test "audio_injector: neutral structured post-submit proof is unknown" {
+    const response = runtimeStringValueJson("{\"submit_result\":\"submitted\",\"input_value\":\"2\",\"body_text_snippet\":\"Choose the matching audio.\",\"wrong_text\":false,\"completion_text\":false}");
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, response);
+
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.unknown, proof.verdict);
+    try std.testing.expect(!proof.accepted());
+}
+
+test "audio_injector: malformed post-submit proof is unknown" {
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, runtimeStringValueJson("{bad-json"));
+
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.unknown, proof.verdict);
+    try std.testing.expect(!proof.accepted());
+}
+
+test "audio_injector: direct submitted string is unknown not complete" {
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, runtimeStringValue("submitted"));
+
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.unknown, proof.verdict);
+    try std.testing.expect(!proof.accepted());
+}
+
+test "audio_injector: direct success string is unknown not complete" {
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, runtimeStringValue("success"));
+
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.unknown, proof.verdict);
+    try std.testing.expect(!proof.accepted());
 }
 
 test "audio_bypass: challenge loop continues until completion signal or safety limit" {

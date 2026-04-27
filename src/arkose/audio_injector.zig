@@ -33,6 +33,29 @@ const RuntimeEvaluateStringValue = struct {
     } = null,
 };
 
+const PostSubmitPayload = struct {
+    submit_result: ?[]const u8 = null,
+    input_value: ?[]const u8 = null,
+    body_text_snippet: ?[]const u8 = null,
+    wrong_text: bool = false,
+    completion_text: bool = false,
+};
+
+pub const PostSubmitVerdict = enum {
+    clicked,
+    wrong,
+    complete,
+    unknown,
+};
+
+pub const PostSubmitProof = struct {
+    verdict: PostSubmitVerdict,
+
+    pub fn accepted(self: PostSubmitProof) bool {
+        return self.verdict == .complete;
+    }
+};
+
 // =============================================================================
 // Audio Button Selectors — Arkose Captcha Iframe (arkoselabs.com)
 // =============================================================================
@@ -453,11 +476,31 @@ pub fn injectAnswerOnTarget(
         try cdp.evaluateWithTimeout(submit_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
     defer allocator.free(submit_response);
     std.debug.print("[AUDIO INJECTOR] Submit (target): {s}\n", .{submit_response[0..@min(submit_response.len, 200)]});
-    const submitted = submitResponseSucceeded(submit_response);
+    const click_attempted = mem.indexOf(u8, submit_response, "clicked_") != null;
+    std.debug.print("[AUDIO INJECTOR] Submit click attempted={}\n", .{click_attempted});
 
     const submit_grace = std.os.linux.timespec{ .sec = 1, .nsec = 500 * std.time.ns_per_ms };
     _ = std.os.linux.nanosleep(&submit_grace, null);
-    return submitted;
+
+    const proof_script =
+        \\(() => {
+        \\  const input = document.querySelector('input[type="text"]') || document.querySelector('input');
+        \\  const bodyText = (document.body && document.body.innerText || '');
+        \\  const lower = bodyText.toLowerCase();
+        \\  const wrongText = lower.includes('incorrect') || lower.includes('wrong') || lower.includes('only enter the number');
+        \\  const completionText = lower.includes('verification complete') || lower.includes('challenge complete') || lower.includes('you are all set') || lower.includes("you're all set");
+        \\  return JSON.stringify({ input_value: input ? String(input.value || '') : '', body_text_snippet: bodyText.slice(0, 240), wrong_text: wrongText, completion_text: completionText });
+        \\})()
+    ;
+    const proof_response = if (context_id > 0)
+        try cdp.evaluateInContextWithTimeout(proof_script, context_id, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS)
+    else
+        try cdp.evaluateWithTimeout(proof_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
+    defer allocator.free(proof_response);
+    std.debug.print("[AUDIO INJECTOR] Post-submit proof response: {s}\n", .{proof_response[0..@min(proof_response.len, 300)]});
+    const proof = classifyPostSubmitProof(allocator, proof_response);
+    std.debug.print("[AUDIO INJECTOR] Post-submit verdict: {s}\n", .{@tagName(proof.verdict)});
+    return proof.accepted();
 }
 
 pub fn submitResponseSucceeded(response: []const u8) bool {
@@ -474,9 +517,41 @@ pub fn submitResponseSucceeded(response: []const u8) bool {
     if (!mem.eql(u8, value_type, "string")) return false;
     const value = inner.value orelse return false;
 
-    return mem.startsWith(u8, value, "clicked_") or
-        mem.eql(u8, value, "submitted") or
-        mem.eql(u8, value, "success");
+    _ = value;
+    return false;
+}
+
+pub fn classifyPostSubmitProof(allocator: std.mem.Allocator, response: []const u8) PostSubmitProof {
+    std.debug.assert(response.len <= browser_bridge.MAX_CDP_BUF);
+
+    const value = browser_bridge.extractRuntimeEvaluateStringValue(allocator, response) catch return .{ .verdict = .unknown };
+    defer allocator.free(value);
+
+    if (mem.startsWith(u8, value, "clicked_")) return .{ .verdict = .clicked };
+
+    var parsed = std.json.parseFromSlice(PostSubmitPayload, allocator, value, .{
+        .ignore_unknown_fields = true,
+    }) catch return .{ .verdict = .unknown };
+    defer parsed.deinit();
+
+    const payload = parsed.value;
+    std.debug.print(
+        "[AUDIO INJECTOR] Post-submit proof: input_value='{s}' body='{s}' wrong_text={} completion_text={} submit_result={s}\n",
+        .{
+            payload.input_value orelse "",
+            payload.body_text_snippet orelse "",
+            payload.wrong_text,
+            payload.completion_text,
+            payload.submit_result orelse "",
+        },
+    );
+
+    if (payload.wrong_text) return .{ .verdict = .wrong };
+    if (payload.completion_text) return .{ .verdict = .complete };
+    if (payload.submit_result) |submit_result| {
+        if (mem.startsWith(u8, submit_result, "clicked_")) return .{ .verdict = .clicked };
+    }
+    return .{ .verdict = .unknown };
 }
 
 comptime {

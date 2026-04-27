@@ -1349,6 +1349,10 @@ fn sanitizeTraceLabel(label: []const u8, buf: []u8) []const u8 {
     return buf[0..len];
 }
 
+fn fullPageScreenshotParams() []const u8 {
+    return "{\"format\":\"png\",\"captureBeyondViewport\":true}";
+}
+
 // ---------------------------------------------------------------------------
 // Harvested Data Structures
 // ---------------------------------------------------------------------------
@@ -2958,7 +2962,15 @@ pub const BrowserBridge = struct {
     }
 
     fn captureScreenshot(self: *BrowserBridge, trace_dir: []const u8, label: []const u8) BridgeError!void {
-        const response = try self.cdp.sendCommand("Page.captureScreenshot", "{\"format\":\"png\"}");
+        // SOURCE: Chrome DevTools Protocol Page.getLayoutMetrics — exposes content size.
+        // SOURCE: Chrome DevTools Protocol Page.captureScreenshot — captureBeyondViewport captures full page.
+        const layout_metrics = self.cdp.sendCommand("Page.getLayoutMetrics", "{}") catch null;
+        if (layout_metrics) |metrics| {
+            defer self.allocator.free(metrics);
+            std.debug.print("[BRIDGE] Screenshot layout metrics: {s}\n", .{metrics[0..@min(metrics.len, 300)]});
+        }
+
+        const response = try self.cdp.sendCommand("Page.captureScreenshot", fullPageScreenshotParams());
         defer self.allocator.free(response);
 
         const data_marker = "\"data\":\"";
