@@ -2,6 +2,85 @@
 
 ---
 
+## [2026-04-27] — Arkose Audio Final Success Sıfır Hedefi Başarı Saydı
+
+**Hata:** `audioBypassFinalSuccess()` `target_challenges=0` ve `challenge_complete=false` durumunda `0 >= 0` karşılaştırmasıyla true dönebiliyordu.
+**Kök sebep:** Runtime hedef parse edilememiş state ile hedefe ulaşılmış state aynı karşılaştırma dalından değerlendirildi.
+**Kaynak:** Kullanıcı review bulgusu 2026-04-27 — hedef parse edilememiş ve completion olmayan state final success olmamalı; gerçek `challenge_complete=true` completion sinyali success kalabilir.
+**Düzeltme:** Final success için target-based dal `target_challenges > 0` guard'ı ile sınırlandı; completion sinyali dalı korunarak regresyon testi eklendi.
+
+---
+
+## [2026-04-27] — Arkose Audio Final Success Completion Flag'e Bağlı Kaldı
+
+**Hata:** Audio bypass döngüsü runtime hedef submit sayısına ulaştığında durabiliyor, ancak final `AudioBypassResult.success` yalnız `challenge_complete` değerine bağlı kaldığı için `complete=false` durumunda sonuç PARTIAL kalabiliyordu.
+
+**Kök sebep:** Döngü sonlandırma semantiği ile final başarı semantiği ayrıştırılmamıştı. Runtime hedefe ulaşmak başarılı submit hedefinin tamamlandığını gösterir; Arkose completion flag'i ayrıca loglanır ama hedef submit başarısını false yapmamalıdır.
+
+**Kaynak:** Kullanıcı gereksinimi 2026-04-27 — `audio_challenge_urls` hedefi kadar gerçek submit başarıysa final başarı true olmalı; `no_submit` başarı sayılmamalı.
+
+**Düzeltme:** `audioBypassFinalSuccess()` helper'ı eklendi. Final başarı artık `challenge_complete` veya `successful_submits >= target_challenges` ile hesaplanıyor; hedef parse edilemeyen erken dönüş ve `no_submit` sayacı değişmeden kaldı.
+
+---
+
+## [2026-04-27] — Arkose Audio Loop Deneme Sayısını Hedef Saydı
+
+**Hata:** `shouldContinueAudioChallengeLoop()` hedefe ulaşmayı yalnız başarılı submit sayısıyla değil, `attempted < target_challenges` ile de sınırlıyordu. `target=3` iken iki başarılı submit ve bir başarısız/no_submit denemesi sonrası döngü üçüncü başarıyı denemeden durabiliyordu.
+
+**Kök sebep:** Runtime JSON'dan gelen `audio_challenge_urls.len` başarı hedefidir; deneme sayısı yalnız `MAX_CHALLENGES` safety limit için kullanılmalıydı. Helper, hedef ve safety limit kavramlarını karıştırdı.
+
+**Kaynak:** Kullanıcı gereksinimi 2026-04-27 — loop koşulu hedef biliniyorsa hedefe bağlı olacak, `MAX_CHALLENGES` safety limit kalacak, `no_submit` sahte başarı sayılmayacak.
+
+**Düzeltme:** Helper koşulu `successful_submits < target_challenges && attempted < MAX_CHALLENGES` olarak daraltıldı; focused regresyon testi `target=3, successful=2` devam eder ve `successful=3` durur davranışını doğruluyor.
+
+---
+
+## [2026-04-27] — Arkose Audio Runtime Hedef Sayısı Parse Edilmedi
+
+**Hata:** Statik `5` hedefi kaldırıldıktan sonra audio bypass döngüsü hedef sayıyı `/fc/gfct/` içindeki `audio_challenge_urls` dizisinden okumuyordu; döngü yalnız `MAX_CHALLENGES` ve erken completion sinyaline bağlıydı.
+
+**Kök sebep:** `gfct_response` Runtime.evaluate string payload'u zaten elde edilmesine rağmen bu JSON içindeki `audio_challenge_urls` sayısı parse edilmedi. `shouldContinueAudioChallengeLoop()` `successful_submits` değerini yok sayıyordu.
+
+**Kaynak:** Kullanıcı gereksinimi 2026-04-27 — Arkose `/fc/gfct/` response içindeki `audio_challenge_urls` kaç elemanlıysa audio challenge hedefi o sayı olmalı; completion check yalnız ek erken tamamlanma doğrulaması olabilir.
+
+**Düzeltme:** `parseAudioChallengeTargetFromGfctResponse()` eklendi. Pipeline artık hedef sayıyı Runtime.evaluate string JSON payload'undan alıyor; hedef parse edilemezse statik fallback yapmadan `success=false` partial dönüyor. Döngü koşulu `successful_submits < target_challenges && attempted < MAX_CHALLENGES` oldu.
+
+---
+
+## [2026-04-27] — Arkose Audio Hardcoded 5 Challenge Hedefi
+
+**Hata:** Audio bypass döngüsü `TARGET_CHALLENGES = 5` sabitine bağlıydı; `Challenge N/5 DONE`, `Pipeline complete: N/5` ve üst seviye `N/5` logları gerçek Arkose durumunu değil statik hedefi yansıtıyordu.
+
+**Kök sebep:** Canlı Arkose akışında challenge sayısı runtime durumundan gelirken `runAudioBypass()` başarı koşulunu sabit `5` üzerinden hesaplıyordu. Bu, gerçek submit sonrası tamamlanma sinyali kontrol edilmeden pipeline'ın statik hedefe göre bitmesine neden olabiliyordu.
+
+**Kaynak:** `src/arkose/audio_bypass.zig` eski döngü koşulu `successful < TARGET_CHALLENGES`; kullanıcı gereksinimi 2026-04-27 — başarı hedefi dinamik olmalı, güvenlik üst sınırı yalnız `MAX_CHALLENGES` olmalı.
+
+**Düzeltme:** `TARGET_CHALLENGES` kaldırıldı. Döngü `shouldContinueAudioChallengeLoop()` ile `MAX_CHALLENGES` ve Arkose tamamlanma sinyaline bağlı hale getirildi. Her gerçek submit success sonrası tamamlanma kontrolü yapılıyor; tamamlanma yoksa bir sonraki audio challenge deneniyor.
+
+---
+
+## [2026-04-27] — Arkose Audio no_submit Sahte Başarı Sayacı
+
+**Hata:** Audio bypass logunda `Submit (target)` CDP yanıtı `"no_submit"` döndürmesine rağmen hemen ardından `Challenge N/5 DONE` ve sonunda `Pipeline complete: 5/5` yazıyordu.
+
+**Kök sebep:** `injectAnswerOnTarget()` submit sonucunu semantik olarak döndürmüyordu; `runAudioBypass()` yalnızca fonksiyonun hata fırlatmamasını başarı sayıp `successful += 1` yapıyordu.
+
+**Kaynak:** Canlı koşu kanıtı `/home/void0x14/.local/share/opencode/tool-output/tool_dcc271a620010dFi4UohQ5GBLD` satır 3309-3463 — her `no_submit` yanıtı sonrası sayaç artmış.
+
+**Log alıntısı:**
+```text
+[AUDIO INJECTOR] Submit (target): {"id":44,"result":{"result":{"type":"string","value":"no_submit"}}}
+[AUDIO BYPASS] Challenge 1/5 DONE
+...
+[AUDIO INJECTOR] Submit (target): {"id":72,"result":{"result":{"type":"string","value":"no_submit"}}}
+[AUDIO BYPASS] Challenge 5/5 DONE
+[AUDIO BYPASS] Pipeline complete: 5/5 challenges, 69825ms
+```
+
+**Düzeltme:** `submitResponseSucceeded()` helper'ı eklendi. `injectAnswerOnTarget()` artık submit semantiğini `bool` döndürüyor; `no_submit` false, `submitted`/`clicked`/`success` true kabul ediliyor. `runAudioBypass()` yalnızca true sonucunda challenge sayacını artırıyor.
+
+---
+
 ## [2026-04-25] — CDP Context Evaluate Timeout Eksikliği
 
 **Hata:** Arkose audio answer injection, `context_id > 0` yolunda `Runtime.evaluate` yanıtı gelmiyor gibi görünüyordu. Aynı action main-context fallback veya manual MCP ile çalışabiliyordu.

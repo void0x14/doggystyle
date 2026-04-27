@@ -17,7 +17,7 @@
 //   6. peakNormalize → 0dBFS tepe noktasına normalize et
 //   7. analyze → 3 parçaya böl, spectral flux hesapla, en yüksek delta'yı bul
 //   8. guess+1 = answer → browser'a inject et, Submit'e tıkla
-//   9. 5/5 challenge tamamlanana kadar tekrarla (max 10)
+//   9. Arkose tamamlanma sinyali verene kadar tekrarla (max 10)
 //
 // SOURCE: Live test 2026-04-24 — rtag/audio endpoint, 44100Hz mono MP3, 18-21s
 // SOURCE: RFC 7916 — Spectral Flux analysis (Scheirer & Slaney, 1997)
@@ -35,9 +35,6 @@ const browser_bridge = @import("../browser_bridge.zig");
 
 /// Maximum number of audio challenges to solve
 pub const MAX_CHALLENGES: u8 = 10;
-
-/// Target number of challenges to complete
-pub const TARGET_CHALLENGES: u8 = 5;
 
 /// Number of equal clips to split audio into
 pub const CLIP_SPLIT: u8 = 3;
@@ -57,12 +54,101 @@ pub const AudioBypassResult = struct {
     execution_time_ms: u64,
     /// Total challenges processed (max MAX_CHALLENGES)
     total_challenges: u8,
-    /// Whether all target challenges completed successfully
+    /// Runtime target parsed from /fc/gfct/ audio_challenge_urls
+    target_challenges: u8,
+    /// Whether Arkose reported challenge completion
     success: bool,
+};
+
+pub const ChallengeLoopState = struct {
+    successful_submits: u8,
+    attempted: u8,
+    target_challenges: u8,
+    challenge_complete: bool,
 };
 
 comptime {
     std.debug.assert(@sizeOf(AudioBypassResult) > 0);
+}
+
+pub fn shouldContinueAudioChallengeLoop(state: ChallengeLoopState) bool {
+    return !state.challenge_complete and
+        state.successful_submits < state.target_challenges and
+        state.attempted < MAX_CHALLENGES;
+}
+
+pub fn audioBypassFinalSuccess(state: ChallengeLoopState) bool {
+    return state.challenge_complete or
+        (state.target_challenges > 0 and state.successful_submits >= state.target_challenges);
+}
+
+pub fn parseAudioChallengeTargetFromGfctResponse(
+    allocator: std.mem.Allocator,
+    gfct_response: []const u8,
+) !u8 {
+    const payload = try browser_bridge.extractRuntimeEvaluateStringValue(allocator, gfct_response);
+    defer allocator.free(payload);
+
+    return parseAudioChallengeTargetFromGfctPayload(allocator, payload);
+}
+
+fn parseAudioChallengeTargetFromGfctPayload(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) !u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return error.ParseFailed;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.ParseFailed;
+    const urls_value = parsed.value.object.get("audio_challenge_urls") orelse return error.ParseFailed;
+    if (urls_value != .array) return error.ParseFailed;
+
+    const count = urls_value.array.items.len;
+    if (count == 0) return error.ParseFailed;
+    if (count > MAX_CHALLENGES) return error.TargetChallengeCountExceeded;
+    return @intCast(count);
+}
+
+fn detectAudioChallengeCompletion(
+    cdp: *browser_bridge.CdpClient,
+    allocator: std.mem.Allocator,
+    context_id: i64,
+) bool {
+    const completion_script =
+        \\(() => {
+        \\  const visible = (el) => !!el && el.offsetParent !== null && !el.disabled;
+        \\  const controls = Array.from(document.querySelectorAll('input[type="text"], input[type="submit"], button'));
+        \\  const activeInput = controls.some(el => visible(el) && el.matches('input[type="text"], input:not([type])'));
+        \\  const activeSubmit = controls.some(el => visible(el) && (el.matches('input[type="submit"], button') || ((el.textContent || el.value || '').toLowerCase().includes('submit'))));
+        \\  const bodyText = (document.body && document.body.innerText || '').toLowerCase();
+        \\  const completionText = bodyText.includes('verification complete') ||
+        \\    bodyText.includes('challenge complete') ||
+        \\    bodyText.includes('verified') ||
+        \\    bodyText.includes('success') ||
+        \\    bodyText.includes('passed') ||
+        \\    bodyText.includes('you are all set') ||
+        \\    bodyText.includes("you're all set");
+        \\  if (!activeInput && !activeSubmit && completionText) return 'complete';
+        \\  if (activeInput || activeSubmit) return 'continue';
+        \\  return 'unknown';
+        \\})()
+    ;
+
+    const response = if (context_id > 0)
+        cdp.evaluateInContextWithTimeout(completion_script, context_id, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS)
+    else
+        cdp.evaluateWithTimeout(completion_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
+
+    if (response) |resp| {
+        defer allocator.free(resp);
+        std.debug.print("[AUDIO BYPASS] Completion check: {s}\n", .{resp[0..@min(resp.len, 200)]});
+        const value = browser_bridge.extractRuntimeEvaluateStringValue(allocator, resp) catch return false;
+        defer allocator.free(value);
+        return std.mem.eql(u8, value, "complete");
+    } else |err| {
+        std.debug.print("[AUDIO BYPASS] Completion check failed: {}\n", .{err});
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -151,14 +237,14 @@ fn tryResolveGameCoreContext(
 // runAudioBypass — Ana pipeline orkestratörü
 // ---------------------------------------------------------------------------
 //
-// SOURCE: Arkose Labs Audio CAPTCHA — 5 challenge sequence (live test 2026-04-24)
+// SOURCE: Arkose Labs Audio CAPTCHA — challenge sequence length is runtime state
 //
 // Tüm audio bypass sürecini otomatikleştirir:
 //   1. Her challenge için audio URL yakala, MP3 indir, decode et
 //   2. Spectral flux analizi ile hangi segmentin farklı olduğunu bul
 //   3. Cevabı browser'a inject et ve submit et
 //   4. Hata olursa challenge'ı atla (ilk challenge hatası fatal)
-//   5. Max 10 challenge, 5 başarılı yeter
+//   5. Max 10 challenge, Arkose tamamlanma sinyali yeter
 //
 pub fn runAudioBypass(
     bridge: *browser_bridge.BrowserBridge,
@@ -169,12 +255,12 @@ pub fn runAudioBypass(
     var last_guess: u8 = 0;
     var successful: u8 = 0;
     var total_attempted: u8 = 0;
+    var target_challenges: u8 = 0;
+    var challenge_complete = false;
     var audio_mode_activated: bool = false;
     var game_core_ctx: i64 = 0;
 
-    std.debug.print("\n[AUDIO BYPASS] Starting pipeline ({d} targets, max {d} attempts)...\n", .{
-        TARGET_CHALLENGES, MAX_CHALLENGES,
-    });
+    std.debug.print("\n[AUDIO BYPASS] Starting pipeline (gfct runtime target, max {d} attempts)...\n", .{MAX_CHALLENGES});
 
     // Step 0: Connect directly to the Arkose enforcement iframe via its own CDP WebSocket
     // The enforcement iframe has its own webSocketDebuggerUrl in GET /json.
@@ -543,6 +629,13 @@ pub fn runAudioBypass(
                                     if (ft.len > 5) {
                                         game_core_game_token = try allocator.dupe(u8, ft);
                                         std.debug.print("[AUDIO BYPASS] FAZ 1: Captured gameToken from Network response: {s}\n", .{ft});
+                                        target_challenges = parseAudioChallengeTargetFromGfctPayload(allocator, body) catch |err| blk: {
+                                            std.debug.print("[AUDIO BYPASS] WARNING: Could not parse audio_challenge_urls count from Network /fc/gfct/ body: {}\n", .{err});
+                                            break :blk 0;
+                                        };
+                                        if (target_challenges > 0) {
+                                            std.debug.print("[AUDIO BYPASS] Runtime audio challenge target from /fc/gfct/: {d}\n", .{target_challenges});
+                                        }
                                         // Also extract session_token if available
                                         if (std.mem.indexOf(u8, body, session_prefix)) |spos| {
                                             const sstart = spos + session_prefix.len;
@@ -642,7 +735,7 @@ pub fn runAudioBypass(
     // FAZ 2: If gameToken is still missing, fetch it directly from /fc/gfct/ via enforcement iframe CDP.
     // SOURCE: ChromeDevTools MCP live capture 2026-04-25 — /fc/gfct/ POST returns challengeID as gameToken
     // SOURCE: RFC 7231, Section 4.3.3 — POST semantics
-    if (game_core_game_token == null and game_core_session_token != null) {
+    if ((game_core_game_token == null or target_challenges == 0) and game_core_session_token != null) {
         std.debug.print("[AUDIO BYPASS] FAZ 2: Fetching gameToken from /fc/gfct/ via enforcement CDP...\n", .{});
 
         const gfct_js = try std.fmt.allocPrint(allocator,
@@ -666,6 +759,14 @@ pub fn runAudioBypass(
         defer allocator.free(gfct_response);
         std.debug.print("[AUDIO BYPASS] /fc/gfct/ response: {s}\n", .{gfct_response[0..@min(gfct_response.len, 300)]});
 
+        target_challenges = parseAudioChallengeTargetFromGfctResponse(allocator, gfct_response) catch |err| blk: {
+            std.debug.print("[AUDIO BYPASS] WARNING: Could not parse audio_challenge_urls count from /fc/gfct/ Runtime.evaluate response: {}\n", .{err});
+            break :blk 0;
+        };
+        if (target_challenges > 0) {
+            std.debug.print("[AUDIO BYPASS] Runtime audio challenge target from /fc/gfct/: {d}\n", .{target_challenges});
+        }
+
         // Extract challengeID (gameToken) from JSON response
         // SOURCE: LIVE capture — /fc/gfct/ response has "challengeID":"..."
         const resp_value = browser_bridge.extractRuntimeEvaluateStringValue(allocator, gfct_response) catch null;
@@ -675,7 +776,7 @@ pub fn runAudioBypass(
             if (std.mem.indexOf(u8, rv, challengeID_prefix)) |cpos| {
                 const cstart = cpos + challengeID_prefix.len;
                 const cend = std.mem.indexOfScalarPos(u8, rv, cstart, '"') orelse rv.len;
-                if (cend > cstart and cend - cstart > 5) {
+                if (cend > cstart and cend - cstart > 5 and game_core_game_token == null) {
                     game_core_game_token = try allocator.dupe(u8, rv[cstart..cend]);
                     std.debug.print("[AUDIO BYPASS] FAZ 2: Captured gameToken from /fc/gfct/: {s}\n", .{game_core_game_token.?});
                 }
@@ -687,7 +788,24 @@ pub fn runAudioBypass(
         std.debug.print("[AUDIO BYPASS] WARNING: gameToken not available, pipeline may fail\n", .{});
     }
 
-    while (successful < TARGET_CHALLENGES and total_attempted < MAX_CHALLENGES) : (total_attempted += 1) {
+    if (target_challenges == 0) {
+        const elapsed = currentMonotonicMs() - start_ms;
+        std.debug.print("[AUDIO BYPASS] ERROR: audio_challenge_urls target count unavailable; refusing static fallback\n", .{});
+        return AudioBypassResult{
+            .guess = last_guess,
+            .execution_time_ms = elapsed,
+            .total_challenges = successful,
+            .target_challenges = 0,
+            .success = false,
+        };
+    }
+
+    while (shouldContinueAudioChallengeLoop(.{
+        .successful_submits = successful,
+        .attempted = total_attempted,
+        .target_challenges = target_challenges,
+        .challenge_complete = challenge_complete,
+    })) : (total_attempted += 1) {
         const elapsed = currentMonotonicMs() - start_ms;
         if (elapsed > PIPELINE_TIMEOUT_MS) {
             std.debug.print("[AUDIO BYPASS] Pipeline timeout after {d}ms\n", .{elapsed});
@@ -695,7 +813,7 @@ pub fn runAudioBypass(
         }
 
         std.debug.print("\n[AUDIO BYPASS] Attempt {d}/{d} (successful: {d}/{d})...\n", .{
-            total_attempted + 1, MAX_CHALLENGES, successful, TARGET_CHALLENGES,
+            total_attempted + 1, target_challenges, successful, target_challenges,
         });
 
         // Step 0.5: Activate audio mode if not already active
@@ -815,28 +933,41 @@ pub fn runAudioBypass(
         std.debug.print("[AUDIO BYPASS] Analysis time: {d}us\n", .{flux_result.execution_time_us});
 
         // Step 9: Inject answer into iframe and submit (via direct CDP session)
-        audio_injector.injectAnswerOnTarget(&arkose_cdp, allocator, answer, game_core_ctx) catch |err| {
+        const submit_success = audio_injector.injectAnswerOnTarget(&arkose_cdp, allocator, answer, game_core_ctx) catch |err| {
             std.debug.print("[AUDIO BYPASS] Attempt {d}: inject/submit failed: {}\n", .{ total_attempted, err });
             continue;
         };
+        if (!submit_success) {
+            std.debug.print("[AUDIO BYPASS] Attempt {d}: submit did not report success\n", .{total_attempted});
+            continue;
+        }
 
         successful += 1;
-        std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} DONE\n", .{ successful, TARGET_CHALLENGES });
+        std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} submitted\n", .{ successful, target_challenges });
+        challenge_complete = detectAudioChallengeCompletion(&arkose_cdp, allocator, game_core_ctx);
+        if (challenge_complete) {
+            std.debug.print("[AUDIO BYPASS] Arkose completion signal detected after {d}/{d} submits\n", .{ successful, target_challenges });
+            break;
+        }
     }
 
     const end_ms = currentMonotonicMs();
     const elapsed = end_ms - start_ms;
-    const all_success = successful >= TARGET_CHALLENGES;
-
-    std.debug.print("[AUDIO BYPASS] Pipeline complete: {d}/{d} challenges, {d}ms\n", .{
-        successful, TARGET_CHALLENGES, elapsed,
+    std.debug.print("[AUDIO BYPASS] Pipeline ended: {d}/{d} submitted, complete={}, {d}ms\n", .{
+        successful, target_challenges, challenge_complete, elapsed,
     });
 
     return AudioBypassResult{
         .guess = last_guess,
         .execution_time_ms = elapsed,
         .total_challenges = successful,
-        .success = all_success,
+        .target_challenges = target_challenges,
+        .success = audioBypassFinalSuccess(.{
+            .successful_submits = successful,
+            .attempted = total_attempted,
+            .target_challenges = target_challenges,
+            .challenge_complete = challenge_complete,
+        }),
     };
 }
 
@@ -849,16 +980,17 @@ test "audio_bypass: AudioBypassResult struct size" {
 }
 
 test "audio_bypass: constants are valid" {
-    try std.testing.expect(MAX_CHALLENGES >= TARGET_CHALLENGES);
-    try std.testing.expect(TARGET_CHALLENGES > 0);
+    try std.testing.expect(MAX_CHALLENGES > 0);
     try std.testing.expect(CLIP_SPLIT == 3);
     try std.testing.expect(PIPELINE_TIMEOUT_MS > 0);
 }
 
 test "audio_bypass: runAudioBypass returns error without bridge" {
-    try std.testing.expect(@TypeOf(runAudioBypass) == fn (
+    const RunAudioBypassFn = fn (
         *browser_bridge.BrowserBridge,
         std.mem.Allocator,
         std.Io,
-    ) anyerror!AudioBypassResult);
+    ) anyerror!AudioBypassResult;
+    const run_fn: *const RunAudioBypassFn = runAudioBypass;
+    try std.testing.expect(run_fn == runAudioBypass);
 }

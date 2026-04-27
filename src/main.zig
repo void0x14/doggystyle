@@ -126,8 +126,8 @@ fn solveArkoseAudioChallenge(
 
     if (result.success) {
         std.debug.print("\n[AUDIO BYPASS] >>> PIPELINE COMPLETE <<<\n", .{});
-        std.debug.print("[AUDIO BYPASS] All {d}/{d} challenges completed in {d}ms\n", .{
-            result.total_challenges, audio_bypass.TARGET_CHALLENGES, result.execution_time_ms,
+        std.debug.print("[AUDIO BYPASS] Arkose completed after {d}/{d} submitted challenges in {d}ms\n", .{
+            result.total_challenges, result.target_challenges, result.execution_time_ms,
         });
         std.debug.print("[AUDIO BYPASS] Last guess: {d} (answer: {d})\n", .{
             result.guess, result.guess + 1,
@@ -135,8 +135,8 @@ fn solveArkoseAudioChallenge(
         std.debug.print("[AUDIO BYPASS] audio_bypass field written to BDA BrowserEnvironment\n", .{});
     } else {
         std.debug.print("\n[AUDIO BYPASS] >>> PIPELINE ENDED (PARTIAL) <<<\n", .{});
-        std.debug.print("[AUDIO BYPASS] Partial success: {d}/{d} challenges in {d}ms\n", .{
-            result.total_challenges, audio_bypass.TARGET_CHALLENGES, result.execution_time_ms,
+        std.debug.print("[AUDIO BYPASS] Partial result: {d}/{d} submitted challenges in {d}ms\n", .{
+            result.total_challenges, result.target_challenges, result.execution_time_ms,
         });
     }
 }

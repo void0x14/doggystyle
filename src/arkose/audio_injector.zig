@@ -24,6 +24,15 @@ const std = @import("std");
 const mem = std.mem;
 const browser_bridge = @import("../browser_bridge.zig");
 
+const RuntimeEvaluateStringValue = struct {
+    result: ?struct {
+        result: ?struct {
+            type: ?[]const u8 = null,
+            value: ?[]const u8 = null,
+        } = null,
+    } = null,
+};
+
 // =============================================================================
 // Audio Button Selectors — Arkose Captcha Iframe (arkoselabs.com)
 // =============================================================================
@@ -347,7 +356,7 @@ pub fn injectAnswerOnTarget(
     allocator: std.mem.Allocator,
     answer: u8,
     context_id: i64,
-) !void {
+) !bool {
     // SESSION VALIDATION TEST: 1+1 evaluate before injection
     // If this drops silently → session invalid (timing değil escape)
     // If returns 2 → session valid, look elsewhere (escape or JS error)
@@ -444,12 +453,39 @@ pub fn injectAnswerOnTarget(
         try cdp.evaluateWithTimeout(submit_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
     defer allocator.free(submit_response);
     std.debug.print("[AUDIO INJECTOR] Submit (target): {s}\n", .{submit_response[0..@min(submit_response.len, 200)]});
+    const submitted = submitResponseSucceeded(submit_response);
 
     const submit_grace = std.os.linux.timespec{ .sec = 1, .nsec = 500 * std.time.ns_per_ms };
     _ = std.os.linux.nanosleep(&submit_grace, null);
+    return submitted;
+}
+
+pub fn submitResponseSucceeded(response: []const u8) bool {
+    std.debug.assert(response.len <= browser_bridge.MAX_CDP_BUF);
+
+    var parsed = std.json.parseFromSlice(RuntimeEvaluateStringValue, std.heap.page_allocator, response, .{
+        .ignore_unknown_fields = true,
+    }) catch return false;
+    defer parsed.deinit();
+
+    const outer = parsed.value.result orelse return false;
+    const inner = outer.result orelse return false;
+    const value_type = inner.type orelse return false;
+    if (!mem.eql(u8, value_type, "string")) return false;
+    const value = inner.value orelse return false;
+
+    return mem.startsWith(u8, value, "clicked_") or
+        mem.eql(u8, value, "submitted") or
+        mem.eql(u8, value, "success");
 }
 
 comptime {
     std.debug.assert(@sizeOf(browser_bridge.BrowserBridge) > 0);
     std.debug.assert(@sizeOf(browser_bridge.CdpClient) > 0);
+}
+
+test "audio_injector: no_submit target response is not submit success" {
+    const response = "{\"result\":{\"result\":{\"type\":\"string\",\"value\":\"no_submit\"}}}";
+
+    try std.testing.expect(!submitResponseSucceeded(response));
 }

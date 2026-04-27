@@ -112,6 +112,18 @@ pub fn build(b: *std.Build) void {
     fft_fuzz_test_run.has_side_effects = true;
     test_step.dependOn(&fft_fuzz_test_run.step);
 
+    // Module 9: Arkose Audio Injector submit-result semantics
+    const audio_injector_semantics_test_run = b.addSystemCommand(&.{
+        vendor_zig,      "test",           "src/audio_injector_semantics_test.zig",
+        "--zig-lib-dir", "vendor/zig-std", "-target", "x86_64-linux-musl", "-lc",
+        "--test-filter", "audio_injector:",
+        "--test-filter", "audio_bypass: challenge loop",
+        "--test-filter", "audio_bypass: final success",
+        "--test-filter", "audio_bypass: gfct",
+    });
+    audio_injector_semantics_test_run.has_side_effects = true;
+    test_step.dependOn(&audio_injector_semantics_test_run.step);
+
     // Run with sudo — NOPASSWD configured in /etc/sudoers.d/ghost-engine
     // Required for raw sockets (SOCK_RAW) and iptables (RST suppression)
     const exe_path = b.pathFromRoot("zig-out/bin/siege_engine");
