@@ -5,7 +5,13 @@ Kurallar tavsiye niteliğinde değildir; ihlal = çıktı kabul edilmez.
 
 ---
 
-## 0. Temel İlke: Tahmin Yasağı
+## 0.0 DEĞİŞTİRİLEMEZ KESİN VE SABİT KURAL: CANLI MOTOR TESTİ VE GERÇEKTEN KODLARI DERLEME AŞAMASI
+
+Build yapacağın zaman her zaman 'vendor/zig/zig build' komutunu kullancaksın,motoru çalıştıracağın zamanda her zaman bu komutu kullanacaksın 'sudo ./zig-out/bin/siege_engine enp37s0'
+
+---
+
+## 0.1 Temel İlke: Tahmin Yasağı
 
 Sen bir istatistiksel tahmin motoru değil, bu projede bir **derleyici uzantısısın**.
 Herhangi bir byte offseti, pointer aritmetiği, protokol alan sırası veya kernel davranışı için **tahmin yapamazsın**.
