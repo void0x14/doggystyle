@@ -57,7 +57,28 @@ test "audio_injector: completion post-submit text produces complete verdict" {
 }
 
 test "audio_injector: neutral structured post-submit proof is unknown" {
-    const response = runtimeStringValueJson("{\"submit_result\":\"submitted\",\"input_value\":\"2\",\"body_text_snippet\":\"Choose the matching audio.\",\"wrong_text\":false,\"completion_text\":false}");
+    const response = runtimeStringValueJson("{\\\"submit_result\\\":\\\"submitted\\\",\\\"input_value\\\":\\\"2\\\",\\\"body_text_snippet\\\":\\\"Choose the matching audio.\\\",\\\"wrong_text\\\":false,\\\"completion_text\\\":false}");
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, response);
+
+    // input_visible is missing → no input_visible field means we don't have DOM visibility data
+    // Missing field defaults to null, so classifyPostSubmitProof() won't enter the transition branch
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.unknown, proof.verdict);
+    try std.testing.expect(!proof.accepted());
+}
+
+test "audio_injector: input disappeared without wrong/complete text is transition" {
+    // SOURCE: Arkose DOM — after correct answer, input element offsetParent becomes null
+    // Body text has no "incorrect" or "verification complete" — intermediate challenge loading
+    const response = runtimeStringValueJson("{\\\"submit_result\\\":\\\"clicked_text_submit\\\",\\\"input_value\\\":\\\"\\\",\\\"input_visible\\\":false,\\\"body_text_snippet\\\":\\\"Select the matching audio.\\\",\\\"wrong_text\\\":false,\\\"completion_text\\\":false}");
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, response);
+
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.transition, proof.verdict);
+    try std.testing.expect(proof.accepted());
+}
+
+test "audio_injector: input still visible without wrong/complete text is unknown" {
+    // SOURCE: Arkose is still processing — input visible, no verdict text yet
+    const response = runtimeStringValueJson("{\\\"submit_result\\\":\\\"clicked_text_submit\\\",\\\"input_value\\\":\\\"2\\\",\\\"input_visible\\\":true,\\\"body_text_snippet\\\":\\\"Loading...\\\",\\\"wrong_text\\\":false,\\\"completion_text\\\":false}");
     const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, response);
 
     try std.testing.expectEqual(audio_injector.PostSubmitVerdict.unknown, proof.verdict);
@@ -176,4 +197,47 @@ test "audio_bypass: gfct Runtime.evaluate audio_challenge_urls count defines tar
 
     try std.testing.expectEqual(@as(u8, 2), try audio_bypass.parseAudioChallengeTargetFromGfctResponse(allocator, gfct_two));
     try std.testing.expectEqual(@as(u8, 3), try audio_bypass.parseAudioChallengeTargetFromGfctResponse(allocator, gfct_three));
+}
+
+test "audio_injector: intermediate transition when input gone but no wrong/complete text" {
+    // Simulates: correct answer on challenge 0 of 3, Arkose loads challenge 1
+    // Body has neutral text (no "Incorrect", no "Verification complete"), input disappeared
+    const response = runtimeStringValueJson("{\\\"input_value\\\":\\\"2\\\",\\\"input_visible\\\":false,\\\"body_text_snippet\\\":\\\"Choose the matching audio.\\\",\\\"wrong_text\\\":false,\\\"completion_text\\\":false}");
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, response);
+
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.transition, proof.verdict);
+    try std.testing.expect(proof.accepted());
+}
+
+test "audio_injector: transition proof is accepted" {
+    const proof = audio_injector.PostSubmitProof{ .verdict = .transition };
+    try std.testing.expect(proof.accepted());
+}
+
+test "audio_injector: input still visible after submit is unknown not transition" {
+    // Simulates: submit clicked but Arkose hasn't processed yet
+    // Input still visible, body neutral → should be unknown (waiting)
+    const response = runtimeStringValueJson("{\\\"input_value\\\":\\\"2\\\",\\\"input_visible\\\":true,\\\"body_text_snippet\\\":\\\"Choose the matching audio.\\\",\\\"wrong_text\\\":false,\\\"completion_text\\\":false}");
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, response);
+
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.unknown, proof.verdict);
+    try std.testing.expect(!proof.accepted());
+}
+
+test "audio_injector: no input_visible field falls through to unknown" {
+    // Backward compat: old payload format without input_visible field
+    const response = runtimeStringValueJson("{\"input_value\":\\\"2\\\",\\\"body_text_snippet\\\":\\\"Choose audio.\\\",\\\"wrong_text\\\":false,\\\"completion_text\\\":false}");
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, response);
+
+    // input_visible=null → can't determine if transition → stays unknown
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.unknown, proof.verdict);
+    try std.testing.expect(!proof.accepted());
+}
+
+test "audio_injector: broken JSON with complet text still unknown" {
+    // Malformed JSON → extract fails → unknown (not transition, not complete)
+    const proof = audio_injector.classifyPostSubmitProof(std.testing.allocator, runtimeStringValueJson("{bad-json-with-complet"));
+
+    try std.testing.expectEqual(audio_injector.PostSubmitVerdict.unknown, proof.verdict);
+    try std.testing.expect(!proof.accepted());
 }

@@ -2,6 +2,38 @@
 
 ---
 
+## [2026-04-27] — Arkose Audio State Machine Fix: Intermediate Challenge Transition Detection
+
+**Hata:** `classifyPostSubmitProof()` binary karar veriyordu (ya wrong ya complete). Arkose'un ara challengelarında (0..N-2) doğru cevap sonrası body'de ne "wrong" ne "complete" metni var. `.unknown` = çöp kutusu, hiçbir işlem yapılmıyordu. Pipeline ilerleyemiyordu.
+
+**Kök sebep:** Arkose 3 durumda çalışır: (1) wrong answer → body'de "Incorrect" text, (2) intermediate transition → doğru cevap, sonraki challenge yükleniyor, body'de hiçbir completion/wrong text yok, (3) complete → sadece SON challenge'da "verification complete" text. Kod yalnızca (1) ve (3)'ü modelledi, (2)'yi `.unknown`'a atıp görmezden geldi.
+
+**Kaynak:** Arkose Labs UI behavior — intermediate challenges don't show completion text (live test 2026-04-27)
+
+**Düzeltme:**
+1. `PostSubmitVerdict` enum'a `.transition` eklendi — ara geçiş tespiti için
+2. `classifyPostSubmitProof()`: post-submit proof JS'e `input_visible` alanı eklendi; input kaybolduğunda ve wrong/complete text yoksa → `.transition`
+3. `detectAudioChallengeCompletion()` → `detectPostSubmitUiState()` yeniden yazıldı: 5 durumlu enum döndürüyor (complete, continue_wait, transition, restarted, query_failed)
+4. Verdict switch: `.transition` → successful++, challenge_index++; `.unknown` → artık no-op değil, UI state kontrol edip transition/complete/restart tespit ediyor; `.wrong` → Arkose restart tespiti eklendi
+5. 5 yeni semantik test eklendi, 22/22 geçiyor
+
+---
+
+## [2026-04-27] — Arkose Audio .unknown Verdict İlerlemeyi Engelliyor (CRITICAL)
+
+**Hata:** Doğru cevap verildiğinde Arkose bir sonraki challenge'a geçiyor. Post-submit proof script body text'te ne "wrong" ne "complete" buluyor → `.unknown` verdict. `.unknown` durumunda `successful` VE `challenge_index` artmıyor. Loop aynı `challenge_index` ile audio'yu tekrar indiriyor, ama UI zaten ilerlemiş → input bulunamıyor veya yanlış challenge'a enjeksiyon → pipeline çöküyor.
+
+**Kök sebep:** `classifyPostSubmitProof()` body text'te completion/wrong text arayarak binary karar veriyor. Ancak N challenge'lı bir sette, 0..N-2 arası challengelar için doğru cevap sonrası sayfada bir sonraki challenge'ın input'u beliriyor — body'de ne "verification complete" ne "wrong" var. Yalnız son challenge (N-1) completion text üretiyor. Ara challengelardaki `.unknown` verdict'leri handle edilmiyor.
+
+**Kaynak:** Arkose Labs UI behavior — challenge geçişleri arasında DOM güncellenir ama completion text yalnızca tüm challengelar bittiğinde render edilir. `detectAudioChallengeCompletion()` bu durumu kontrol edebiliyor ama yalnızca `.complete` verdict'inde çağrılıyor, `.unknown`'da çağrılmıyor.
+
+**Düzeltme (önerilen):**
+1. `.unknown` verdict'inde `detectAudioChallengeCompletion()` çağrılarak UI'nin ilerleyip ilerlemediği kontrol edilmeli
+2. Alternatif: Post-submit script input element varlığını ve değerini de döndürmeli; input yoksa veya yeni bir challenge gösteriliyorsa success sayılmalı
+3. `.wrong` durumunda aynı audio'yu tekrar indirmek yerine farklı bir cevap denenmeli (eğer FFT aynı sonucu veriyorsa)
+
+---
+
 ## [2026-04-27] — Arkose Audio Direct Submitted/Success Complete Sayıldı
 
 **Hata:** Runtime.evaluate direct string `submitted` veya `success` sonucu, post-submit sayfa durumu okunmadan `.complete` kabul edildi.

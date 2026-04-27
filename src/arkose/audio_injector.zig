@@ -33,26 +33,34 @@ const RuntimeEvaluateStringValue = struct {
     } = null,
 };
 
+// SOURCE: Arkose DOM state — input element disappears after correct answer (intermediate transition)
+// input_visible tracks offsetParent !== null to detect transition vs. still-waiting state
 const PostSubmitPayload = struct {
     submit_result: ?[]const u8 = null,
     input_value: ?[]const u8 = null,
+    input_visible: ?bool = null,
     body_text_snippet: ?[]const u8 = null,
     wrong_text: bool = false,
     completion_text: bool = false,
 };
 
+// SOURCE: Arkose Labs audio CAPTCHA state machine (live DOM observation 2026-04-27)
+// States: wrong(text)→incorrect | transition(input gone, no text) → next challenge | complete(text)→verification done
 pub const PostSubmitVerdict = enum {
     clicked,
     wrong,
     complete,
+    transition,   // Correct answer, intermediate challenge — input disappeared, no wrong/complete text
     unknown,
 };
 
 pub const PostSubmitProof = struct {
     verdict: PostSubmitVerdict,
 
+    // SOURCE: Arkose intermediate transition is progress — next challenge loads after correct answer,
+    // input disappears from DOM, body text has neither "incorrect" nor "verification complete".
     pub fn accepted(self: PostSubmitProof) bool {
-        return self.verdict == .complete;
+        return self.verdict == .complete or self.verdict == .transition;
     }
 };
 
@@ -489,7 +497,8 @@ pub fn injectAnswerOnTarget(
         \\  const lower = bodyText.toLowerCase();
         \\  const wrongText = lower.includes('incorrect') || lower.includes('wrong') || lower.includes('only enter the number');
         \\  const completionText = lower.includes('verification complete') || lower.includes('challenge complete') || lower.includes('you are all set') || lower.includes("you're all set");
-        \\  return JSON.stringify({ input_value: input ? String(input.value || '') : '', body_text_snippet: bodyText.slice(0, 240), wrong_text: wrongText, completion_text: completionText });
+        \\  const inputVisible = !!(input && input.offsetParent !== null);
+        \\  return JSON.stringify({ input_value: input ? String(input.value || '') : '', input_visible: inputVisible, body_text_snippet: bodyText.slice(0, 240), wrong_text: wrongText, completion_text: completionText });
         \\})()
     ;
     const proof_response = if (context_id > 0)
@@ -564,9 +573,10 @@ pub fn classifyPostSubmitProof(allocator: std.mem.Allocator, response: []const u
 
     const payload = parsed.value;
     std.debug.print(
-        "[AUDIO INJECTOR] Post-submit proof: input_value='{s}' body='{s}' wrong_text={} completion_text={} submit_result={s}\n",
+        "[AUDIO INJECTOR] Post-submit proof: input_value='{s}' input_visible={} body='{s}' wrong_text={} completion_text={} submit_result={s}\n",
         .{
             payload.input_value orelse "",
+            payload.input_visible orelse false,
             payload.body_text_snippet orelse "",
             payload.wrong_text,
             payload.completion_text,
@@ -576,8 +586,20 @@ pub fn classifyPostSubmitProof(allocator: std.mem.Allocator, response: []const u
 
     if (payload.wrong_text) return .{ .verdict = .wrong };
     if (payload.completion_text) return .{ .verdict = .complete };
-    if (payload.submit_result) |submit_result| {
-        if (mem.startsWith(u8, submit_result, "clicked_")) return .{ .verdict = .clicked };
+
+    // SOURCE: Arkose DOM behavior — after correct answer, input element is removed/replaced
+    // by the next challenge. offsetParent becomes null. If input disappeared AND body has
+    // neither "incorrect" nor "verification complete" text, this is an intermediate transition.
+    if (payload.input_visible != null and !payload.input_visible.?) {
+        return .{ .verdict = .transition };
+    }
+
+    // SOURCE: submit_result click check — only fire when we don't have DOM visibility data
+    // (payload has no input_visible field, i.e. old JS without DOM check).
+    // If input_visible is present (true or false), we already determined transition vs unknown.
+    // Click info without DOM visibility means we need to wait for Arkose to process.
+    if (payload.input_visible == null and payload.submit_result != null) {
+        if (mem.startsWith(u8, payload.submit_result.?, "clicked_")) return .{ .verdict = .clicked };
     }
     return .{ .verdict = .unknown };
 }

@@ -17,7 +17,7 @@
 //   6. peakNormalize → 0dBFS tepe noktasına normalize et
 //   7. analyze → 3 parçaya böl, spectral flux hesapla, en yüksek delta'yı bul
 //   8. guess+1 = answer → browser'a inject et, Submit'e tıkla
-//   9. Arkose tamamlanma sinyali verene kadar tekrarla (max 10)
+//   9. Arkose tamamlanma sinyali verene kadar tekrarla (max 10, ara geçişler tespit edilir)
 //
 // SOURCE: Live test 2026-04-24 — rtag/audio endpoint, 44100Hz mono MP3, 18-21s
 // SOURCE: RFC 7916 — Spectral Flux analysis (Scheirer & Slaney, 1997)
@@ -110,11 +110,20 @@ fn parseAudioChallengeTargetFromGfctPayload(
     return @intCast(count);
 }
 
-fn detectAudioChallengeCompletion(
+// SOURCE: Arkose Labs UI behavior — intermediate challenges don't show completion text (live test 2026-04-27)
+const PostSubmitUiState = enum {
+    complete,      // No controls + completion text (Arkose fully done)
+    continue_wait, // Active controls present (still same challenge, waiting)
+    transition,    // No controls + NO completion text (intermediate transition)
+    restarted,     // Controls present + body has challenge restart indicators
+    query_failed,  // Evaluate failed
+};
+
+fn detectPostSubmitUiState(
     cdp: *browser_bridge.CdpClient,
     allocator: std.mem.Allocator,
     context_id: i64,
-) bool {
+) PostSubmitUiState {
     const completion_script =
         \\(() => {
         \\  const visible = (el) => !!el && el.offsetParent !== null && !el.disabled;
@@ -129,9 +138,11 @@ fn detectAudioChallengeCompletion(
         \\    bodyText.includes('passed') ||
         \\    bodyText.includes('you are all set') ||
         \\    bodyText.includes("you're all set");
+        \\  const wrongText = bodyText.includes('incorrect') || bodyText.includes('only enter the number');
         \\  if (!activeInput && !activeSubmit && completionText) return 'complete';
-        \\  if (activeInput || activeSubmit) return 'continue';
-        \\  return 'unknown';
+        \\  if (activeInput || activeSubmit) return 'continue_wait';
+        \\  if (!activeInput && !activeSubmit && wrongText) return 'restarted';
+        \\  return 'transition';
         \\})()
     ;
 
@@ -142,13 +153,17 @@ fn detectAudioChallengeCompletion(
 
     if (response) |resp| {
         defer allocator.free(resp);
-        std.debug.print("[AUDIO BYPASS] Completion check: {s}\n", .{resp[0..@min(resp.len, 200)]});
-        const value = browser_bridge.extractRuntimeEvaluateStringValue(allocator, resp) catch return false;
+        std.debug.print("[AUDIO BYPASS] UI state check: {s}\n", .{resp[0..@min(resp.len, 200)]});
+        const value = browser_bridge.extractRuntimeEvaluateStringValue(allocator, resp) catch return .query_failed;
         defer allocator.free(value);
-        return std.mem.eql(u8, value, "complete");
+        if (std.mem.eql(u8, value, "complete")) return .complete;
+        if (std.mem.eql(u8, value, "continue_wait")) return .continue_wait;
+        if (std.mem.eql(u8, value, "restarted")) return .restarted;
+        if (std.mem.eql(u8, value, "transition")) return .transition;
+        return .query_failed;
     } else |err| {
-        std.debug.print("[AUDIO BYPASS] Completion check failed: {}\n", .{err});
-        return false;
+        std.debug.print("[AUDIO BYPASS] UI state check failed: {}\n", .{err});
+        return .query_failed;
     }
 }
 
@@ -944,19 +959,72 @@ pub fn runAudioBypass(
             .complete => {
                 successful += 1;
                 challenge_index += 1;
-                std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} solved successfully\n", .{ successful, target_challenges });
-                challenge_complete = detectAudioChallengeCompletion(&arkose_cdp, allocator, game_core_ctx);
+                std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} solved (complete text)\n", .{ successful, target_challenges });
+                challenge_complete = detectPostSubmitUiState(&arkose_cdp, allocator, game_core_ctx) == .complete;
+                if (challenge_complete) {
+                    std.debug.print("[AUDIO BYPASS] Arkose completion signal confirmed\n", .{});
+                }
+            },
+            .transition => {
+                // Correct answer on intermediate challenge: Arkose advanced to next challenge
+                // Body has no completion text, input disappeared
+                successful += 1;
+                challenge_index += 1;
+                std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} solved (intermediate transition)\n", .{ successful, target_challenges });
+
+                // Verify the transition by checking UI state
+                const ui_state = detectPostSubmitUiState(&arkose_cdp, allocator, game_core_ctx);
+                if (ui_state == .complete) {
+                    challenge_complete = true;
+                    std.debug.print("[AUDIO BYPASS] Unexpected completion after transition\n", .{});
+                }
             },
             .wrong => {
-                std.debug.print("[AUDIO BYPASS] Attempt {d}: Wrong answer, retrying same challenge\n", .{total_attempted});
-                // challenge_index does not change, same audio will be re-analyzed
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: Wrong answer detected\n", .{total_attempted});
+
+                // Check if Arkose restarted ALL challenges (challenge_index back to 0, new audio)
+                const ui_state = detectPostSubmitUiState(&arkose_cdp, allocator, game_core_ctx);
+                if (ui_state == .restarted) {
+                    // Arkose restarted: reset challenge tracking
+                    std.debug.print("[AUDIO BYPASS] Arkose restarted all challenges after wrong answer\n", .{});
+                    // Don't reset successful count - keep progress tracking
+                    // challenge_index stays; we'll try the current index again
+                }
             },
             .clicked => {
                 std.debug.print("[AUDIO BYPASS] Attempt {d}: Submit clicked, waiting for result\n", .{total_attempted});
                 _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 2, .nsec = 0 }, null);
             },
             .unknown => {
-                std.debug.print("[AUDIO BYPASS] Attempt {d}: Unknown post-submit state\n", .{total_attempted});
+                // Unknown state: could be intermediate transition that wasn't detected
+                // by the post-submit proof JS. Check UI state to determine what happened.
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: Unknown post-submit state, checking UI...\n", .{total_attempted});
+
+                _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 1, .nsec = 0 }, null);
+                const ui_state = detectPostSubmitUiState(&arkose_cdp, allocator, game_core_ctx);
+
+                switch (ui_state) {
+                    .complete => {
+                        successful += 1;
+                        challenge_index += 1;
+                        challenge_complete = true;
+                        std.debug.print("[AUDIO BYPASS] UI check revealed completion! Challenge {d}/{d}\n", .{ successful, target_challenges });
+                    },
+                    .transition => {
+                        successful += 1;
+                        challenge_index += 1;
+                        std.debug.print("[AUDIO BYPASS] UI check: intermediate transition confirmed (challenge {d}/{d})\n", .{ successful, target_challenges });
+                    },
+                    .continue_wait => {
+                        std.debug.print("[AUDIO BYPASS] UI check: still same challenge, will retry\n", .{});
+                    },
+                    .restarted => {
+                        std.debug.print("[AUDIO BYPASS] UI check: Arkose restarted challenges\n", .{});
+                    },
+                    .query_failed => {
+                        std.debug.print("[AUDIO BYPASS] UI check failed, continuing\n", .{});
+                    },
+                }
             },
         }
 
