@@ -256,6 +256,7 @@ pub fn runAudioBypass(
     var last_guess: u8 = 0;
     var successful: u8 = 0;
     var total_attempted: u8 = 0;
+    var challenge_index: u8 = 0;
     var target_challenges: u8 = 0;
     var challenge_complete = false;
     var audio_mode_activated: bool = false;
@@ -866,7 +867,7 @@ pub fn runAudioBypass(
         dl_result = audio_downloader.fetchAudioViaCdpEvaluate(
             &arkose_cdp,
             allocator,
-            total_attempted,
+            challenge_index,
             game_core_session_token orelse "",
             game_core_game_token orelse "",
         ) catch |err| {
@@ -934,18 +935,31 @@ pub fn runAudioBypass(
         std.debug.print("[AUDIO BYPASS] Analysis time: {d}us\n", .{flux_result.execution_time_us});
 
         // Step 9: Inject answer into iframe and submit (via direct CDP session)
-        const submit_success = audio_injector.injectAnswerOnTarget(&arkose_cdp, allocator, answer, game_core_ctx) catch |err| {
+        const proof = audio_injector.injectAnswerOnTarget(&arkose_cdp, allocator, answer, game_core_ctx) catch |err| {
             std.debug.print("[AUDIO BYPASS] Attempt {d}: inject/submit failed: {}\n", .{ total_attempted, err });
             continue;
         };
-        if (!submit_success) {
-            std.debug.print("[AUDIO BYPASS] Attempt {d}: submit did not report success\n", .{total_attempted});
-            continue;
+
+        switch (proof.verdict) {
+            .complete => {
+                successful += 1;
+                challenge_index += 1;
+                std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} solved successfully\n", .{ successful, target_challenges });
+                challenge_complete = detectAudioChallengeCompletion(&arkose_cdp, allocator, game_core_ctx);
+            },
+            .wrong => {
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: Wrong answer, retrying same challenge\n", .{total_attempted});
+                // challenge_index does not change, same audio will be re-analyzed
+            },
+            .clicked => {
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: Submit clicked, waiting for result\n", .{total_attempted});
+                _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 2, .nsec = 0 }, null);
+            },
+            .unknown => {
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: Unknown post-submit state\n", .{total_attempted});
+            },
         }
 
-        successful += 1;
-        std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} submitted\n", .{ successful, target_challenges });
-        challenge_complete = detectAudioChallengeCompletion(&arkose_cdp, allocator, game_core_ctx);
         if (challenge_complete) {
             std.debug.print("[AUDIO BYPASS] Arkose completion signal detected after {d}/{d} submits\n", .{ successful, target_challenges });
             break;

@@ -379,7 +379,7 @@ pub fn injectAnswerOnTarget(
     allocator: std.mem.Allocator,
     answer: u8,
     context_id: i64,
-) !bool {
+) !PostSubmitProof {
     // SESSION VALIDATION TEST: 1+1 evaluate before injection
     // If this drops silently → session invalid (timing değil escape)
     // If returns 2 → session valid, look elsewhere (escape or JS error)
@@ -500,12 +500,30 @@ pub fn injectAnswerOnTarget(
     std.debug.print("[AUDIO INJECTOR] Post-submit proof response: {s}\n", .{proof_response[0..@min(proof_response.len, 300)]});
     const proof = classifyPostSubmitProof(allocator, proof_response);
     std.debug.print("[AUDIO INJECTOR] Post-submit verdict: {s}\n", .{@tagName(proof.verdict)});
-    return proof.accepted();
+    return proof;
 }
 
 pub fn submitResponseSucceeded(response: []const u8) bool {
     std.debug.assert(response.len <= browser_bridge.MAX_CDP_BUF);
 
+    // Try parsing as direct Arkose JSON first (e.g., {"response":"answered","solved":true})
+    const ArkoseSubmitResponse = struct {
+        response: ?[]const u8 = null,
+        solved: ?bool = null,
+    };
+
+    if (std.json.parseFromSlice(ArkoseSubmitResponse, std.heap.page_allocator, response, .{
+        .ignore_unknown_fields = true,
+    })) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.response) |resp| {
+            if (mem.eql(u8, resp, "answered") and (parsed.value.solved orelse false)) {
+                return true;
+            }
+        }
+    } else |_| {}
+
+    // Fallback: try CDP Runtime.evaluate wrapped format
     var parsed = std.json.parseFromSlice(RuntimeEvaluateStringValue, std.heap.page_allocator, response, .{
         .ignore_unknown_fields = true,
     }) catch return false;
@@ -517,7 +535,17 @@ pub fn submitResponseSucceeded(response: []const u8) bool {
     if (!mem.eql(u8, value_type, "string")) return false;
     const value = inner.value orelse return false;
 
-    _ = value;
+    if (std.json.parseFromSlice(ArkoseSubmitResponse, std.heap.page_allocator, value, .{
+        .ignore_unknown_fields = true,
+    })) |inner_parsed| {
+        defer inner_parsed.deinit();
+        if (inner_parsed.value.response) |resp| {
+            if (mem.eql(u8, resp, "answered") and (inner_parsed.value.solved orelse false)) {
+                return true;
+            }
+        }
+    } else |_| {}
+
     return false;
 }
 
