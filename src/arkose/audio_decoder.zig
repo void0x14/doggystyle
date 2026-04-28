@@ -48,6 +48,48 @@ fn readMonotonicNs() u64 {
         @as(u64, @intCast(ts.nsec));
 }
 
+fn parseAudioMetadataOutput(output: []const u8, file_path: []const u8) !AudioMetadata {
+    var sample_rate: ?u32 = null;
+    var bit_depth: ?u8 = null;
+    var channels: ?u8 = null;
+    var duration_seconds: ?f64 = null;
+
+    var lines = mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const trimmed = mem.trim(u8, line, " \n\r");
+        if (trimmed.len == 0) continue;
+
+        const eq_index = mem.indexOfScalar(u8, trimmed, '=') orelse return error.InvalidMetadata;
+        const key = mem.trim(u8, trimmed[0..eq_index], " \n\r");
+        const value = mem.trim(u8, trimmed[eq_index + 1 ..], " \n\r");
+
+        if (mem.eql(u8, key, "sample_rate")) {
+            sample_rate = try std.fmt.parseInt(u32, value, 10);
+        } else if (mem.eql(u8, key, "bits_per_sample")) {
+            bit_depth = try std.fmt.parseInt(u8, value, 10);
+        } else if (mem.eql(u8, key, "channels")) {
+            channels = try std.fmt.parseInt(u8, value, 10);
+        } else if (mem.eql(u8, key, "duration")) {
+            duration_seconds = try std.fmt.parseFloat(f64, value);
+        }
+    }
+
+    const parsed_sample_rate = sample_rate orelse return error.InvalidMetadata;
+    const parsed_bit_depth = bit_depth orelse return error.InvalidMetadata;
+    const parsed_channels = channels orelse return error.InvalidMetadata;
+    const parsed_duration_seconds = duration_seconds orelse return error.InvalidMetadata;
+
+    std.debug.assert(parsed_sample_rate == 44100 or parsed_sample_rate == 22050 or parsed_sample_rate == 16000);
+
+    return AudioMetadata{
+        .sample_rate = parsed_sample_rate,
+        .bit_depth = parsed_bit_depth,
+        .channels = parsed_channels,
+        .duration_seconds = parsed_duration_seconds,
+        .format = detectFormat(file_path),
+    };
+}
+
 // SOURCE: man ffprobe — -show_entries stream for sample_rate, bits_per_sample, channels, duration
 // SOURCE: man ffprobe — default output format key=value parser
 pub fn probeAudioMetadata(allocator: std.mem.Allocator, io: Io, file_path: []const u8) !AudioMetadata {
@@ -59,7 +101,7 @@ pub fn probeAudioMetadata(allocator: std.mem.Allocator, io: Io, file_path: []con
             "-show_entries",
             "stream=sample_rate,bits_per_sample,channels,duration",
             "-of",
-            "default=noprint_wrappers=1:nokey=1",
+            "default=noprint_wrappers=1",
             file_path,
         },
     });
@@ -75,27 +117,7 @@ pub fn probeAudioMetadata(allocator: std.mem.Allocator, io: Io, file_path: []con
         else => return error.FfprobeFailed,
     }
 
-    var lines = mem.splitScalar(u8, result.stdout, '\n');
-
-    const sample_rate_str = mem.trim(u8, lines.next() orelse return error.InvalidMetadata, " \n\r");
-    const bit_depth_str = mem.trim(u8, lines.next() orelse return error.InvalidMetadata, " \n\r");
-    const channels_str = mem.trim(u8, lines.next() orelse return error.InvalidMetadata, " \n\r");
-    const duration_str = mem.trim(u8, lines.next() orelse return error.InvalidMetadata, " \n\r");
-
-    const sample_rate = try std.fmt.parseInt(u32, sample_rate_str, 10);
-    const bit_depth = try std.fmt.parseInt(u8, bit_depth_str, 10);
-    const channels = try std.fmt.parseInt(u8, channels_str, 10);
-    const duration_seconds = try std.fmt.parseFloat(f64, duration_str);
-
-    std.debug.assert(sample_rate == 44100 or sample_rate == 22050 or sample_rate == 16000);
-
-    return AudioMetadata{
-        .sample_rate = sample_rate,
-        .bit_depth = bit_depth,
-        .channels = channels,
-        .duration_seconds = duration_seconds,
-        .format = detectFormat(file_path),
-    };
+    return parseAudioMetadataOutput(result.stdout, file_path);
 }
 
 // SOURCE: man ffmpeg — pcm_f32le encoder writes 32-bit float PCM in little-endian
@@ -256,6 +278,22 @@ test "audio_decoder: probeAudioMetadata returns error for invalid file" {
     } else |_| {
         // Expected — either ffprobe not found or file doesn't exist
     }
+}
+
+test "audio_decoder: ffprobe key=value output parses by key not line position" {
+    const sample_output =
+        "sample_rate=44100\n" ++
+        "channels=1\n" ++
+        "bits_per_sample=0\n" ++
+        "duration=14.497937\n";
+
+    const metadata = try parseAudioMetadataOutput(sample_output, "/tmp/test.mp3");
+
+    try std.testing.expectEqual(@as(u32, 44100), metadata.sample_rate);
+    try std.testing.expectEqual(@as(u8, 1), metadata.channels);
+    try std.testing.expectEqual(@as(u8, 0), metadata.bit_depth);
+    try std.testing.expectApproxEqAbs(@as(f64, 14.497937), metadata.duration_seconds, 0.000001);
+    try std.testing.expectEqualStrings("mp3", metadata.format);
 }
 
 test "audio_decoder: save and load f32 round-trip" {

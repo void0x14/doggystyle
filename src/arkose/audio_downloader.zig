@@ -66,6 +66,9 @@ const MAX_HTTP_HEADER_LEN: usize = 4096;
 const MAX_STATUS_LINE_LEN: usize = 256;
 const MAX_CHUNK_LINE_LEN: usize = 4096;
 
+/// Large base64 audio payloads need longer than the default CDP receive timeout.
+const AUDIO_FETCH_EVALUATE_TIMEOUT_MS: u64 = 30000;
+
 // ---------------------------------------------------------------------------
 // Structs
 // ---------------------------------------------------------------------------
@@ -573,7 +576,7 @@ pub fn fetchAudioViaCdpEvaluate(
 
     std.debug.print("[AUDIO] CDP evaluate fetch: challenge={s}, sessionToken={s}\n", .{ challenge_str, session_token });
 
-    const response = cdp.evaluate(js) catch |err| {
+    const response = cdp.evaluateWithTimeout(js, AUDIO_FETCH_EVALUATE_TIMEOUT_MS) catch |err| {
         std.debug.print("[AUDIO] CDP evaluate call failed: {}\n", .{err});
         return error.CdpEvalFailed;
     };

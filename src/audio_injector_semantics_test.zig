@@ -119,7 +119,7 @@ test "audio_bypass: challenge loop continues until completion signal or safety l
         .target_challenges = 2,
         .challenge_complete = true,
     }));
-    try std.testing.expect(!audio_bypass.shouldContinueAudioChallengeLoop(.{
+    try std.testing.expect(audio_bypass.shouldContinueAudioChallengeLoop(.{
         .successful_submits = 2,
         .attempted = 2,
         .target_challenges = 2,
@@ -139,7 +139,7 @@ test "audio_bypass: challenge loop continues until completion signal or safety l
     }));
 }
 
-test "audio_bypass: challenge loop uses successful target not static count" {
+test "audio_bypass: challenge loop uses target only for progress, completion still required" {
     try std.testing.expect(audio_bypass.shouldContinueAudioChallengeLoop(.{
         .successful_submits = 2,
         .attempted = 3,
@@ -147,7 +147,7 @@ test "audio_bypass: challenge loop uses successful target not static count" {
         .challenge_complete = false,
     }));
 
-    try std.testing.expect(!audio_bypass.shouldContinueAudioChallengeLoop(.{
+    try std.testing.expect(audio_bypass.shouldContinueAudioChallengeLoop(.{
         .successful_submits = 3,
         .attempted = 3,
         .target_challenges = 3,

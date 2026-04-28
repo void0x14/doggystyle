@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
     const vendor_zig = b.pathFromRoot("vendor/zig/zig");
     const test_run = b.addSystemCommand(&.{
         vendor_zig,      "test",           "src/network_core.zig",
-        "--zig-lib-dir", "vendor/zig-std", "-lc",
+        "--zig-lib-dir", "vendor/zig-std", "-target", "x86_64-linux-musl", "-lc",
     });
     test_run.has_side_effects = true;
     test_step.dependOn(&test_run.step);
@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
     // Module 2.2: HTTP/2 core tests
     const http2_test_run = b.addSystemCommand(&.{
         vendor_zig,      "test",           "src/http2_core.zig",
-        "--zig-lib-dir", "vendor/zig-std", "-lc",
+        "--zig-lib-dir", "vendor/zig-std", "-target", "x86_64-linux-musl", "-lc",
     });
     http2_test_run.has_side_effects = true;
     test_step.dependOn(&http2_test_run.step);
@@ -70,7 +70,7 @@ pub fn build(b: *std.Build) void {
     // Module 3.3: Stealth Browser Initialization tests
     const browser_init_test_run = b.addSystemCommand(&.{
         vendor_zig,      "test",           "src/browser_init.zig",
-        "--zig-lib-dir", "vendor/zig-std", "-lc",
+        "--zig-lib-dir", "vendor/zig-std", "-target", "x86_64-linux-musl", "-lc",
     });
     browser_init_test_run.has_side_effects = true;
     test_step.dependOn(&browser_init_test_run.step);
@@ -78,7 +78,7 @@ pub fn build(b: *std.Build) void {
     // Module 4: Browser Bridge (Chrome stdout interceptor) tests
     const browser_bridge_test_run = b.addSystemCommand(&.{
         vendor_zig,      "test",           "src/browser_bridge.zig",
-        "--zig-lib-dir", "vendor/zig-std", "-lc",
+        "--zig-lib-dir", "vendor/zig-std", "-target", "x86_64-linux-musl", "-lc",
     });
     browser_bridge_test_run.has_side_effects = true;
     test_step.dependOn(&browser_bridge_test_run.step);
@@ -91,7 +91,7 @@ pub fn build(b: *std.Build) void {
     // Module 6: Arkose Audio Decoder tests
     const audio_decoder_test_run = b.addSystemCommand(&.{
         vendor_zig,      "test",           "src/arkose/audio_decoder.zig",
-        "--zig-lib-dir", "vendor/zig-std", "-lc",
+        "--zig-lib-dir", "vendor/zig-std", "-target", "x86_64-linux-musl", "-lc",
     });
     audio_decoder_test_run.has_side_effects = true;
     test_step.dependOn(&audio_decoder_test_run.step);
@@ -99,7 +99,7 @@ pub fn build(b: *std.Build) void {
     // Module 7: FFT Analyzer tests
     const fft_analyzer_test_run = b.addSystemCommand(&.{
         vendor_zig,      "test",           "src/audio/fft_analyzer.zig",
-        "--zig-lib-dir", "vendor/zig-std", "-lc",
+        "--zig-lib-dir", "vendor/zig-std", "-target", "x86_64-linux-musl", "-lc",
     });
     fft_analyzer_test_run.has_side_effects = true;
     test_step.dependOn(&fft_analyzer_test_run.step);
@@ -107,7 +107,7 @@ pub fn build(b: *std.Build) void {
     // Module 8: FFT Fuzzing Harness tests
     const fft_fuzz_test_run = b.addSystemCommand(&.{
         vendor_zig,      "test",           "src/fuzz_fft.zig",
-        "--zig-lib-dir", "vendor/zig-std", "-lc",
+        "--zig-lib-dir", "vendor/zig-std", "-target", "x86_64-linux-musl", "-lc",
     });
     fft_fuzz_test_run.has_side_effects = true;
     test_step.dependOn(&fft_fuzz_test_run.step);

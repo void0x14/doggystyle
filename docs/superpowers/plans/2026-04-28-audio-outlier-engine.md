@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `src/audio/fft_analyzer.zig`
 
-- [ ] **Step 1: Add public structs after `SpectralFluxResult`**
+- [x] **Step 1: Add public structs after `SpectralFluxResult`**
 
 ```zig
 pub const ClipInput = struct { samples: []const f32, sample_rate: u32 };
@@ -26,7 +26,7 @@ pub const DecisionMode = enum { hardware_primary, weighted_fallback, ambiguous }
 pub const QuantizationGridSource = enum { caller_bit_depth, runtime_common_grid };
 ```
 
-- [ ] **Step 2: Add feature/result structs**
+- [x] **Step 2: Add feature/result structs**
 
 ```zig
 pub const ActiveRegion = struct { start: usize, end: usize, noise_frame_count: u32, active_frame_count: u32, active_rms: f64, noise_floor_rms: f64, snr_estimate: f64 };
@@ -38,13 +38,13 @@ pub const OutlierDiagnostics = struct { dc_delta_ratios: [CLIP_COUNT]f64, select
 pub const OutlierAnalysisResult = struct { guess: u8, execution_time_us: u64, features: [CLIP_COUNT]ClipFeatures, outlier_scores: [CLIP_COUNT]OutlierScore, hardware_scores: [CLIP_COUNT]f64, acoustic_scores: [CLIP_COUNT]f64, final_scores: [CLIP_COUNT]f64, confidence: f64, decision_mode: DecisionMode, diagnostics: OutlierDiagnostics };
 ```
 
-- [ ] **Step 3: Extend `AnalysisError`**
+- [x] **Step 3: Extend `AnalysisError`**
 
 ```zig
 const AnalysisError = error{ InvalidClip, InvalidSampleRate, FftTooLarge, OutputBufferTooSmall, ClipAnalysisFailed, AmbiguousSignal, NoActiveSignal };
 ```
 
-- [ ] **Step 4: Run compile test**
+- [x] **Step 4: Run compile test**
 
 Run: `vendor/zig/zig test src/audio/fft_analyzer.zig --zig-lib-dir vendor/zig-std -lc`
 Expected: existing tests compile or expose syntax issues from new declarations.
@@ -56,7 +56,7 @@ Expected: existing tests compile or expose syntax issues from new declarations.
 **Files:**
 - Modify: `src/audio/fft_analyzer.zig`
 
-- [ ] **Step 1: Add helpers**
+- [x] **Step 1: Add helpers**
 
 ```zig
 fn msToSamples(ms: u32, sample_rate: u32) usize;
@@ -65,15 +65,15 @@ fn findActiveRegion(clip: []const f32, sample_rate: u32, config: VADConfig) Anal
 fn computeHardwareWithoutQuantization(clip: []const f32, active: ActiveRegion) AnalysisError!HardwareSignature;
 ```
 
-- [ ] **Step 2: Write tests**
+- [x] **Step 2: Write tests**
 
 Add tests for `announcement_skip_ms = 0`, `announcement_skip_ms = 1000`, linear SNR, and no `dc_delta_ratio` in `HardwareSignature`.
 
-- [ ] **Step 3: Implement VAD**
+- [x] **Step 3: Implement VAD**
 
 Use frame energy, dynamic threshold, active frame count, active/noise RMS, and linear `snr_estimate = active_rms / noise_floor_rms`.
 
-- [ ] **Step 4: Implement DC confidence**
+- [x] **Step 4: Implement DC confidence**
 
 Use at least 5 target windows. Define `sign_consistency = dominant_sign_count / window_count`. Compute `dc_bias_confidence` from window count factor, variance factor, and sign consistency.
 
@@ -84,18 +84,18 @@ Use at least 5 target windows. Define `sign_consistency = dominant_sign_count / 
 **Files:**
 - Modify: `src/audio/fft_analyzer.zig`
 
-- [ ] **Step 1: Add helpers**
+- [x] **Step 1: Add helpers**
 
 ```zig
 fn quantizationFractionWithin(clip: []const f32, active: ActiveRegion, grid_scale: f64, tolerance: f64) f64;
 fn chooseCommonQuantizationGrid(clips: []const ClipInput, features: *[CLIP_COUNT]ClipFeatures, config: OutlierConfig) AnalysisError!struct { scale: f64, source: QuantizationGridSource };
 ```
 
-- [ ] **Step 2: Write tests**
+- [x] **Step 2: Write tests**
 
 Test caller bit depth uses one grid for all clips. Test runtime mode chooses `argmax sum_i fraction_within(clip_i, grid)` and does not choose per-clip grids.
 
-- [ ] **Step 3: Implement residual fraction**
+- [x] **Step 3: Implement residual fraction**
 
 Use `residual = abs(sample * grid_scale - round(sample * grid_scale))` and `fraction_within = count(residual <= tolerance) / inspected_count`.
 
@@ -106,22 +106,22 @@ Use `residual = abs(sample * grid_scale - round(sample * grid_scale))` and `frac
 **Files:**
 - Modify: `src/audio/fft_analyzer.zig`
 
-- [ ] **Step 1: Add helpers**
+- [x] **Step 1: Add helpers**
 
 ```zig
 fn semanticLabelFromText(text: []const u8) SemanticLabel;
 fn computeAcousticSignature(clip: []const f32, active: ActiveRegion, sample_rate: u32, config: OutlierConfig) AnalysisError!AcousticSignature;
 ```
 
-- [ ] **Step 2: Implement bounded FFT frames**
+- [x] **Step 2: Implement bounded FFT frames**
 
 Use 1024/2048 max power-of-two frames, Hanning window, existing `fft()`, and 2-4 frames across the active region.
 
-- [ ] **Step 3: Compute metrics**
+- [x] **Step 3: Compute metrics**
 
 Compute spectral flux, rolloff, ZCR, harmonic peak ratio, centroid, narrowband stability, and low-frequency transient energy.
 
-- [ ] **Step 4: Write tests**
+- [x] **Step 4: Write tests**
 
 Test label parsing, bee narrowband stability, and steps low-frequency transient field presence.
 
@@ -132,7 +132,7 @@ Test label parsing, bee narrowband stability, and steps low-frequency transient 
 **Files:**
 - Modify: `src/audio/fft_analyzer.zig`
 
-- [ ] **Step 1: Add scoring helpers**
+- [x] **Step 1: Add scoring helpers**
 
 ```zig
 fn maxAdScores(values: [CLIP_COUNT]f64) [CLIP_COUNT]f64;
@@ -142,17 +142,17 @@ fn computeHardwareScores(scores: [CLIP_COUNT]OutlierScore, features: [CLIP_COUNT
 fn computeAcousticScores(scores: [CLIP_COUNT]OutlierScore, label: SemanticLabel) [CLIP_COUNT]f64;
 ```
 
-- [ ] **Step 2: Implement score semantics**
+- [x] **Step 2: Implement score semantics**
 
 DC MaxAD input is raw `hardware.dc_offset`. `dc_delta_ratio` is diagnostic only. Hardware score uses confidence-normalized effective weights. Acoustic score uses semantic dispatcher weights.
 
-- [ ] **Step 3: Implement public API**
+- [x] **Step 3: Implement public API**
 
 ```zig
 pub fn analyzeOutlier(clips: []const ClipInput, label: SemanticLabel, config: OutlierConfig) !OutlierAnalysisResult;
 ```
 
-- [ ] **Step 4: Write tests**
+- [x] **Step 4: Write tests**
 
 Test three identical clips return `error.AmbiguousSignal`; DC outlier wins; `harmonic_peak_ratio` raw feature maps to `harmonic_peak_score`; final scores use 70/30 weighting.
 

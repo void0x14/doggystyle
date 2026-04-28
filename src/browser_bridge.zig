@@ -3625,8 +3625,9 @@ fn buildRuntimeEvaluateParams(
 
 fn computeRuntimeEvaluateTimeouts(timeout_ms: u64) RuntimeEvaluateTimeouts {
     const response_margin_ms: u64 = 1000;
+    const max_cdp_timeout_ms: u64 = 8000;
     return .{
-        .cdp_timeout_ms = timeout_ms,
+        .cdp_timeout_ms = @min(timeout_ms, max_cdp_timeout_ms),
         .socket_timeout_ms = timeout_ms + response_margin_ms,
     };
 }

@@ -160,35 +160,38 @@ fn findActiveRegion(clip: []const f32, sample_rate: u32, config: VADConfig) Anal
     const frame_count = available / frame_len;
     if (frame_count == 0) return error.InvalidClip;
 
-    var min_rms = std.math.inf(f64);
-    var max_rms: f64 = 0.0;
+    var min_energy = std.math.inf(f64);
+    var max_energy: f64 = 0.0;
     for (0..frame_count) |frame_index| {
         const start = skip + frame_index * frame_len;
         const end = start + frame_len;
         const frame_rms = computeRangeRms(clip, start, end);
-        min_rms = @min(min_rms, frame_rms);
-        max_rms = @max(max_rms, frame_rms);
+        const frame_energy = frame_rms * frame_rms;
+        min_energy = @min(min_energy, frame_energy);
+        max_energy = @max(max_energy, frame_energy);
     }
 
-    const threshold = @max(min_rms * config.snr_min, min_rms + (max_rms - min_rms) * 0.25);
+    const snr_energy_multiplier = config.snr_min * config.snr_min;
+    const threshold_energy = @max(min_energy * snr_energy_multiplier, min_energy + (max_energy - min_energy) * 0.25);
     var best_start_frame: usize = 0;
     var best_frame_count: u32 = 0;
     var run_start_frame: usize = 0;
     var run_frame_count: u32 = 0;
     var noise_frame_count: u32 = 0;
-    var noise_sum_sq: f64 = 0.0;
+    var noise_sum_energy: f64 = 0.0;
     var noise_sample_count: usize = 0;
 
     for (0..frame_count) |frame_index| {
         const start = skip + frame_index * frame_len;
         const end = start + frame_len;
         const frame_rms = computeRangeRms(clip, start, end);
-        if (frame_rms >= threshold) {
+        const frame_energy = frame_rms * frame_rms;
+        if (frame_energy >= threshold_energy) {
             if (run_frame_count == 0) run_start_frame = frame_index;
             run_frame_count += 1;
         } else {
             noise_frame_count += 1;
-            noise_sum_sq += frame_rms * frame_rms * @as(f64, @floatFromInt(frame_len));
+            noise_sum_energy += frame_energy * @as(f64, @floatFromInt(frame_len));
             noise_sample_count += frame_len;
             if (run_frame_count > best_frame_count) {
                 best_start_frame = run_start_frame;
@@ -206,7 +209,8 @@ fn findActiveRegion(clip: []const f32, sample_rate: u32, config: VADConfig) Anal
     const active_start = skip + best_start_frame * frame_len;
     const active_end = active_start + @as(usize, best_frame_count) * frame_len;
     const active_rms = computeRangeRms(clip, active_start, active_end);
-    const noise_floor_rms = if (noise_sample_count == 0) min_rms else @sqrt(noise_sum_sq / @as(f64, @floatFromInt(noise_sample_count)));
+    const noise_floor_energy = if (noise_sample_count == 0) min_energy else noise_sum_energy / @as(f64, @floatFromInt(noise_sample_count));
+    const noise_floor_rms = @sqrt(noise_floor_energy);
     if (noise_floor_rms <= 0.0 and active_rms <= 0.0) return error.NoActiveSignal;
     const snr_estimate = if (noise_floor_rms <= 0.0) std.math.inf(f64) else active_rms / noise_floor_rms;
     if (snr_estimate < config.snr_min) return error.NoActiveSignal;
@@ -219,6 +223,30 @@ fn findActiveRegion(clip: []const f32, sample_rate: u32, config: VADConfig) Anal
         .active_rms = active_rms,
         .noise_floor_rms = noise_floor_rms,
         .snr_estimate = snr_estimate,
+    };
+}
+
+fn wholeClipActiveRegion(clip: []const f32, sample_rate: u32, config: VADConfig) AnalysisError!ActiveRegion {
+    if (clip.len == 0) return error.InvalidClip;
+    if (sample_rate == 0) return error.InvalidSampleRate;
+
+    const frame_len = msToSamples(config.frame_ms, sample_rate);
+    if (frame_len == 0) return error.InvalidSampleRate;
+    const skip = @min(msToSamples(config.announcement_skip_ms, sample_rate), clip.len);
+    if (skip >= clip.len) return error.NoActiveSignal;
+
+    const active_rms = computeRangeRms(clip, skip, clip.len);
+    if (active_rms <= 0.0) return error.NoActiveSignal;
+    const frame_count = @max(@as(usize, 1), (clip.len - skip) / frame_len);
+
+    return .{
+        .start = skip,
+        .end = clip.len,
+        .noise_frame_count = 0,
+        .active_frame_count = @intCast(@min(frame_count, std.math.maxInt(u32))),
+        .active_rms = active_rms,
+        .noise_floor_rms = active_rms,
+        .snr_estimate = 1.0,
     };
 }
 
@@ -691,7 +719,10 @@ pub fn analyzeOutlier(clips: []const ClipInput, label: SemanticLabel, config: Ou
     for (clips, 0..) |clip, i| {
         if (clip.samples.len == 0) return error.InvalidClip;
         if (clip.sample_rate == 0) return error.InvalidSampleRate;
-        const active = try findActiveRegion(clip.samples, clip.sample_rate, config.vad);
+        const active = findActiveRegion(clip.samples, clip.sample_rate, config.vad) catch |err| switch (err) {
+            error.NoActiveSignal => try wholeClipActiveRegion(clip.samples, clip.sample_rate, config.vad),
+            else => return err,
+        };
         const hardware = try computeHardwareWithoutQuantization(clip.samples, active);
         const acoustic = try computeAcousticSignature(clip.samples, active, clip.sample_rate, config);
         features[i] = .{ .active = active, .hardware = hardware, .acoustic = acoustic };
@@ -1046,6 +1077,19 @@ test "fft_analyzer: VAD SNR estimate is linear ratio" {
     try std.testing.expectApproxEqAbs(@as(f64, 10.0), active.snr_estimate, 0.001);
 }
 
+test "fft_analyzer: VAD dynamic threshold uses frame energy" {
+    const sample_rate: u32 = 1000;
+    var clip = [_]f32{1.0} ** 100;
+    for (30..60) |i| clip[i] = 3.05;
+    for (60..90) |i| clip[i] = 6.0;
+
+    const active = try findActiveRegion(&clip, sample_rate, .{ .frame_ms = 10, .min_active_frames = 3, .snr_min = 2.0 });
+
+    try std.testing.expectEqual(@as(usize, 60), active.start);
+    try std.testing.expectEqual(@as(usize, 90), active.end);
+    try std.testing.expectEqual(@as(u32, 3), active.active_frame_count);
+}
+
 test "fft_analyzer: HardwareSignature has no dc_delta_ratio field" {
     try std.testing.expect(!@hasField(HardwareSignature, "dc_delta_ratio"));
 }
@@ -1063,14 +1107,18 @@ test "fft_analyzer: VAD accepts silent noise floor with active signal" {
 }
 
 test "fft_analyzer: hardware DC confidence uses stable signed windows" {
-    var clip = [_]f32{0.11} ** 100;
-    const active = ActiveRegion{ .start = 0, .end = clip.len, .noise_frame_count = 5, .active_frame_count = 10, .active_rms = 0.11, .noise_floor_rms = 0.01, .snr_estimate = 11.0 };
+    var stable_clip = [_]f32{0.11} ** 100;
+    var mixed_clip: [100]f32 = undefined;
+    for (&mixed_clip, 0..) |*sample, i| sample.* = if (i < 60) 0.11 else -0.09;
+    const active = ActiveRegion{ .start = 0, .end = stable_clip.len, .noise_frame_count = 5, .active_frame_count = 10, .active_rms = 0.11, .noise_floor_rms = 0.01, .snr_estimate = 11.0 };
 
-    const hardware = try computeHardwareWithoutQuantization(&clip, active);
+    const stable = try computeHardwareWithoutQuantization(&stable_clip, active);
+    const mixed = try computeHardwareWithoutQuantization(&mixed_clip, active);
 
-    try std.testing.expectApproxEqAbs(@as(f64, 0.11), hardware.dc_offset, 0.001);
-    try std.testing.expect(hardware.dc_bias_confidence > 0.9);
-    try std.testing.expect(hardware.dc_window_std_dev < 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.11), stable.dc_offset, 0.001);
+    try std.testing.expect(stable.dc_bias_confidence > 0.9);
+    try std.testing.expect(stable.dc_window_std_dev < 0.001);
+    try std.testing.expect(mixed.dc_bias_confidence < stable.dc_bias_confidence);
 }
 
 test "fft_analyzer: quantization fraction uses residual tolerance" {
@@ -1228,6 +1276,31 @@ test "fft_analyzer: analyzeOutlier returns ambiguous for identical clips" {
     };
 
     try std.testing.expectError(error.AmbiguousSignal, analyzeOutlier(&clips, .unknown, .{ .vad = .{ .snr_min = 1.1 } }));
+}
+
+test "fft_analyzer: analyzeOutlier uses whole clip when VAD rejects low SNR active audio" {
+    var clip0: [4096]f32 = undefined;
+    var clip1: [4096]f32 = undefined;
+    var clip2: [4096]f32 = undefined;
+    for (0..4096) |i| {
+        const t = @as(f64, @floatFromInt(i)) / 8192.0;
+        const bed = 0.08 * @sin(2.0 * std.math.pi * 220.0 * t);
+        const motion = if ((i / 256) % 2 == 0) 0.04 * @sin(2.0 * std.math.pi * 440.0 * t) else 0.0;
+        clip0[i] = @floatCast(bed + motion);
+        clip1[i] = @floatCast(bed + motion * 0.95);
+        clip2[i] = @floatCast(0.18 + bed + motion);
+    }
+    const clips = [_]ClipInput{
+        .{ .samples = &clip0, .sample_rate = 8192 },
+        .{ .samples = &clip1, .sample_rate = 8192 },
+        .{ .samples = &clip2, .sample_rate = 8192 },
+    };
+
+    const result = try analyzeOutlier(&clips, .unknown, .{ .hardware_primary_margin = 0.05 });
+
+    try std.testing.expectEqual(@as(u8, 2), result.guess);
+    try std.testing.expectEqual(@as(usize, 0), result.features[2].active.start);
+    try std.testing.expectEqual(@as(usize, clip2.len), result.features[2].active.end);
 }
 
 test "fft_analyzer: analyzeOutlier DC outlier wins hardware primary" {

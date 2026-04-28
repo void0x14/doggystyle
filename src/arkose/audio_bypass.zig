@@ -5,8 +5,8 @@
 // WIRE-TRUTH ANALYSIS (LIVE TEST 2026-04-24):
 // - Arkose Labs Audio CAPTCHA serves a SINGLE MP3 (~18-21s, 44100Hz mono)
 // - Single MP3 contains 3 speaker segments concatenated
-// - Pipeline splits PCM into 3 equal parts for spectral flux comparison
-// - Answer = index of segment with highest spectral flux delta + 1
+// - Pipeline splits PCM into 3 equal parts for outlier analysis
+// - Answer = outlier engine guess + 1
 //
 // Pipeline akışı (her challenge için):
 //   1. captureAudioUrl(s) → rtag/audio?challenge=N URL'sini CDP Fetch ile yakala
@@ -15,12 +15,12 @@
 //   4. probeAudioMetadata → ffprobe ile sample_rate, channels, duration
 //   5. convertToPcmF32 → ffmpeg ile MP3 → PCM f32le (44100Hz mono)
 //   6. peakNormalize → 0dBFS tepe noktasına normalize et
-//   7. analyze → 3 parçaya böl, spectral flux hesapla, en yüksek delta'yı bul
+//   7. analyzeOutlier → 3 parçadan farklı segmenti bul
 //   8. guess+1 = answer → browser'a inject et, Submit'e tıkla
 //   9. Arkose tamamlanma sinyali verene kadar tekrarla (max 10, ara geçişler tespit edilir)
 //
 // SOURCE: Live test 2026-04-24 — rtag/audio endpoint, 44100Hz mono MP3, 18-21s
-// SOURCE: RFC 7916 — Spectral Flux analysis (Scheirer & Slaney, 1997)
+// SOURCE: MaxAD outlier scoring — median absolute deviation over three clips
 
 const std = @import("std");
 const audio_downloader = @import("audio_downloader.zig");
@@ -72,9 +72,9 @@ comptime {
 }
 
 pub fn shouldContinueAudioChallengeLoop(state: ChallengeLoopState) bool {
-    return !state.challenge_complete and
-        state.successful_submits < state.target_challenges and
-        state.attempted < MAX_CHALLENGES;
+    _ = state.successful_submits;
+    _ = state.target_challenges;
+    return !state.challenge_complete and state.attempted < MAX_CHALLENGES;
 }
 
 pub fn audioBypassFinalSuccess(state: ChallengeLoopState) bool {
@@ -112,11 +112,12 @@ fn parseAudioChallengeTargetFromGfctPayload(
 
 // SOURCE: Arkose Labs UI behavior — intermediate challenges don't show completion text (live test 2026-04-27)
 const PostSubmitUiState = enum {
-    complete,      // No controls + completion text (Arkose fully done)
+    complete, // No controls + completion text (Arkose fully done)
     continue_wait, // Active controls present (still same challenge, waiting)
-    transition,    // No controls + NO completion text (intermediate transition)
-    restarted,     // Controls present + body has challenge restart indicators
-    query_failed,  // Evaluate failed
+    transition, // No controls + NO completion text (intermediate transition)
+    restarted, // Controls present + body has challenge restart indicators
+    wrong_visible, // Wrong text visible while answer controls remain active
+    query_failed, // Evaluate failed
 };
 
 fn detectPostSubmitUiState(
@@ -140,6 +141,7 @@ fn detectPostSubmitUiState(
         \\    bodyText.includes("you're all set");
         \\  const wrongText = bodyText.includes('incorrect') || bodyText.includes('only enter the number');
         \\  if (!activeInput && !activeSubmit && completionText) return 'complete';
+        \\  if ((activeInput || activeSubmit) && wrongText) return 'wrong_visible';
         \\  if (activeInput || activeSubmit) return 'continue_wait';
         \\  if (!activeInput && !activeSubmit && wrongText) return 'restarted';
         \\  return 'transition';
@@ -158,6 +160,7 @@ fn detectPostSubmitUiState(
         defer allocator.free(value);
         if (std.mem.eql(u8, value, "complete")) return .complete;
         if (std.mem.eql(u8, value, "continue_wait")) return .continue_wait;
+        if (std.mem.eql(u8, value, "wrong_visible")) return .wrong_visible;
         if (std.mem.eql(u8, value, "restarted")) return .restarted;
         if (std.mem.eql(u8, value, "transition")) return .transition;
         return .query_failed;
@@ -249,6 +252,24 @@ fn tryResolveGameCoreContext(
     return out_ctx.* > 0;
 }
 
+fn buildOutlierClipInputs(samples: []const f32, sample_rate: u32) [CLIP_SPLIT]fft_analyzer.ClipInput {
+    const clip_len = samples.len / CLIP_SPLIT;
+    return .{
+        .{ .samples = samples[0..clip_len], .sample_rate = sample_rate },
+        .{ .samples = samples[clip_len .. 2 * clip_len], .sample_rate = sample_rate },
+        .{ .samples = samples[2 * clip_len ..], .sample_rate = sample_rate },
+    };
+}
+
+fn outlierAnswerFromResult(result: fft_analyzer.OutlierAnalysisResult) u8 {
+    std.debug.assert(result.guess < CLIP_SPLIT);
+    return result.guess + 1;
+}
+
+fn shouldRevealPromptForAnalysis(mode: fft_analyzer.DecisionMode) bool {
+    return mode == .weighted_fallback;
+}
+
 // ---------------------------------------------------------------------------
 // runAudioBypass — Ana pipeline orkestratörü
 // ---------------------------------------------------------------------------
@@ -257,7 +278,7 @@ fn tryResolveGameCoreContext(
 //
 // Tüm audio bypass sürecini otomatikleştirir:
 //   1. Her challenge için audio URL yakala, MP3 indir, decode et
-//   2. Spectral flux analizi ile hangi segmentin farklı olduğunu bul
+//   2. Outlier analizi ile hangi segmentin farklı olduğunu bul
 //   3. Cevabı browser'a inject et ve submit et
 //   4. Hata olursa challenge'ı atla (ilk challenge hatası fatal)
 //   5. Max 10 challenge, Arkose tamamlanma sinyali yeter
@@ -295,7 +316,7 @@ pub fn runAudioBypass(
     while (arkose_connect_attempt < ARKOSE_CONNECT_MAX_RETRIES and !arkose_connected) : (arkose_connect_attempt += 1) {
         if (arkose_connect_attempt > 0) {
             std.debug.print("[AUDIO BYPASS] Arkose connection retry {d}/{d}...\n", .{ arkose_connect_attempt + 1, ARKOSE_CONNECT_MAX_RETRIES });
-            
+
             // Her 3 başarısız denemede bir sayfayı yenile
             if (arkose_connect_attempt % 3 == 0) {
                 std.debug.print("[AUDIO BYPASS] Reloading page to force Arkose iframe load (attempt {d}/{d})...\n", .{ arkose_connect_attempt, ARKOSE_CONNECT_MAX_RETRIES });
@@ -527,7 +548,7 @@ pub fn runAudioBypass(
                                 allocator.free(candidate_ws_url);
                             }
                         } else |err| {
-                            std.debug.print("[AUDIO BYPASS] getArkoseWsUrl failed for game-core (attempt {d}): {}\n", .{gc_retry + 1, err});
+                            std.debug.print("[AUDIO BYPASS] getArkoseWsUrl failed for game-core (attempt {d}): {}\n", .{ gc_retry + 1, err });
                         }
                     }
                     if (new_cdp_opt != null and new_ws_url_opt != null) {
@@ -923,31 +944,45 @@ pub fn runAudioBypass(
         defer allocator.free(normalized.normalized);
         std.debug.print("[AUDIO BYPASS] Normalized: scale={d:.4}\n", .{normalized.scale});
 
-        // Step 7: Split into 3 equal clips and analyze spectral flux
+        // Step 7: Split into 3 equal clips and analyze outlier signature
         if (normalized.normalized.len < CLIP_SPLIT) {
             std.debug.print("[AUDIO BYPASS] Attempt {d}: audio too short ({d} samples)\n", .{ total_attempted, normalized.normalized.len });
             continue;
         }
-        const clip_len = normalized.normalized.len / CLIP_SPLIT;
-        const clips = [_][]const f32{
-            normalized.normalized[0..clip_len],
-            normalized.normalized[clip_len .. 2 * clip_len],
-            normalized.normalized[2 * clip_len ..],
+        const clips = buildOutlierClipInputs(normalized.normalized, meta.sample_rate);
+        const outlier_config = fft_analyzer.OutlierConfig{
+            .vad = .{},
+            .optional_bit_depth = if (meta.bit_depth == 0) null else meta.bit_depth,
         };
 
-        const flux_result = fft_analyzer.analyze(allocator, &clips, meta.sample_rate) catch |err| {
-            std.debug.print("[AUDIO BYPASS] Attempt {d}: FFT analyze failed: {}\n", .{ total_attempted, err });
-            continue;
-        };
-
-        // Step 8: Answer = guess + 1 (1-indexed)
-        last_guess = flux_result.guess;
-        const answer: u8 = flux_result.guess + 1;
-        std.debug.print("[AUDIO BYPASS] Spectral flux: [{d:.6}, {d:.6}, {d:.6}]\n", .{
-            flux_result.deltas[0], flux_result.deltas[1], flux_result.deltas[2],
-        });
-        std.debug.print("[AUDIO BYPASS] Guess (highest delta): {d} -> Answer: {d}\n", .{ flux_result.guess, answer });
-        std.debug.print("[AUDIO BYPASS] Analysis time: {d}us\n", .{flux_result.execution_time_us});
+        var answer: u8 = undefined;
+        const outlier_result_or_error = fft_analyzer.analyzeOutlier(&clips, .unknown, outlier_config);
+        if (outlier_result_or_error) |outlier_result| {
+            answer = outlierAnswerFromResult(outlier_result);
+            last_guess = answer - 1;
+            std.debug.print("[AUDIO BYPASS] Outlier final scores: [{d:.6}, {d:.6}, {d:.6}]\n", .{
+                outlier_result.final_scores[0], outlier_result.final_scores[1], outlier_result.final_scores[2],
+            });
+            std.debug.print("[AUDIO BYPASS] Outlier hardware scores: [{d:.6}, {d:.6}, {d:.6}]\n", .{
+                outlier_result.hardware_scores[0], outlier_result.hardware_scores[1], outlier_result.hardware_scores[2],
+            });
+            if (shouldRevealPromptForAnalysis(outlier_result.decision_mode)) {
+                std.debug.print("[AUDIO BYPASS] Fallback decision mode active: weighted_fallback\n", .{});
+            }
+            std.debug.print("[AUDIO BYPASS] Guess (outlier): {d} -> Answer: {d}\n", .{ outlier_result.guess, answer });
+            std.debug.print("[AUDIO BYPASS] Analysis time: {d}us\n", .{outlier_result.execution_time_us});
+        } else |err| {
+            switch (err) {
+                error.AmbiguousSignal => {
+                    std.debug.print("[AUDIO BYPASS] Attempt {d}: outlier analyze ambiguous; skipping challenge without manual answer fallback\n", .{total_attempted});
+                    continue;
+                },
+                else => {
+                    std.debug.print("[AUDIO BYPASS] Attempt {d}: outlier analyze failed: {}\n", .{ total_attempted, err });
+                    continue;
+                },
+            }
+        }
 
         // Step 9: Inject answer into iframe and submit (via direct CDP session)
         const proof = audio_injector.injectAnswerOnTarget(&arkose_cdp, allocator, answer, game_core_ctx) catch |err| {
@@ -966,21 +1001,21 @@ pub fn runAudioBypass(
                 }
             },
             .transition => {
-                // Correct answer on intermediate challenge: Arkose advanced to next challenge
-                // Body has no completion text, input disappeared
-                successful += 1;
-                challenge_index += 1;
-                std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} solved (intermediate transition)\n", .{ successful, target_challenges });
-
-                // Verify the transition by checking UI state
                 const ui_state = detectPostSubmitUiState(&arkose_cdp, allocator, game_core_ctx);
-                if (ui_state == .complete) {
-                    challenge_complete = true;
-                    std.debug.print("[AUDIO BYPASS] Unexpected completion after transition\n", .{});
+                if (ui_state == .wrong_visible or ui_state == .restarted) {
+                    std.debug.print("[AUDIO BYPASS] Transition rechecked as wrong; answer {d} rejected\n", .{answer});
+                } else {
+                    successful += 1;
+                    challenge_index += 1;
+                    std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} advanced (intermediate transition)\n", .{ successful, target_challenges });
+                    if (ui_state == .complete) {
+                        challenge_complete = true;
+                        std.debug.print("[AUDIO BYPASS] Completion after transition\n", .{});
+                    }
                 }
             },
             .wrong => {
-                std.debug.print("[AUDIO BYPASS] Attempt {d}: Wrong answer detected\n", .{total_attempted});
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: Wrong answer {d} rejected\n", .{ total_attempted, answer });
 
                 // Check if Arkose restarted ALL challenges (challenge_index back to 0, new audio)
                 const ui_state = detectPostSubmitUiState(&arkose_cdp, allocator, game_core_ctx);
@@ -1017,6 +1052,9 @@ pub fn runAudioBypass(
                     },
                     .continue_wait => {
                         std.debug.print("[AUDIO BYPASS] UI check: still same challenge, will retry\n", .{});
+                    },
+                    .wrong_visible => {
+                        std.debug.print("[AUDIO BYPASS] UI check: wrong text visible; answer {d} rejected\n", .{answer});
                     },
                     .restarted => {
                         std.debug.print("[AUDIO BYPASS] UI check: Arkose restarted challenges\n", .{});
@@ -1066,6 +1104,41 @@ test "audio_bypass: constants are valid" {
     try std.testing.expect(MAX_CHALLENGES > 0);
     try std.testing.expect(CLIP_SPLIT == 3);
     try std.testing.expect(PIPELINE_TIMEOUT_MS > 0);
+}
+
+test "audio_bypass: builds outlier clip inputs from normalized PCM" {
+    var pcm = [_]f32{ 0.1, 0.2, 0.3, 1.1, 1.2, 1.3, 2.1, 2.2, 2.3 };
+
+    const clips = buildOutlierClipInputs(&pcm, 44100);
+
+    try std.testing.expectEqual(@as(usize, 3), clips[0].samples.len);
+    try std.testing.expectEqual(@as(f32, 0.1), clips[0].samples[0]);
+    try std.testing.expectEqual(@as(f32, 1.1), clips[1].samples[0]);
+    try std.testing.expectEqual(@as(f32, 2.1), clips[2].samples[0]);
+    try std.testing.expectEqual(@as(u32, 44100), clips[2].sample_rate);
+}
+
+test "audio_bypass: outlier answer uses analyzeOutlier result" {
+    const result = fft_analyzer.OutlierAnalysisResult{
+        .guess = 2,
+        .execution_time_us = 42,
+        .features = undefined,
+        .outlier_scores = undefined,
+        .hardware_scores = .{ 0.1, 0.2, 0.9 },
+        .acoustic_scores = .{ 0.1, 0.2, 0.8 },
+        .final_scores = .{ 0.1, 0.2, 0.87 },
+        .confidence = 0.67,
+        .decision_mode = .hardware_primary,
+        .diagnostics = .{ .dc_delta_ratios = .{ 0.0, 0.0, 1.0 }, .selected_quantization_grid_scale = 32767.0, .quantization_grid_source = .runtime_common_grid, .score_range = 0.77 },
+    };
+
+    try std.testing.expectEqual(@as(u8, 3), outlierAnswerFromResult(result));
+}
+
+test "audio_bypass: prompt reveal only for weighted fallback" {
+    try std.testing.expect(!shouldRevealPromptForAnalysis(.hardware_primary));
+    try std.testing.expect(shouldRevealPromptForAnalysis(.weighted_fallback));
+    try std.testing.expect(!shouldRevealPromptForAnalysis(.ambiguous));
 }
 
 test "audio_bypass: runAudioBypass returns error without bridge" {

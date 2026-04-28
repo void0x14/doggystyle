@@ -2,6 +2,15 @@
 
 ---
 
+## [2026-04-28] — Arkose Audio Outlier VAD Düşük SNR Segmentlerini Reddetti
+
+**Hata:** Canlı audio bypass yeni `analyzeOutlier()` yoluna geçti ama her denemede `error.NoActiveSignal` döndü; motor cevap üretemedi.
+**Kök sebep:** `analyzeOutlier()` üç segmentin tamamı için `findActiveRegion()` başarısı istiyordu. Canlı Arkose MP3 segmentlerinde 1 ve 2 aktif/nonzero olmasına rağmen VAD SNR hesabı 3.0 eşiğinin altında kaldı (`2.83`, `2.65`) ve tüm analiz abort edildi.
+**Kaynak:** Canlı motor logu `/home/void0x14/.local/share/opencode/tool-output/tool_dd4ff681d001Fqa3MGIddiAD8j` — `Decoded` sonrası `Attempt N: outlier analyze failed: error.NoActiveSignal`; `tmp/audio_challenge_0.mp3` ffmpeg PCM ölçümü 2026-04-28.
+**Düzeltme:** `analyzeOutlier()` yalnız `error.NoActiveSignal` için nonzero segmentlerde whole-clip active fallback kullanıyor; sessiz segmentler yine fail ediyor. Regresyon testi eklendi: `fft_analyzer: analyzeOutlier uses whole clip when VAD rejects low SNR active audio`.
+
+---
+
 ## [2026-04-27] — Arkose Audio State Machine Fix: Intermediate Challenge Transition Detection
 
 **Hata:** `classifyPostSubmitProof()` binary karar veriyordu (ya wrong ya complete). Arkose'un ara challengelarında (0..N-2) doğru cevap sonrası body'de ne "wrong" ne "complete" metni var. `.unknown` = çöp kutusu, hiçbir işlem yapılmıyordu. Pipeline ilerleyemiyordu.
