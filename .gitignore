@@ -37,3 +37,12 @@ b
 kernel_panic
 main
 root
+tmp/
+.kilo
+.superpowers/brainstorm
+REMAINING_WORK.md
+__pycache__/
+github_arkose_captcha_vulnerability_findings.md
+siege_engine_observability_hayali.md
+session-ses_22f9-DEEPSEEKV4-PRO-purna.md
+in-memoria-vectors.db/
