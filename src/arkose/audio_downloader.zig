@@ -68,6 +68,7 @@ const MAX_CHUNK_LINE_LEN: usize = 4096;
 
 /// Large base64 audio payloads need longer than the default CDP receive timeout.
 const AUDIO_FETCH_EVALUATE_TIMEOUT_MS: u64 = 30000;
+const AUDIO_FETCH_QUEUE_KEY = "__ghostAudioFetchQueue";
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -540,6 +541,41 @@ pub fn downloadAndSaveAudio(
 //   3. Fetch'i enforcement page'den (same-origin) çalıştırır
 //   4. Yanıtı base64 encode edip döndürür
 //   5. Zig tarafında base64 decode edilip MP3 diske yazılır
+// SOURCE: Chrome DevTools Protocol — Runtime.evaluate executes JS in page context
+// SOURCE: ECMAScript Promise chaining — single tail promise serializes async work
+fn buildQueuedAudioFetchExpression(
+    allocator: std.mem.Allocator,
+    challenge_str: []const u8,
+    session_token: []const u8,
+    game_token: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\(async () => {{
+        \\  const queueKey = '{s}';
+        \\  const queue = window[queueKey] || (window[queueKey] = {{ tail: Promise.resolve() }});
+        \\  const gt = '{s}';
+        \\  const challenge = '{s}';
+        \\  const sessionTok = '{s}';
+        \\  const runFetch = async () => {{
+        \\    let url = '/rtag/audio?challenge=' + challenge + '&gameToken=' + encodeURIComponent(gt);
+        \\    if (sessionTok) url += '&sessionToken=' + encodeURIComponent(sessionTok);
+        \\    try {{
+        \\      const resp = await fetch(url);
+        \\      if (!resp.ok) return 'ERROR:HTTP_' + resp.status;
+        \\      const buf = await resp.arrayBuffer();
+        \\      const bytes = new Uint8Array(buf);
+        \\      let binary = '';
+        \\      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        \\      return btoa(binary);
+        \\    }} catch(e) {{ return 'ERROR:FETCH'; }}
+        \\  }};
+        \\  const queued = queue.tail.then(runFetch, runFetch);
+        \\  queue.tail = queued.then(() => undefined, () => undefined);
+        \\  return await queued;
+        \\}})()
+    , .{ AUDIO_FETCH_QUEUE_KEY, game_token, challenge_str, session_token });
+}
+
 pub fn fetchAudioViaCdpEvaluate(
     cdp: *browser_bridge.CdpClient,
     allocator: std.mem.Allocator,
@@ -550,28 +586,9 @@ pub fn fetchAudioViaCdpEvaluate(
     const challenge_str = try std.fmt.allocPrint(allocator, "{d}", .{challenge_index});
     defer allocator.free(challenge_str);
 
-    // Build JS that fetches audio via same-origin fetch()
-    // SOURCE: ChromeDevTools MCP live test 2026-04-25 — enforcement page
+    // Build JS that fetches audio via same-origin fetch() through a single-file queue.
     // SOURCE: ChromeDevTools MCP live test 2026-04-25 — /fc/gfct/ returns challengeID as gameToken
-    // game_token passed directly from Network response capture (FAZ 1)
-    const js = try std.fmt.allocPrint(allocator,
-        \\(async () => {{
-        \\  const gt = '{s}';
-        \\  const challenge = '{s}';
-        \\  const sessionTok = '{s}';
-        \\  let url = '/rtag/audio?challenge=' + challenge + '&gameToken=' + encodeURIComponent(gt);
-        \\  if (sessionTok) url += '&sessionToken=' + encodeURIComponent(sessionTok);
-        \\  try {{
-        \\    const resp = await fetch(url);
-        \\    if (!resp.ok) return 'ERROR:HTTP_' + resp.status;
-        \\    const buf = await resp.arrayBuffer();
-        \\    const bytes = new Uint8Array(buf);
-        \\    let binary = '';
-        \\    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-        \\    return btoa(binary);
-        \\  }} catch(e) {{ return 'ERROR:FETCH'; }}
-        \\}})()
-    , .{ game_token, challenge_str, session_token });
+    const js = try buildQueuedAudioFetchExpression(allocator, challenge_str, session_token, game_token);
     defer allocator.free(js);
 
     std.debug.print("[AUDIO] CDP evaluate fetch: challenge={s}, sessionToken={s}\n", .{ challenge_str, session_token });
@@ -677,4 +694,16 @@ test "audio_downloader: AudioDownloadResult struct size" {
     comptime {
         std.debug.assert(@sizeOf(AudioDownloadResult) > 0);
     }
+}
+
+test "audio_downloader: queued CDP fetch JS serializes audio downloads" {
+    const allocator = std.testing.allocator;
+    const js = try buildQueuedAudioFetchExpression(allocator, "2", "session-abc", "game-def");
+    defer allocator.free(js);
+
+    try std.testing.expect(std.mem.indexOf(u8, js, AUDIO_FETCH_QUEUE_KEY) != null);
+    try std.testing.expect(std.mem.indexOf(u8, js, "queue.tail.then(runFetch, runFetch)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js, "queue.tail = queued.then(() => undefined, () => undefined)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js, "return await queued") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js, "challenge=2") != null);
 }
