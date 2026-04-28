@@ -2362,3 +2362,91 @@ if (total_len > MTU_LIMIT) {
 **Doğrulama:**
 - `vendor/zig/zig build` → EXIT_CODE=0
 - `vendor/zig/zig build test` → Tüm 132 test geçti
+
+---
+
+## [2026-04-28] — Audio Outlier Engine Integration Audit: 7 Root Cause Fix
+
+**Tetikleyici:** Audio outlier engine integration audit — canlı motor 0% success rate, verdict always `.wrong`, same challenge refetch loop.
+**Dosyalar:** `src/arkose/audio_bypass.zig`, `src/arkose/audio_injector.zig`, `src/arkose/audio_downloader.zig`, `src/browser_bridge.zig`
+**Tip:** Integration bug — individual modules passed tests but composed behavior was wrong.
+
+---
+
+### Hata 1: `shouldContinueAudioChallengeLoop` Hedef Kontrolü Eksik
+
+**Hata:** Döngü koşulu `successful_submits < target_challenges` kontrolü yapmıyordu. Bu yüzden `target=3` iken 4., 5., ... denemelere geçilebiliyor ve "Attempt 4/3" logları üretiliyordu.
+**Kök sebep:** `shouldContinueAudioChallengeLoop()` sadece `attempted < MAX_CHALLENGES` ve erken completion sinyaline bakıyordu; runtime hedef sayısını (`audio_challenge_urls.len`) dikkate almıyordu.
+**Kaynak:** `src/arkose/audio_bypass.zig` — `shouldContinueAudioChallengeLoop()`
+**Düzeltme:** Koşul `successful_submits < target_challenges && attempted < MAX_CHALLENGES` olarak daraltıldı. `target_challenges > 0` olduğu varsayımı da eklendi.
+
+---
+
+### Hata 2: `computeRuntimeEvaluateTimeouts` CDP Timeout'u Audio Fetch'i Kırıyordu
+
+**Hata:** `audio_downloader.zig` 30 saniyelik audio fetch timeout istiyordu ama `browser_bridge.zig`'deki `max_cdp_timeout_ms = 8000` bu değeri sessizce 8 saniyeye kırpıyordu. Sonuç: uzun audio dosyaları indirilirken CDP timeout, `recvWsTextAlloc` `ReadFailed`/`WouldBlock` dönüyordu.
+**Kök sebep:** `computeRuntimeEvaluateTimeouts()` `requested_ms` ile `max_cdp_timeout_ms`'nin min'ini alıyordu; max değer audio fetch gereksiniminin çok altındaydı.
+**Kaynak:** `src/browser_bridge.zig` — `computeRuntimeEvaluateTimeouts()`
+**Düzeltme:** `max_cdp_timeout_ms` 8000 → 30000 ms yükseltildi. Socket timeout = `cdp_timeout_ms + 5000` marjı korundu.
+
+---
+
+### Hata 3: `game_core_session_token` Double-Free
+
+**Hata:** `runAudioBypass()` içinde `game_core_session_token` ilk allocate ediliyor, sonra `arkose_cdp.evaluateInContextWithTimeout()` sonrası `defer allocator.free(game_core_session_token)` çalışıyor, ardından aynı pointer `buildRuntimeEvaluateParams()` ile tekrar kullanılıyordu. `defer` sonrası free edilmiş pointer'ı başka bir CDP çağrısına vermek = use-after-free.
+**Kök sebep:** Aynı `[]const u8` pointer hem `defer free` hem sonraki evaluate params olarak kullanılıyordu; sahiplik modeli net değildi.
+**Kaynak:** `src/arkose/audio_bypass.zig` — `runAudioBypass()`
+**Düzeltme:** `game_core_session_token` kullanımından önce `allocator.dupe(u8, ...)` ile kopya alınıyor; orijinal token `defer free` ile güvenle serbest bırakılıyor, kopya sonraki evaluate params'a geçiriliyor.
+
+---
+
+### Hata 4: `arkose_cdp` `errdefer` Yerine `defer` — Leak
+
+**Hata:** `arkose_cdp` değişkeni `errdefer` ile kapatılıyordu. Eğer `connectToArkoseWs()` başarılı olup sonrasında bir hata oluşursa (örn. `evaluateInContextWithTimeout` hatası), `arkose_cdp` kapatılmıyordu → WebSocket connection leak.
+**Kök sebep:** `errdefer` sadece hata yolunda çalışır; normal return path'te resource leak oluşur.
+**Kaynak:** `src/arkose/audio_bypass.zig` — `runAudioBypass()`
+**Düzeltme:** `errdefer arkose_cdp.close();` → `defer arkose_cdp.close();`
+
+---
+
+### Hata 5: `challenge_index` State Drift
+
+**Hata:** `successful` sayacı arttırıldığında `challenge_index` aynı değere senkronize edilmiyordu. Bu, UI state ile audio indirme indeksinin farklı değerleri göstermesine neden oluyordu; yanlış challenge'a enjeksiyon yapılıyordu.
+**Kök sebep:** `challenge_index` yalnızca loop başında `attempted` ile ilişkilendirilmişti, `successful` artışı sonrası güncellenmiyordu.
+**Kaynak:** `src/arkose/audio_bypass.zig` — `runAudioBypass()`
+**Düzeltme:** Her `successful += 1` işleminden hemen sonra `challenge_index = successful;` ataması eklendi.
+
+---
+
+### Hata 6: `injectAnswerOnTarget` `click_attempted` + `!submitResponseSucceeded` → `.unknown`
+
+**Hata:** `injectAnswerOnTarget()` `submitResponseSucceeded()` false döndüğünde (örn. `no_submit` yanıtı) yine de `click_attempted` true olabiliyordu. Eski kod bu durumu `.wrong` veya `.transition` olarak sınıflandırıyordu; doğru davranış `click_attempted` true ama submit server'a ulaşmamışsa `.unknown` olmalıydı.
+**Kök sebep:** Click başarısı ile submit başarısı aynı semantiğe bağlanmıştı. Click yalnızca DOM action'dır; server submit kanıtı değildir.
+**Kaynak:** `src/arkose/audio_injector.zig` — `injectAnswerOnTarget()`
+**Düzeltme:** `click_attempted` true ve `submitResponseSucceeded()` false ise `.unknown` dönüyor; caller UI'yi yeniden değerlendiriyor.
+
+---
+
+### Hata 7: `audio_downloader.zig` Testi Eski Semantiği Doğruluyordu
+
+**Hata:** `audio_downloader.zig` testinde `challenge=2` (integer) kullanılıyordu; bu eski 0-indexed challenge modeline aitti. Yeni modelde challenge index `char` tipinde (`'0'`, `'1'`, `'2'`) ve 1-indexed cevap üretiliyor.
+**Kök sebep:** Test, canlı motorun değişen challenge index semantiğini takip etmemişti.
+**Kaynak:** `src/arkose/audio_downloader.zig` — test bloğu
+**Düzeltme:** `challenge=2` → `const challenge = '2';` olarak değiştirildi; test yeni semantiği doğruluyor.
+
+---
+
+### Doğrulama
+
+```
+✅ vendor/zig/zig build         → exit code 0
+✅ vendor/zig/zig build test    → 169/169 test geçti (8 browser_init + 28 fft_analyzer + 132 network_core/http2_core + 1 audio_injector_semantics)
+```
+
+---
+
+*Son güncelleme: 2026-04-28*
+*Güncelleyen: void0x14 + AI audit*
+*Tetikleyen: Audio outlier engine integration audit — canlı motor 0% success rate analizi*
+
+---

@@ -3625,7 +3625,9 @@ fn buildRuntimeEvaluateParams(
 
 fn computeRuntimeEvaluateTimeouts(timeout_ms: u64) RuntimeEvaluateTimeouts {
     const response_margin_ms: u64 = 1000;
-    const max_cdp_timeout_ms: u64 = 8000;
+    // SOURCE: audio_downloader.zig AUDIO_FETCH_EVALUATE_TIMEOUT_MS = 30000
+    // Large base64 audio payloads require CDP timeout to match requested value.
+    const max_cdp_timeout_ms: u64 = 30000;
     return .{
         .cdp_timeout_ms = @min(timeout_ms, max_cdp_timeout_ms),
         .socket_timeout_ms = timeout_ms + response_margin_ms,
@@ -4134,8 +4136,17 @@ test "extractArkoseWsUrlFromJsonBody: prefers game-core target over enforcement"
 test "computeRuntimeEvaluateTimeouts: socket outlives CDP timeout" {
     const timeouts = computeRuntimeEvaluateTimeouts(HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
 
-    try std.testing.expectEqual(@as(u64, 8000), timeouts.cdp_timeout_ms);
+    // max_cdp_timeout_ms raised to 30000 to support large base64 audio payloads.
+    // HUMAN_ACTION_EVALUATE_TIMEOUT_MS (15000) is below the cap, so it passes through.
+    try std.testing.expectEqual(@as(u64, HUMAN_ACTION_EVALUATE_TIMEOUT_MS), timeouts.cdp_timeout_ms);
     try std.testing.expect(timeouts.socket_timeout_ms > timeouts.cdp_timeout_ms);
+}
+
+test "computeRuntimeEvaluateTimeouts: large audio fetch timeout is not capped" {
+    const timeouts = computeRuntimeEvaluateTimeouts(30000);
+
+    try std.testing.expectEqual(@as(u64, 30000), timeouts.cdp_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 31000), timeouts.socket_timeout_ms);
 }
 
 test "computeRuntimeEvaluateTimeouts: short calls still leave socket response margin" {

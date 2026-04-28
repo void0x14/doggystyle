@@ -72,9 +72,9 @@ comptime {
 }
 
 pub fn shouldContinueAudioChallengeLoop(state: ChallengeLoopState) bool {
-    _ = state.successful_submits;
-    _ = state.target_challenges;
-    return !state.challenge_complete and state.attempted < MAX_CHALLENGES;
+    return state.successful_submits < state.target_challenges and
+           state.attempted < MAX_CHALLENGES and
+           !state.challenge_complete;
 }
 
 pub fn audioBypassFinalSuccess(state: ChallengeLoopState) bool {
@@ -356,7 +356,7 @@ pub fn runAudioBypass(
     }
 
     var arkose_cdp = arkose_cdp_opt.?;
-    errdefer arkose_cdp.close();
+    defer arkose_cdp.close();
     var iframe_ws_url = iframe_ws_url_opt.?;
     defer allocator.free(iframe_ws_url);
 
@@ -680,8 +680,9 @@ pub fn runAudioBypass(
                                             const send = std.mem.indexOfScalarPos(u8, body, sstart, '"') orelse body.len;
                                             const st = body[sstart..send];
                                             if (st.len > 5) {
-                                                if (game_core_session_token) |old| allocator.free(old);
+                                                const old_token = game_core_session_token;
                                                 game_core_session_token = try allocator.dupe(u8, st);
+                                                if (old_token) |old| allocator.free(old);
                                             }
                                         }
                                         game_core_found = true;
@@ -993,7 +994,7 @@ pub fn runAudioBypass(
         switch (proof.verdict) {
             .complete => {
                 successful += 1;
-                challenge_index += 1;
+                challenge_index = successful;
                 std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} solved (complete text)\n", .{ successful, target_challenges });
                 challenge_complete = detectPostSubmitUiState(&arkose_cdp, allocator, game_core_ctx) == .complete;
                 if (challenge_complete) {
@@ -1006,7 +1007,7 @@ pub fn runAudioBypass(
                     std.debug.print("[AUDIO BYPASS] Transition rechecked as wrong; answer {d} rejected\n", .{answer});
                 } else {
                     successful += 1;
-                    challenge_index += 1;
+                    challenge_index = successful;
                     std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} advanced (intermediate transition)\n", .{ successful, target_challenges });
                     if (ui_state == .complete) {
                         challenge_complete = true;
@@ -1041,13 +1042,13 @@ pub fn runAudioBypass(
                 switch (ui_state) {
                     .complete => {
                         successful += 1;
-                        challenge_index += 1;
+                        challenge_index = successful;
                         challenge_complete = true;
                         std.debug.print("[AUDIO BYPASS] UI check revealed completion! Challenge {d}/{d}\n", .{ successful, target_challenges });
                     },
                     .transition => {
                         successful += 1;
-                        challenge_index += 1;
+                        challenge_index = successful;
                         std.debug.print("[AUDIO BYPASS] UI check: intermediate transition confirmed (challenge {d}/{d})\n", .{ successful, target_challenges });
                     },
                     .continue_wait => {

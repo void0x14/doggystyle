@@ -485,7 +485,15 @@ pub fn injectAnswerOnTarget(
     defer allocator.free(submit_response);
     std.debug.print("[AUDIO INJECTOR] Submit (target): {s}\n", .{submit_response[0..@min(submit_response.len, 200)]});
     const click_attempted = mem.indexOf(u8, submit_response, "clicked_") != null;
-    std.debug.print("[AUDIO INJECTOR] Submit click attempted={}\n", .{click_attempted});
+    const submit_reached_server = submitResponseSucceeded(submit_response);
+    std.debug.print("[AUDIO INJECTOR] Submit click attempted={} reached_server={}\n", .{ click_attempted, submit_reached_server });
+
+    // If the click happened but Arkose did not accept the submission (no_submit),
+    // treat as unknown so the caller re-checks UI state instead of wasting a retry.
+    if (click_attempted and !submit_reached_server) {
+        std.debug.print("[AUDIO INJECTOR] Submit click without server acceptance → unknown verdict\n", .{});
+        return .{ .verdict = .unknown };
+    }
 
     const submit_grace = std.os.linux.timespec{ .sec = 1, .nsec = 500 * std.time.ns_per_ms };
     _ = std.os.linux.nanosleep(&submit_grace, null);

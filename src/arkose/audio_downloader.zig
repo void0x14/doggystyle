@@ -705,5 +705,5 @@ test "audio_downloader: queued CDP fetch JS serializes audio downloads" {
     try std.testing.expect(std.mem.indexOf(u8, js, "queue.tail.then(runFetch, runFetch)") != null);
     try std.testing.expect(std.mem.indexOf(u8, js, "queue.tail = queued.then(() => undefined, () => undefined)") != null);
     try std.testing.expect(std.mem.indexOf(u8, js, "return await queued") != null);
-    try std.testing.expect(std.mem.indexOf(u8, js, "challenge=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js, "const challenge = '2'") != null);
 }

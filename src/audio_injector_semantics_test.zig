@@ -106,50 +106,67 @@ test "audio_injector: direct success string is unknown not complete" {
     try std.testing.expect(!proof.accepted());
 }
 
-test "audio_bypass: challenge loop continues until completion signal or safety limit" {
+test "audio_bypass: challenge loop continues while successful < target and attempted < max" {
+    // Normal: hedefe ulaşılmadı, devam et
     try std.testing.expect(audio_bypass.shouldContinueAudioChallengeLoop(.{
         .successful_submits = 1,
         .attempted = 1,
         .target_challenges = 2,
         .challenge_complete = false,
     }));
+    // Complete signal geldi, dur
     try std.testing.expect(!audio_bypass.shouldContinueAudioChallengeLoop(.{
         .successful_submits = 2,
         .attempted = 2,
         .target_challenges = 2,
         .challenge_complete = true,
     }));
-    try std.testing.expect(audio_bypass.shouldContinueAudioChallengeLoop(.{
+    // Hedef tamamlandı (successful == target), complete false bile olsa dur
+    try std.testing.expect(!audio_bypass.shouldContinueAudioChallengeLoop(.{
         .successful_submits = 2,
         .attempted = 2,
         .target_challenges = 2,
         .challenge_complete = false,
     }));
+    // Safety limit aşıldı, dur
     try std.testing.expect(!audio_bypass.shouldContinueAudioChallengeLoop(.{
         .successful_submits = 1,
         .attempted = audio_bypass.MAX_CHALLENGES,
         .target_challenges = 2,
         .challenge_complete = false,
     }));
+    // Hedefe ulaşılmadı ama safety limit aşıldı, dur
     try std.testing.expect(!audio_bypass.shouldContinueAudioChallengeLoop(.{
         .successful_submits = 0,
         .attempted = audio_bypass.MAX_CHALLENGES,
         .target_challenges = audio_bypass.MAX_CHALLENGES,
         .challenge_complete = false,
     }));
-}
-
-test "audio_bypass: challenge loop uses target only for progress, completion still required" {
+    // Henüz başlanmadı, devam et
+    try std.testing.expect(audio_bypass.shouldContinueAudioChallengeLoop(.{
+        .successful_submits = 0,
+        .attempted = 0,
+        .target_challenges = 3,
+        .challenge_complete = false,
+    }));
+    // Başarılı submit < target, attempted fazla ama max altında, devam et
     try std.testing.expect(audio_bypass.shouldContinueAudioChallengeLoop(.{
         .successful_submits = 2,
         .attempted = 3,
         .target_challenges = 3,
         .challenge_complete = false,
     }));
-
-    try std.testing.expect(audio_bypass.shouldContinueAudioChallengeLoop(.{
+    // Başarılı submit == target, attempted < max ama hedef tamam, dur
+    try std.testing.expect(!audio_bypass.shouldContinueAudioChallengeLoop(.{
         .successful_submits = 3,
         .attempted = 3,
+        .target_challenges = 3,
+        .challenge_complete = false,
+    }));
+    // Başarılı submit == target, attempted > target, dur
+    try std.testing.expect(!audio_bypass.shouldContinueAudioChallengeLoop(.{
+        .successful_submits = 3,
+        .attempted = 5,
         .target_challenges = 3,
         .challenge_complete = false,
     }));
