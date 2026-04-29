@@ -605,7 +605,8 @@ fn runSingleAttempt(init: std.process.Init, allocator: std.mem.Allocator, iface_
     if (!risk_status.challenge_required) {
         std.debug.print("[SUCCESS] Arkose Bypassed via Low-Risk Signature\n", .{});
     } else {
-        std.debug.print("[WARN] Challenge required! Audio bypass integrated into captureSignupBundle\n", .{});
+        std.debug.print("[WARN] Challenge required! Starting audio bypass pipeline...\n", .{});
+        try solveArkoseAudioChallenge(&bridge, allocator, io, &env);
     }
 
     // =========================================================================

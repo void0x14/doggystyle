@@ -262,8 +262,8 @@ fn buildOutlierClipInputs(samples: []const f32, sample_rate: u32) [CLIP_SPLIT]ff
 }
 
 fn outlierAnswerFromResult(result: fft_analyzer.OutlierAnalysisResult) u8 {
-    std.debug.assert(result.guess < CLIP_SPLIT);
-    return result.guess + 1;
+    std.debug.assert(result.guess > 0 and result.guess <= CLIP_SPLIT);
+    return result.guess;
 }
 
 fn shouldRevealPromptForAnalysis(mode: fft_analyzer.DecisionMode) bool {
@@ -937,6 +937,15 @@ pub fn runAudioBypass(
         defer allocator.free(decoded.samples);
         std.debug.print("[AUDIO BYPASS] Decoded: {d} f32 samples ({d:.2}s)\n", .{ decoded.total_samples, meta.duration_seconds });
 
+        // Step 5b: Save raw f32 PCM to disk alongside the MP3
+        const dot_pos = std.mem.lastIndexOf(u8, result.path, ".mp3") orelse result.path.len;
+        const f32_path = try std.fmt.allocPrint(allocator, "{s}.f32", .{result.path[0..dot_pos]});
+        defer allocator.free(f32_path);
+        audio_decoder.saveF32ToFile(allocator, io, decoded.samples, f32_path) catch |err| {
+            std.debug.print("[AUDIO BYPASS] Attempt {d}: saveF32ToFile failed: {}\n", .{ total_attempted, err });
+        };
+        std.debug.print("[AUDIO BYPASS] Saved f32 PCM: {s}\n", .{f32_path});
+
         // Step 6: Peak normalize
         const normalized = audio_decoder.peakNormalize(allocator, decoded.samples) catch |err| {
             std.debug.print("[AUDIO BYPASS] Attempt {d}: peakNormalize failed: {}\n", .{ total_attempted, err });
@@ -1133,7 +1142,7 @@ test "audio_bypass: outlier answer uses analyzeOutlier result" {
         .diagnostics = .{ .dc_delta_ratios = .{ 0.0, 0.0, 1.0 }, .selected_quantization_grid_scale = 32767.0, .quantization_grid_source = .runtime_common_grid, .score_range = 0.77 },
     };
 
-    try std.testing.expectEqual(@as(u8, 3), outlierAnswerFromResult(result));
+    try std.testing.expectEqual(@as(u8, 2), outlierAnswerFromResult(result));
 }
 
 test "audio_bypass: prompt reveal only for weighted fallback" {

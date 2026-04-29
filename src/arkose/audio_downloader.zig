@@ -479,7 +479,10 @@ pub fn saveAudioDataToDisk(allocator: std.mem.Allocator, data: []const u8, chall
         }
     }
 
-    const path = try std.fmt.allocPrint(allocator, "tmp/audio_challenge_{d}.mp3", .{challenge_index});
+    var ts: posix.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    const timestamp = @as(i64, @intCast(ts.sec));
+    const path = try std.fmt.allocPrint(allocator, "tmp/audio_challenge_{d}_{d}.mp3", .{ timestamp, challenge_index });
     errdefer allocator.free(path);
 
     const fd = posix.openat(posix.AT.FDCWD, path, .{
