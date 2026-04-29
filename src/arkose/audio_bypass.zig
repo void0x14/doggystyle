@@ -364,10 +364,11 @@ pub fn runAudioBypass(
     _ = arkose_cdp.runtimeEnable() catch {};
     std.debug.print("[AUDIO BYPASS] Arkose iframe CDP session established\n", .{});
 
-    // CRITICAL FIX 2026-04-26: Arkose JS renders UI dynamically inside #funcaptcha.
-    // The DOM starts as just <div id="funcaptcha"> and JS injects buttons.
-    // We must wait for Arkose-specific elements to appear, not just generic buttons.
+    // CRITICAL FIX 2026-04-29: Arkose EC UI 2.0 no longer uses .fc-* class names.
+    // The DOM is dynamically rendered inside #funcaptcha or a shadow DOM container.
+    // We must detect UI readiness via GENERIC interactive elements, not hardcoded classes.
     // SOURCE: ChromeDevTools MCP live test — Arkose UI takes 5-15s to render.
+    // STRATEGY: Class-agnostic detection — any visible button/input/iframe = UI rendered.
     const wait_for_ui_script =
         \\(() => {
         \\  function deepQuery(selector) {
@@ -381,11 +382,13 @@ pub fn runAudioBypass(
         \\    q(document);
         \\    return results;
         \\  }
-        \\  const fcElements = document.querySelectorAll('.fc-challenge, .fc-button, .fc-audio, .fc-audio-button, [class^="fc-"]');
         \\  const funcaptcha = document.getElementById('funcaptcha');
         \\  const funcaptchaChildren = funcaptcha ? funcaptcha.querySelectorAll('*').length : 0;
-        \\  const allBtns = deepQuery('button, a, [role="button"], .fc-button, .fc-audio, .fc-audio-button, #audio');
-        \\  const interactive = deepQuery('[onclick], [tabindex], [role="button"]');
+        \\  // GENERIC: all interactive elements (class-agnostic)
+        \\  const allBtns = deepQuery('button, a[role="button"], [role="button"]');
+        \\  const allInputs = deepQuery('input, textarea');
+        \\  const visibleInputs = allInputs.filter(el => el.offsetParent !== null && el.type !== 'hidden');
+        \\  const interactive = deepQuery('[onclick], [tabindex], [role="button"], [role="link"]');
         \\  const iframe = document.querySelector('iframe');
         \\  let iframe_info = 'none';
         \\  if (iframe) {
@@ -394,12 +397,14 @@ pub fn runAudioBypass(
         \\      const idoc = iframe.contentDocument;
         \\      if (idoc) {
         \\        const ibtns = idoc.querySelectorAll('button, a, [role="button"]');
-        \\        iframe_info += '|ibtns=' + ibtns.length;
+        \\        const iinputs = idoc.querySelectorAll('input');
+        \\        iframe_info += '|ibtns=' + ibtns.length + '|iinputs=' + iinputs.length;
         \\      }
         \\    } catch(e) { iframe_info += '|cross-origin'; }
         \\  }
-        \\  return 'fc=' + fcElements.length + '|children=' + funcaptchaChildren +
-        \\         '|btns=' + allBtns.length + '|interactive=' + interactive.length +
+        \\  return 'children=' + funcaptchaChildren +
+        \\         '|btns=' + allBtns.length + '|visible_inputs=' + visibleInputs.length +
+        \\         '|interactive=' + interactive.length +
         \\         '|iframe=' + iframe_info;
         \\})()
     ;
@@ -409,12 +414,12 @@ pub fn runAudioBypass(
         if (arkose_cdp.evaluate(wait_for_ui_script)) |resp| {
             defer allocator.free(resp);
             std.debug.print("[AUDIO BYPASS] UI check (attempt {d}): {s}\n", .{ ui_retry + 1, resp[0..@min(resp.len, 300)] });
-            // UI is ready if we see ANY Arkose element, ANY button, or funcaptcha has children
-            if (std.mem.indexOf(u8, resp, "fc=0|") == null or
-                std.mem.indexOf(u8, resp, "btns=0|") == null or
+            // UI is ready if we see ANY button, ANY visible input, funcaptcha has children, or iframe has content
+            if (std.mem.indexOf(u8, resp, "btns=0|") == null or
+                std.mem.indexOf(u8, resp, "visible_inputs=0|") == null or
                 std.mem.indexOf(u8, resp, "children=0|") == null)
             {
-                std.debug.print("[AUDIO BYPASS] Arkose UI rendered! Elements detected.\n", .{});
+                std.debug.print("[AUDIO BYPASS] Arkose UI rendered! Interactive elements detected.\n", .{});
                 ui_ready = true;
                 break;
             }
@@ -426,11 +431,11 @@ pub fn runAudioBypass(
         std.debug.print("[AUDIO BYPASS] WARNING: Arkose UI never rendered — game-core may not load\n", .{});
     }
 
-    // CRITICAL FIX 2026-04-26: Click the "Audio challenge" button in the enforcement iframe.
-    // The button is rendered by Arkose JS and may be inside shadow DOM or have Arkose-specific classes.
-    // We use a comprehensive selector list and deep shadow DOM traversal.
-    // SOURCE: ChromeDevTools MCP live test 2026-04-25 — user clicked "Audio challenge" first,
-    //         THEN game-core iframe appeared.
+    // CRITICAL FIX 2026-04-29: Click the "Audio challenge" button in the enforcement iframe.
+    // Arkose EC UI 2.0 no longer uses .fc-* class names. Buttons are generic <button> elements
+    // identified by text content ("Audio", "Sound", "Hear challenge", speaker icons).
+    // We use class-agnostic heuristic detection with deep shadow DOM traversal.
+    // SOURCE: ChromeDevTools MCP live test — audio button detected by text/aria, not class.
     const audio_challenge_click_script =
         \\(() => {
         \\  function deepQuery(selector) {
@@ -448,7 +453,8 @@ pub fn runAudioBypass(
         \\    const txt = (el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('alt') || '').toLowerCase();
         \\    const cls = (el.className || '').toLowerCase();
         \\    const onclick = (el.getAttribute('onclick') || '').toLowerCase();
-        \\    return txt.includes('audio') || txt.includes('sound') || txt.includes('hear') ||
+        \\    // Heuristic: any interactive element mentioning audio/sound/hear/listen/speaker
+        \\    return txt.includes('audio') || txt.includes('sound') || txt.includes('hear') || txt.includes('listen') ||
         \\           cls.includes('audio') || cls.includes('sound') ||
         \\           onclick.includes('audio') || onclick.includes('sound');
         \\  }
@@ -458,7 +464,7 @@ pub fn runAudioBypass(
         \\    try {
         \\      const idoc = iframe.contentDocument;
         \\      if (idoc) {
-        \\        const ibtns = idoc.querySelectorAll('button, a, [role="button"], .fc-button, .fc-audio, .fc-audio-button, #audio');
+        \\        const ibtns = idoc.querySelectorAll('button, a, [role="button"]');
         \\        for (const b of ibtns) {
         \\          if (isAudioBtn(b)) {
         \\            b.click();
@@ -468,7 +474,7 @@ pub fn runAudioBypass(
         \\        const iAll = idoc.querySelectorAll('*');
         \\        for (const el of iAll) {
         \\          if (el.shadowRoot) {
-        \\            const sbtns = el.shadowRoot.querySelectorAll('button, a, [role="button"], .fc-button, .fc-audio, .fc-audio-button, #audio');
+        \\            const sbtns = el.shadowRoot.querySelectorAll('button, a, [role="button"]');
         \\            for (const b of sbtns) {
         \\              if (isAudioBtn(b)) {
         \\                b.click();
@@ -486,8 +492,8 @@ pub fn runAudioBypass(
         \\      return 'game-core-src:' + src;
         \\    }
         \\  }
-        \\  // Deep search in parent document including shadow DOM
-        \\  const selectors = ['button', 'a', '[role="button"]', '.fc-button', '.fc-audio', '.fc-audio-button', '#audio', '[onclick*="audio"]', '[onclick*="sound"]'];
+        \\  // Deep search in parent document including shadow DOM — class-agnostic
+        \\  const selectors = ['button', 'a', '[role="button"]', '[onclick*="audio"]', '[onclick*="sound"]'];
         \\  for (const sel of selectors) {
         \\    const els = deepQuery(sel);
         \\    for (const el of els) {
@@ -855,6 +861,48 @@ pub fn runAudioBypass(
             total_attempted + 1, target_challenges, successful, target_challenges,
         });
 
+        // DOM PROBE FIX 2026-04-29: Extract ONLY the question text from Arkose UI.
+        // Parses body.innerText to isolate the challenge question between the intro
+        // ("Press Play to listen.") and the button/input noise ("PlayType", "Submit").
+        const dom_probe_script =
+            \\(() => {
+            \\  const text = document.body.innerText;
+            \\  const startMatch = text.match(/(Press Play to listen\.|Click to listen\.|Listen carefully\.|Play to listen\.)\s*(.*)/);
+            \\  if (startMatch) {
+            \\    let rest = startMatch[2];
+            \\    const cutIdx = rest.search(/\b(PlayType|Type here\.\.\.|Submit|Visual puzzle|Restart|Done|Enter the number)\b/);
+            \\    if (cutIdx >= 0) rest = rest.slice(0, cutIdx);
+            \\    return '[ARKOSE QUESTION] ' + rest.trim();
+            \\  }
+            \\  const qMatch = text.match(/(Which\s+.*?\?|What\s+.*?\?|How\s+.*?\?)/);
+            \\  if (qMatch) return '[ARKOSE QUESTION] ' + qMatch[1].trim();
+            \\  return '[ARKOSE QUESTION] NO_QUESTION_FOUND';
+            \\})()
+        ;
+        if (game_core_ctx > 0) {
+            if (arkose_cdp.evaluateInContext(dom_probe_script, game_core_ctx)) |probe_resp| {
+                defer allocator.free(probe_resp);
+                const probe_value = browser_bridge.extractRuntimeEvaluateStringValue(allocator, probe_resp) catch null;
+                if (probe_value) |pv| {
+                    defer allocator.free(pv);
+                    std.debug.print("[AUDIO BYPASS] {s}\n", .{pv});
+                }
+            } else |probe_err| {
+                std.debug.print("[AUDIO BYPASS] DOM probe failed: {}\n", .{probe_err});
+            }
+        } else {
+            if (arkose_cdp.evaluate(dom_probe_script)) |probe_resp| {
+                defer allocator.free(probe_resp);
+                const probe_value = browser_bridge.extractRuntimeEvaluateStringValue(allocator, probe_resp) catch null;
+                if (probe_value) |pv| {
+                    defer allocator.free(pv);
+                    std.debug.print("[AUDIO BYPASS] {s}\n", .{pv});
+                }
+            } else |probe_err| {
+                std.debug.print("[AUDIO BYPASS] DOM probe failed: {}\n", .{probe_err});
+            }
+        }
+
         // Step 0.5: Activate audio mode if not already active
         if (!audio_mode_activated) {
             const MAX_AUDIO_RETRIES = 3;
@@ -866,11 +914,17 @@ pub fn runAudioBypass(
                     _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 1, .nsec = 0 }, null);
                 }
                 std.debug.print("[AUDIO BYPASS] Finding Audio puzzle button...\n", .{});
+                // FIX 2026-04-29: Class-agnostic audio button detection inside game-core iframe.
+                // Heuristic: button text/aria-label/title contains audio/sound/hear/listen.
                 const ascript =
                     \\(() => {
-                    \\  const btns = document.querySelectorAll('button');
+                    \\  function isAudioBtn(el) {
+                    \\    const txt = (el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+                    \\    return txt.includes('audio') || txt.includes('sound') || txt.includes('hear') || txt.includes('listen');
+                    \\  }
+                    \\  const btns = document.querySelectorAll('button, [role="button"]');
                     \\  for (const btn of btns) {
-                    \\    if (btn.textContent.trim().includes('Audio') && btn.offsetParent !== null) {
+                    \\    if (isAudioBtn(btn) && btn.offsetParent !== null) {
                     \\      btn.click();
                     \\      return 'clicked';
                     \\    }

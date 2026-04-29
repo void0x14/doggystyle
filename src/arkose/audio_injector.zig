@@ -88,13 +88,18 @@ pub const AUDIO_BUTTON_SELECTORS = [_][]const u8{
     "button[id*=\"audio\"]",
 };
 
-// TEXT-based audio button finder (real Arkose uses text "Audio puzzle", no aria-label)
+// TEXT-based audio button finder — class-agnostic heuristic
 // SOURCE: LIVE DOM 2026-04-25 — button text "Audio puzzle" in game-core iframe
+// FIX 2026-04-29: Expanded heuristic to catch "Sound", "Hear", "Listen" variants.
 pub const AUDIO_BTN_TEXT_MATCHER =
     \\(() => {
-    \\  const btns = document.querySelectorAll('button');
+    \\  function isAudioBtn(el) {
+    \\    const txt = (el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+    \\    return txt.includes('audio') || txt.includes('sound') || txt.includes('hear') || txt.includes('listen');
+    \\  }
+    \\  const btns = document.querySelectorAll('button, [role="button"]');
     \\  for (const btn of btns) {
-    \\    if (btn.textContent.trim().includes('Audio') && btn.offsetParent !== null) {
+    \\    if (isAudioBtn(btn) && btn.offsetParent !== null) {
     \\      btn.click();
     \\      return 'clicked_text_audio';
     \\    }
@@ -103,15 +108,20 @@ pub const AUDIO_BTN_TEXT_MATCHER =
     \\})()
 ;
 
-// ANSWER INPUT SELECTORS — real DOM: textbox "Answer field", required, type number
+// ANSWER INPUT SELECTORS — class-agnostic: any visible text/number/tel input
 // SOURCE: LIVE DOM 2026-04-25 — game-core iframe audio challenge UI
+// FIX 2026-04-29: Arkose EC UI 2.0 no longer guarantees specific aria-labels.
+// Fallback chain: specific attributes → generic visible input → ANY input.
 pub const ANSWER_INPUT_SELECTORS = [_][]const u8{
     "input[type=\"text\"]",
+    "input[type=\"number\"]",
+    "input[type=\"tel\"]",
     "input[aria-label*=\"Answer\"]",
     "input[aria-label*=\"answer\"]",
     "input[aria-label*=\"Answer field\"]",
     "input[placeholder*=\"answer\"]",
     "input[placeholder*=\"Answer\"]",
+    "input:not([type=\"hidden\"]):not([type=\"submit\"]):not([type=\"button\"])",
 };
 
 // SUBMIT BUTTON SELECTORS — real DOM: button text "Submit", game-core iframe
@@ -131,12 +141,13 @@ pub const SUBMIT_BUTTON_SELECTORS = [_][]const u8{
 
 // TEXT-based submit button finder: queries ALL interactive elements and checks
 // both .textContent (for <button>) and .value (for <input>)
+// FIX 2026-04-29: Expanded to match "Verify", "Next", "Continue", "Done" — Arkose may localize.
 pub const SUBMIT_BTN_TEXT_MATCHER =
     \\(() => {
     \\  const btns = document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]');
     \\  for (const btn of btns) {
-    \\    const txt = (btn.textContent || btn.value || '').trim();
-    \\    if (txt === 'Submit' && btn.offsetParent !== null) {
+    \\    const txt = (btn.textContent || btn.value || '').trim().toLowerCase();
+    \\    if (btn.offsetParent !== null && (txt === 'submit' || txt === 'verify' || txt === 'next' || txt === 'continue' || txt === 'done' || txt === 'go')) {
     \\      btn.click();
     \\      return 'clicked_submit';
     \\    }
@@ -197,6 +208,7 @@ pub fn findAudioButton(bridge: *browser_bridge.BrowserBridge, context_id: i64) !
     const selectors_json = try selectorsToJson(bridge.allocator, &AUDIO_BUTTON_SELECTORS);
     defer bridge.allocator.free(selectors_json);
 
+    // FIX 2026-04-29: Class-agnostic audio button detection with expanded heuristic.
     const find_script = try std.fmt.allocPrint(bridge.allocator,
         \\(() => {{
         \\  const selectors = {s};
@@ -207,10 +219,14 @@ pub fn findAudioButton(bridge: *browser_bridge.BrowserBridge, context_id: i64) !
         \\      return 'clicked_audio_' + sel;
         \\    }}
         \\  }}
-        \\  // TEXT fallback: real Arkose button has text "Audio puzzle", no aria-label
-        \\  const btns = document.querySelectorAll('button');
+        \\  // TEXT fallback: heuristic on textContent / aria-label / title
+        \\  function isAudioBtn(el) {{
+        \\    const txt = (el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+        \\    return txt.includes('audio') || txt.includes('sound') || txt.includes('hear') || txt.includes('listen');
+        \\  }}
+        \\  const btns = document.querySelectorAll('button, [role="button"]');
         \\  for (const btn of btns) {{
-        \\    if (btn.textContent.trim().includes('Audio') && btn.offsetParent !== null) {{
+        \\    if (isAudioBtn(btn) && btn.offsetParent !== null) {{
         \\      btn.click();
         \\      return 'clicked_text_Audio';
         \\    }}
@@ -413,14 +429,27 @@ pub fn injectAnswerOnTarget(
     // FIX: Use direct document selectors since contextId is the game-core execution context itself
     // FIX: Use evaluateWithTimeout / evaluateInContextWithTimeout for infinite-loop protection
 
+    // FIX 2026-04-29: Class-agnostic input detection. Try specific selectors first,
+    // fallback to any visible non-hidden input. Arkose EC UI 2.0 may use type="number".
     const answer_script = try std.fmt.allocPrint(allocator,
         \\(() => {{
-        \\  const inp = document.querySelector('input[type="text"]') || document.querySelector('input');
+        \\  const selectors = ['input[type="text"]', 'input[type="number"]', 'input[type="tel"]', 'input:not([type="hidden"]):not([type="submit"]):not([type="button"])'];
+        \\  let inp = null;
+        \\  for (const sel of selectors) {{
+        \\    inp = document.querySelector(sel);
+        \\    if (inp && inp.offsetParent !== null) break;
+        \\  }}
+        \\  if (!inp) {{
+        \\    const allInputs = document.querySelectorAll('input');
+        \\    for (const el of allInputs) {{
+        \\      if (el.offsetParent !== null && el.type !== 'hidden') {{ inp = el; break; }}
+        \\    }}
+        \\  }}
         \\  if (!inp) return 'no_input';
         \\  inp.value = {d};
         \\  inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
         \\  inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        \\  return 'filled';
+        \\  return 'filled_' + inp.tagName + (inp.type || '');
         \\}})()
     , .{answer});
     defer allocator.free(answer_script);
@@ -498,9 +527,21 @@ pub fn injectAnswerOnTarget(
     const submit_grace = std.os.linux.timespec{ .sec = 1, .nsec = 500 * std.time.ns_per_ms };
     _ = std.os.linux.nanosleep(&submit_grace, null);
 
+    // FIX 2026-04-29: Class-agnostic input detection for post-submit proof.
     const proof_script =
         \\(() => {
-        \\  const input = document.querySelector('input[type="text"]') || document.querySelector('input');
+        \\  const selectors = ['input[type="text"]', 'input[type="number"]', 'input[type="tel"]', 'input:not([type="hidden"]):not([type="submit"]):not([type="button"])'];
+        \\  let input = null;
+        \\  for (const sel of selectors) {
+        \\    input = document.querySelector(sel);
+        \\    if (input && input.offsetParent !== null) break;
+        \\  }
+        \\  if (!input) {
+        \\    const allInputs = document.querySelectorAll('input');
+        \\    for (const el of allInputs) {
+        \\      if (el.offsetParent !== null && el.type !== 'hidden') { input = el; break; }
+        \\    }
+        \\  }
         \\  const bodyText = (document.body && document.body.innerText || '');
         \\  const lower = bodyText.toLowerCase();
         \\  const wrongText = lower.includes('incorrect') || lower.includes('wrong') || lower.includes('only enter the number');

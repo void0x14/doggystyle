@@ -2445,8 +2445,32 @@ if (total_len > MTU_LIMIT) {
 
 ---
 
-*Son güncelleme: 2026-04-28*
+## [2026-04-29] — Arkose EC UI 2.0 DOM Parser .fc-* Class Bağımlılığı (CRITICAL)
+
+**Hata:** `audio_bypass.zig` UI parser'ı Arkose EC UI 2.0'ın yeni DOM yapısını ıskaladı. `wait_for_ui_script` `.fc-challenge, .fc-button, .fc-audio, .fc-audio-button, [class^="fc-"]` selectorleri kullanıyordu; bu class'lar kaldırılınca `fc=0|btns=0|children=0` dönüp `ui_ready=false`. Pipeline game-core'a hiç ulaşamadan ilerleyemiyordu. Aynı şekilde `audio_challenge_click_script` ve `injectAnswerOnTarget` da dar selectorler kullanıyordu.
+
+**Kök sebep:** Arkose Labs Enforcement Challenge UI 2.0 tamamen yeniden tasarlandı (developer docs 2021-08-25). Eski `.fc-*` (FunCaptcha) class isimleri kaldırıldı; yerine generic `<button>` ve shadow DOM container'lar geldi. Kod spesifik class isimlerine hardcoded bağımlıydı.
+
+**Kaynak:** Arkose Labs docs — "Enforce Challenge UI 2.0 is completely redesigned with a brand new UI component" (https://developer.arkoselabs.com/docs/new-enforcement-challenge-ui); canlı motor logu 2026-04-29 — `fc=0|btns=0|children=0` sürekli tekrar.
+
+**Düzeltme:**
+1. `wait_for_ui_script`: `.fc-*` bağımlılığı kaldırıldı; class-agnostic generic interactive element detection (`button`, `input`, `iframe`) kullanılıyor
+2. `audio_challenge_click_script`: `.fc-button, .fc-audio, .fc-audio-button, #audio` selectorleri kaldırıldı; text/aria-label/title heuristic'i (`audio`, `sound`, `hear`, `listen`) ile class-agnostic detection
+3. `audio_injector.zig` `ANSWER_INPUT_SELECTORS`: `input[type="number"]` ve `input[type="tel"]` eklendi; generic `input:not([type="hidden"])` fallback eklendi
+4. `injectAnswerOnTarget`: answer injection ve post-submit proof script'leri çoklu input selector fallback zinciri kullanıyor (text → number → tel → any visible input)
+5. `AUDIO_BTN_TEXT_MATCHER` ve `findAudioButton`: heuristic expanded (`audio`, `sound`, `hear`, `listen`)
+6. `SUBMIT_BTN_TEXT_MATCHER`: "Submit" yanında "Verify", "Next", "Continue", "Done" de match ediyor
+
+**Doğrulama:**
+```
+✅ vendor/zig/zig build         → exit code 0
+✅ vendor/zig/zig build test    → 169/169 test geçti
+```
+
+---
+
+*Son güncelleme: 2026-04-29*
 *Güncelleyen: void0x14 + AI audit*
-*Tetikleyen: Audio outlier engine integration audit — canlı motor 0% success rate analizi*
+*Tetikleyen: Arkose EC UI 2.0 DOM yapısı değişikliği — audio bypass parser class bağımlılığı*
 
 ---
