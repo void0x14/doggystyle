@@ -2,6 +2,23 @@
 
 ---
 
+## [2026-04-30] — Metadata Parse Fragility: ffprobe Line Position ve 0ch/0bit Hatası
+
+**Hata:** Eski `audio_decoder.zig` kodunda ffprobe çıktısı `-of default=noprint_wrappers=1:nokey=1` ile sabit satır pozisyonuna göre parse ediliyordu (`lines.next()` sırasıyla sample_rate, bit_depth, channels, duration). Sonrasında key=value formatına geçilse de `bits_per_sample=0` (MP3), `N/A` (bazı versiyonlar), eksik alanlar ve `sample_rate` assert (yalnızca 44100/22050/16000 kabul ediyordu) nedeniyle fragility devam etti. Farklı sample_rate (örn. 48000 WAV) crash, MP3 `bits_per_sample=0` durumu ise loglarda "0bit" olarak yansıdı.
+
+**Kök sebep:** Lossy formatlar (MP3, AAC, OGG) için ffprobe `bits_per_sample=0` döndürür; bu formatlarda bit depth anlamsızdır. Bazı ffprobe versiyonları `N/A` veya alanı tamamen atlayabilir. `sample_rate` assert ise yalnızca 3 sabit değer kabul ederek diğer tüm geçerli sample rate'leri (48000, 32000 vb.) crash'e zorluyordu.
+
+**Kaynak:** man ffprobe — `-show_entries stream` behavior; lossy codec bit depth semantics; canlı test 2026-04-30 (MP3: `bits_per_sample=0`, 48kHz WAV: `sample_rate=48000`)
+
+**Düzeltme:**
+1. `parseAudioMetadataOutput`: `=` içermeyen satırları `continue` ile atla (eski `InvalidMetadata` yerine).
+2. `bits_per_sample`: `"0"`, `"N/A"`, parse-fail durumlarında `null` bırak, `orelse 16` fallback uygula.
+3. `sample_rate` assert kaldırıldı; yerine `parsed_sample_rate > 0`, `parsed_channels > 0`, `parsed_duration_seconds >= 0.0` runtime assert'leri eklendi.
+4. `convertToPcmF32` içindeki `sample_rate` assert `> 0` olarak genişletildi.
+5. 4 yeni regresyon testi eklendi: `ffprobe MP3 0ch/0bit tolerance`, `ffprobe N/A bit_depth tolerance`, `ffprobe 48kHz sample_rate tolerance`, `ffprobe missing bits_per_sample fallback`. Tümü geçiyor.
+
+---
+
 ## [2026-04-28] — Arkose Audio Outlier VAD Düşük SNR Segmentlerini Reddetti
 
 **Hata:** Canlı audio bypass yeni `analyzeOutlier()` yoluna geçti ama her denemede `error.NoActiveSignal` döndü; motor cevap üretemedi.

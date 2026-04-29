@@ -48,6 +48,7 @@ fn readMonotonicNs() u64 {
         @as(u64, @intCast(ts.nsec));
 }
 
+// SOURCE: man ffprobe — key=value output with optional/missing fields for lossy formats
 fn parseAudioMetadataOutput(output: []const u8, file_path: []const u8) !AudioMetadata {
     var sample_rate: ?u32 = null;
     var bit_depth: ?u8 = null;
@@ -59,31 +60,34 @@ fn parseAudioMetadataOutput(output: []const u8, file_path: []const u8) !AudioMet
         const trimmed = mem.trim(u8, line, " \n\r");
         if (trimmed.len == 0) continue;
 
-        const eq_index = mem.indexOfScalar(u8, trimmed, '=') orelse return error.InvalidMetadata;
+        const eq_index = mem.indexOfScalar(u8, trimmed, '=') orelse continue;
         const key = mem.trim(u8, trimmed[0..eq_index], " \n\r");
         const value = mem.trim(u8, trimmed[eq_index + 1 ..], " \n\r");
 
         if (mem.eql(u8, key, "sample_rate")) {
-            sample_rate = try std.fmt.parseInt(u32, value, 10);
+            sample_rate = std.fmt.parseInt(u32, value, 10) catch continue;
         } else if (mem.eql(u8, key, "bits_per_sample")) {
-            bit_depth = try std.fmt.parseInt(u8, value, 10);
+            if (value.len > 0 and !mem.eql(u8, value, "N/A") and !mem.eql(u8, value, "0")) {
+                bit_depth = std.fmt.parseInt(u8, value, 10) catch null;
+            }
         } else if (mem.eql(u8, key, "channels")) {
-            channels = try std.fmt.parseInt(u8, value, 10);
+            channels = std.fmt.parseInt(u8, value, 10) catch continue;
         } else if (mem.eql(u8, key, "duration")) {
-            duration_seconds = try std.fmt.parseFloat(f64, value);
+            duration_seconds = std.fmt.parseFloat(f64, value) catch continue;
         }
     }
 
     const parsed_sample_rate = sample_rate orelse return error.InvalidMetadata;
-    const parsed_bit_depth = bit_depth orelse return error.InvalidMetadata;
     const parsed_channels = channels orelse return error.InvalidMetadata;
     const parsed_duration_seconds = duration_seconds orelse return error.InvalidMetadata;
 
-    std.debug.assert(parsed_sample_rate == 44100 or parsed_sample_rate == 22050 or parsed_sample_rate == 16000);
+    std.debug.assert(parsed_sample_rate > 0);
+    std.debug.assert(parsed_channels > 0);
+    std.debug.assert(parsed_duration_seconds >= 0.0);
 
     return AudioMetadata{
         .sample_rate = parsed_sample_rate,
-        .bit_depth = parsed_bit_depth,
+        .bit_depth = bit_depth orelse 16,
         .channels = parsed_channels,
         .duration_seconds = parsed_duration_seconds,
         .format = detectFormat(file_path),
@@ -122,7 +126,7 @@ pub fn probeAudioMetadata(allocator: std.mem.Allocator, io: Io, file_path: []con
 
 // SOURCE: man ffmpeg — pcm_f32le encoder writes 32-bit float PCM in little-endian
 pub fn convertToPcmF32(allocator: std.mem.Allocator, io: Io, input_path: []const u8, sample_rate: u32) !DecodedClip {
-    std.debug.assert(sample_rate == 44100 or sample_rate == 22050 or sample_rate == 16000);
+    std.debug.assert(sample_rate > 0);
 
     const ts = readMonotonicNs();
     const output_path = try std.fmt.allocPrint(allocator, "/tmp/audio_convert_{d}.f32", .{ts});
@@ -284,14 +288,14 @@ test "audio_decoder: ffprobe key=value output parses by key not line position" {
     const sample_output =
         "sample_rate=44100\n" ++
         "channels=1\n" ++
-        "bits_per_sample=0\n" ++
+        "bits_per_sample=8\n" ++
         "duration=14.497937\n";
 
     const metadata = try parseAudioMetadataOutput(sample_output, "/tmp/test.mp3");
 
     try std.testing.expectEqual(@as(u32, 44100), metadata.sample_rate);
     try std.testing.expectEqual(@as(u8, 1), metadata.channels);
-    try std.testing.expectEqual(@as(u8, 0), metadata.bit_depth);
+    try std.testing.expectEqual(@as(u8, 8), metadata.bit_depth);
     try std.testing.expectApproxEqAbs(@as(f64, 14.497937), metadata.duration_seconds, 0.000001);
     try std.testing.expectEqualStrings("mp3", metadata.format);
 }
@@ -318,4 +322,56 @@ test "audio_decoder: save and load f32 round-trip" {
     for (&original, loaded) |orig, ld| {
         try std.testing.expectEqual(orig, ld);
     }
+}
+
+test "audio_decoder: ffprobe MP3 0ch/0bit tolerance" {
+    const mp3_output =
+        "sample_rate=44100\n" ++
+        "channels=1\n" ++
+        "bits_per_sample=0\n" ++
+        "duration=15.464437\n";
+
+    const metadata = try parseAudioMetadataOutput(mp3_output, "/tmp/test.mp3");
+    try std.testing.expectEqual(@as(u32, 44100), metadata.sample_rate);
+    try std.testing.expectEqual(@as(u8, 1), metadata.channels);
+    try std.testing.expectEqual(@as(u8, 16), metadata.bit_depth);
+    try std.testing.expectApproxEqAbs(@as(f64, 15.464437), metadata.duration_seconds, 0.000001);
+}
+
+test "audio_decoder: ffprobe N/A bit_depth tolerance" {
+    const na_output =
+        "sample_rate=22050\n" ++
+        "channels=2\n" ++
+        "bits_per_sample=N/A\n" ++
+        "duration=12.000000\n";
+
+    const metadata = try parseAudioMetadataOutput(na_output, "/tmp/test.aac");
+    try std.testing.expectEqual(@as(u32, 22050), metadata.sample_rate);
+    try std.testing.expectEqual(@as(u8, 2), metadata.channels);
+    try std.testing.expectEqual(@as(u8, 16), metadata.bit_depth);
+}
+
+test "audio_decoder: ffprobe 48kHz sample_rate tolerance" {
+    const wav_output =
+        "sample_rate=48000\n" ++
+        "channels=1\n" ++
+        "bits_per_sample=16\n" ++
+        "duration=1.000000\n";
+
+    const metadata = try parseAudioMetadataOutput(wav_output, "/tmp/test.wav");
+    try std.testing.expectEqual(@as(u32, 48000), metadata.sample_rate);
+    try std.testing.expectEqual(@as(u8, 1), metadata.channels);
+    try std.testing.expectEqual(@as(u8, 16), metadata.bit_depth);
+}
+
+test "audio_decoder: ffprobe missing bits_per_sample fallback" {
+    const missing_output =
+        "sample_rate=16000\n" ++
+        "channels=1\n" ++
+        "duration=3.500000\n";
+
+    const metadata = try parseAudioMetadataOutput(missing_output, "/tmp/test.ogg");
+    try std.testing.expectEqual(@as(u32, 16000), metadata.sample_rate);
+    try std.testing.expectEqual(@as(u8, 1), metadata.channels);
+    try std.testing.expectEqual(@as(u8, 16), metadata.bit_depth);
 }
