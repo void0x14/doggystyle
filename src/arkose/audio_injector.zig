@@ -429,18 +429,26 @@ pub fn injectAnswerOnTarget(
     // FIX: Use direct document selectors since contextId is the game-core execution context itself
     // FIX: Use evaluateWithTimeout / evaluateInContextWithTimeout for infinite-loop protection
 
-    // FIX 2026-04-29: Class-agnostic input detection. Try specific selectors first,
-    // fallback to any visible non-hidden input. Arkose EC UI 2.0 may use type="number".
+    // FIX 2026-04-30: game-core iframe is same-origin with enforcement iframe.
+    // Access contentDocument directly — no CDP contextId needed.
     const answer_script = try std.fmt.allocPrint(allocator,
         \\(() => {{
+        \\  let doc = document;
+        \\  const gc = document.querySelector('iframe[src*="game-core"]');
+        \\  if (gc) {{
+        \\    try {{
+        \\      const d = gc.contentDocument;
+        \\      if (d && d.body) doc = d;
+        \\    }} catch(e) {{}}
+        \\  }}
         \\  const selectors = ['input[type="text"]', 'input[type="number"]', 'input[type="tel"]', 'input:not([type="hidden"]):not([type="submit"]):not([type="button"])'];
         \\  let inp = null;
         \\  for (const sel of selectors) {{
-        \\    inp = document.querySelector(sel);
+        \\    inp = doc.querySelector(sel);
         \\    if (inp && inp.offsetParent !== null) break;
         \\  }}
         \\  if (!inp) {{
-        \\    const allInputs = document.querySelectorAll('input');
+        \\    const allInputs = doc.querySelectorAll('input');
         \\    for (const el of allInputs) {{
         \\      if (el.offsetParent !== null && el.type !== 'hidden') {{ inp = el; break; }}
         \\    }}
@@ -463,9 +471,16 @@ pub fn injectAnswerOnTarget(
 
     const submit_script = try std.fmt.allocPrint(allocator,
         \\(() => {{
+        \\  let doc = document;
+        \\  const gc = document.querySelector('iframe[src*="game-core"]');
+        \\  if (gc) {{
+        \\    try {{
+        \\      const d = gc.contentDocument;
+        \\      if (d && d.body) doc = d;
+        \\    }} catch(e) {{}}
+        \\  }}
         \\  // Primary: <button>Submit</button> (no type attr) or <input type="submit" value="Submit">
-        \\  // We search BOTH button and input[type="submit"] and match by visible text.
-        \\  const allBtns = document.querySelectorAll('button, input[type="submit"]');
+        \\  const allBtns = doc.querySelectorAll('button, input[type="submit"]');
         \\  for (const bt of allBtns) {{
         \\    const txt = (bt.textContent || bt.value || '').trim();
         \\    if (txt === 'Submit' && bt.offsetParent !== null && !bt.disabled) {{
@@ -473,20 +488,20 @@ pub fn injectAnswerOnTarget(
         \\      return 'clicked_text_submit';
         \\    }}
         \\  }}
-        \\  // Fallback 1: generic input[type="submit"] (catches value-less or non-Submit text)
-        \\  const inpSubmit = document.querySelector('input[type="submit"]');
+        \\  // Fallback 1: generic input[type="submit"]
+        \\  const inpSubmit = doc.querySelector('input[type="submit"]');
         \\  if (inpSubmit && inpSubmit.offsetParent !== null && !inpSubmit.disabled) {{
         \\    inpSubmit.click();
         \\    return 'clicked_input_submit';
         \\  }}
         \\  // Fallback 2: button[type="submit"]
-        \\  const btn = document.querySelector('button[type="submit"]');
+        \\  const btn = doc.querySelector('button[type="submit"]');
         \\  if (btn && btn.offsetParent !== null && !btn.disabled) {{
         \\    btn.click();
         \\    return 'clicked_type_submit';
         \\  }}
         \\  // Fallback 3: ANY interactive element with submit/verify/next text
-        \\  const btns = document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]');
+        \\  const btns = doc.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]');
         \\  for (const bt of btns) {{
         \\    const txt = (bt.textContent || bt.value || '').trim().toLowerCase();
         \\    if (bt.offsetParent !== null && !bt.disabled && (txt.includes('submit') || txt.includes('verify') || txt.includes('next'))) {{
@@ -530,19 +545,27 @@ pub fn injectAnswerOnTarget(
     // FIX 2026-04-29: Class-agnostic input detection for post-submit proof.
     const proof_script =
         \\(() => {
+        \\  let doc = document;
+        \\  const gc = document.querySelector('iframe[src*="game-core"]');
+        \\  if (gc) {
+        \\    try {
+        \\      const d = gc.contentDocument;
+        \\      if (d && d.body) doc = d;
+        \\    } catch(e) {}
+        \\  }
         \\  const selectors = ['input[type="text"]', 'input[type="number"]', 'input[type="tel"]', 'input:not([type="hidden"]):not([type="submit"]):not([type="button"])'];
         \\  let input = null;
         \\  for (const sel of selectors) {
-        \\    input = document.querySelector(sel);
+        \\    input = doc.querySelector(sel);
         \\    if (input && input.offsetParent !== null) break;
         \\  }
         \\  if (!input) {
-        \\    const allInputs = document.querySelectorAll('input');
+        \\    const allInputs = doc.querySelectorAll('input');
         \\    for (const el of allInputs) {
         \\      if (el.offsetParent !== null && el.type !== 'hidden') { input = el; break; }
         \\    }
         \\  }
-        \\  const bodyText = (document.body && document.body.innerText || '');
+        \\  const bodyText = (doc.body && doc.body.innerText || '');
         \\  const lower = bodyText.toLowerCase();
         \\  const wrongText = lower.includes('incorrect') || lower.includes('wrong') || lower.includes('only enter the number');
         \\  const completionText = lower.includes('verification complete') || lower.includes('challenge complete') || lower.includes('you are all set') || lower.includes("you're all set");

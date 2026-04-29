@@ -576,10 +576,11 @@ pub const CdpClient = struct {
 
     /// Enable Runtime domain to receive execution context events
     /// SOURCE: CDP spec — Runtime.enable sends Runtime.executionContextCreated events
-    pub fn runtimeEnable(self: *CdpClient) ![]u8 {
+    pub fn runtimeEnable(self: *CdpClient) !void {
         std.debug.print("[CDP] Runtime.enable — requesting execution context events\n", .{});
         const response = try self.sendCommand("Runtime.enable", "{}");
-        return response;
+        defer self.allocator.free(response);
+        try ensureCdpCommandSucceeded(self.allocator, "Runtime.enable", response);
     }
 
     pub fn setReceiveTimeoutMs(self: *CdpClient, timeout_ms: u64) void {
@@ -4324,6 +4325,34 @@ test "sendCommand: ignores event messages with nested id before matching top-lev
     defer allocator.free(response);
 
     try std.testing.expectEqualStrings(reply_message, response);
+}
+
+test "runtimeEnable: does not leak command response" {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
+    if (rc == std.math.maxInt(usize)) return error.SocketFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const allocator = std.testing.allocator;
+    var client = CdpClient{
+        .fd = fds[0],
+        .allocator = allocator,
+        .msg_id = 0,
+        .pending_events = std.array_list.Managed([]u8).init(allocator),
+    };
+    defer {
+        for (client.pending_events.items) |event| allocator.free(event);
+        client.pending_events.deinit();
+    }
+
+    const reply_message =
+        "{\"id\":1,\"result\":{}}";
+    var reply_header: [2]u8 = .{ WS_FIN_BIT | WS_OPCODE_TEXT, @intCast(reply_message.len) };
+    try writeAll(fds[1], &reply_header, reply_header.len);
+    try writeAll(fds[1], reply_message.ptr, reply_message.len);
+
+    _ = try client.runtimeEnable();
 }
 
 test "recvWsTextAlloc: handles ping frame and returns correct text message" {

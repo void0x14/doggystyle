@@ -861,24 +861,87 @@ pub fn runAudioBypass(
             total_attempted + 1, target_challenges, successful, target_challenges,
         });
 
-        // DOM PROBE FIX 2026-04-29: Extract ONLY the question text from Arkose UI.
-        // Parses body.innerText to isolate the challenge question between the intro
-        // ("Press Play to listen.") and the button/input noise ("PlayType", "Submit").
-        const dom_probe_script =
-            \\(() => {
-            \\  const text = document.body.innerText;
-            \\  const startMatch = text.match(/(Press Play to listen\.|Click to listen\.|Listen carefully\.|Play to listen\.)\s*(.*)/);
-            \\  if (startMatch) {
-            \\    let rest = startMatch[2];
-            \\    const cutIdx = rest.search(/\b(PlayType|Type here\.\.\.|Submit|Visual puzzle|Restart|Done|Enter the number)\b/);
-            \\    if (cutIdx >= 0) rest = rest.slice(0, cutIdx);
-            \\    return '[ARKOSE QUESTION] ' + rest.trim();
-            \\  }
-            \\  const qMatch = text.match(/(Which\s+.*?\?|What\s+.*?\?|How\s+.*?\?)/);
-            \\  if (qMatch) return '[ARKOSE QUESTION] ' + qMatch[1].trim();
-            \\  return '[ARKOSE QUESTION] NO_QUESTION_FOUND';
-            \\})()
-        ;
+    // DOM PROBE FIX 2026-04-30: Extract question text from Arkose Audio Challenge.
+    // WIRE-TRUTH (ChromeDevTools MCP live test):
+    //   - game-core iframe body.innerText contains:
+    //     "Press Play to listen. Which option is the odd animal out? Enter the number..."
+    //   - game-core iframe shares origin with enforcement iframe (github-api.arkoselabs.com)
+    //   - contentDocument access WORKS from enforcement iframe to game-core iframe
+    //   - Question lives in body.innerText AND button aria-label/description
+    //   - Shadow DOM not used for question text in game-core 1.34.1
+    // SOURCE: ChromeDevTools MCP live DOM snapshot 2026-04-30
+    const dom_probe_script =
+        \\(() => {
+        \\  // CRITICAL FIX: Access game-core iframe contentDocument directly.
+        \\  // game-core iframe is same-origin with enforcement iframe,
+        \\  // so contentDocument is accessible without CDP contextId.
+        \\  let targetDoc = document;
+        \\  const gc = document.querySelector('iframe[src*="game-core"]');
+        \\  if (gc) {
+        \\    try {
+        \\      const doc = gc.contentDocument;
+        \\      if (doc && doc.body) targetDoc = doc;
+        \\    } catch(e) {}
+        \\  }
+        \\  function deepText(root) {
+        \\    const texts = [];
+        \\    const walk = (node) => {
+        \\      if (node.shadowRoot) walk(node.shadowRoot);
+        \\      if (node.nodeType === Node.TEXT_NODE) {
+        \\        const t = node.textContent.trim();
+        \\        if (t.length > 3) texts.push(t);
+        \\      }
+        \\      for (const child of node.childNodes) walk(child);
+        \\    };
+        \\    walk(root);
+        \\    return texts.join(' ');
+        \\  }
+        \\  function getAriaContent(root) {
+        \\    const texts = [];
+        \\    const walk = (node) => {
+        \\      if (node.shadowRoot) walk(node.shadowRoot);
+        \\      if (node.getAttribute) {
+        \\        const al = node.getAttribute('aria-label');
+        \\        if (al && al.trim().length > 3) texts.push(al.trim());
+        \\        const desc = node.getAttribute('aria-describedby');
+        \\        if (desc) {
+        \\          const el = document.getElementById(desc);
+        \\          if (el && el.textContent) texts.push(el.textContent.trim());
+        \\        }
+        \\      }
+        \\      for (const child of node.childNodes) walk(child);
+        \\    };
+        \\    walk(root);
+        \\    return texts.join(' ');
+        \\  }
+        \\  if (!targetDoc.body) return '[ARKOSE QUESTION] NO_QUESTION_FOUND | DEBUG: no targetDoc.body';
+        \\  const bodyText = targetDoc.body.innerText || '';
+        \\  const deep = deepText(targetDoc.body);
+        \\  const aria = getAriaContent(targetDoc.body);
+        \\  const combined = (bodyText + ' ' + deep + ' ' + aria).replace(/\s+/g, ' ').trim();
+        \\  if (combined.length === 0) return '[ARKOSE QUESTION] NO_QUESTION_FOUND | DEBUG: all text empty';
+        \\  const patterns = [
+        \\    /(?:Press Play to listen\.?|Click to listen\.?|Listen carefully\.?|Play to listen\.?|Press the play button)\s*[.:]?\s*(Which[^.?]*(?:\?|\.))/i,
+        \\    /(?:Press Play to listen\.?|Click to listen\.?|Listen carefully\.?|Play to listen\.?|Press the play button)\s*[.:]?\s*(What[^.?]*(?:\?|\.))/i,
+        \\    /(?:Press Play to listen\.?|Click to listen\.?|Listen carefully\.?|Play to listen\.?|Press the play button)\s*[.:]?\s*(How[^.?]*(?:\?|\.))/i,
+        \\    /(Which\s+[^.?]*(?:\?|\.))/i,
+        \\    /(What\s+[^.?]*(?:\?|\.))/i,
+        \\    /(How\s+[^.?]*(?:\?|\.))/i,
+        \\    /(Select\s+[^.?]*(?:\?|\.))/i,
+        \\    /(Choose\s+[^.?]*(?:\?|\.))/i,
+        \\    /(Identify\s+[^.?]*(?:\?|\.))/i,
+        \\    /(Find\s+[^.?]*(?:\?|\.))/i,
+        \\  ];
+        \\  for (const pat of patterns) {
+        \\    const m = combined.match(pat);
+        \\    if (m && m[1]) {
+        \\      const q = m[1].trim();
+        \\      if (q.length > 5) return '[ARKOSE QUESTION] ' + q;
+        \\    }
+        \\  }
+        \\  return '[ARKOSE QUESTION] NO_QUESTION_FOUND | DEBUG_LEN=' + combined.length + ' | DEBUG_TEXT=' + combined.substring(0, 400);
+        \\})()
+    ;
         if (game_core_ctx > 0) {
             if (arkose_cdp.evaluateInContext(dom_probe_script, game_core_ctx)) |probe_resp| {
                 defer allocator.free(probe_resp);
@@ -918,11 +981,23 @@ pub fn runAudioBypass(
                 // Heuristic: button text/aria-label/title contains audio/sound/hear/listen.
                 const ascript =
                     \\(() => {
+                    \\  let doc = document;
+                    \\  const gc = document.querySelector('iframe[src*="game-core"]');
+                    \\  if (gc) {
+                    \\    try {
+                    \\      const d = gc.contentDocument;
+                    \\      if (d && d.body) doc = d;
+                    \\    } catch(e) {}
+                    \\  }
+                    \\  // CRITICAL: If audio challenge UI already present (input+submit), no need to click Audio puzzle button.
+                    \\  const hasInput = !!doc.querySelector('input[type="text"], input[type="number"]');
+                    \\  const hasSubmit = !!doc.querySelector('button, input[type="submit"]');
+                    \\  if (hasInput && hasSubmit) return 'already_in_audio_mode';
                     \\  function isAudioBtn(el) {
                     \\    const txt = (el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
                     \\    return txt.includes('audio') || txt.includes('sound') || txt.includes('hear') || txt.includes('listen');
                     \\  }
-                    \\  const btns = document.querySelectorAll('button, [role="button"]');
+                    \\  const btns = doc.querySelectorAll('button, [role="button"]');
                     \\  for (const btn of btns) {
                     \\    if (isAudioBtn(btn) && btn.offsetParent !== null) {
                     \\      btn.click();
@@ -936,13 +1011,13 @@ pub fn runAudioBypass(
                     if (arkose_cdp.evaluateInContext(ascript, game_core_ctx)) |resp| {
                         defer allocator.free(resp);
                         std.debug.print("[AUDIO BYPASS] Audio button response (game-core ctx={d}): {s}\n", .{ game_core_ctx, resp[0..@min(resp.len, 200)] });
-                        if (std.mem.indexOf(u8, resp, "clicked") != null) audio_clicked = true;
+                        if (std.mem.indexOf(u8, resp, "clicked") != null or std.mem.indexOf(u8, resp, "already_in_audio_mode") != null) audio_clicked = true;
                     } else |_| {}
                 } else {
                     if (arkose_cdp.evaluate(ascript)) |resp| {
                         defer allocator.free(resp);
                         std.debug.print("[AUDIO BYPASS] Audio button response: {s}\n", .{resp[0..@min(resp.len, 200)]});
-                        if (std.mem.indexOf(u8, resp, "clicked") != null) audio_clicked = true;
+                        if (std.mem.indexOf(u8, resp, "clicked") != null or std.mem.indexOf(u8, resp, "already_in_audio_mode") != null) audio_clicked = true;
                     } else |_| {}
                 }
             }

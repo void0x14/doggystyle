@@ -2,6 +2,18 @@
 
 ---
 
+## [2026-04-30] — CDP Runtime.enable Yanıtı Serbest Bırakılmadı, Canlı Retries Leak Üretti
+
+**Hata:** Canlı motor `sudo ./zig-out/bin/siege_engine enp37s0` sonunda `DebugAllocator` bellek sızıntısı raporladı. Leak stack'i `src/browser_bridge.zig:581` `runtimeEnable()` -> `sendCommand()` -> `recvWsTextAlloc()` zincirini gösterdi. Her Arkose audio bypass retry'si yeni bir `Runtime.enable` response buffer'ı bırakıyordu.
+
+**Kök sebep:** `CdpClient.runtimeEnable()` `sendCommand("Runtime.enable", "{}")` dönüşünü `[]u8` olarak aynen çağırana veriyor, ama call site `arkose_cdp.runtimeEnable()` sonucunu `_ = ...` ile yok sayıyordu. Böylece `recvWsTextAlloc()` içindeki `ArrayList.toOwnedSlice()` ile alınan WebSocket mesaj buffer'ı hiç `free` edilmiyordu.
+
+**Kaynak:** Zig 0.16.0 dokümantasyonu — `std.testing.allocator` / `DebugAllocator` leak detection; canlı run kanıtı `/home/void0x14/.local/share/opencode/tool-output/tool_ddb48a137001QFTIBrHh441ZYy`; kaynak kod `src/browser_bridge.zig:579-583`.
+
+**Düzeltme:** `runtimeEnable()` imzası `!void` yapıldı. CDP response artık fonksiyon içinde `defer self.allocator.free(response);` ile serbest bırakılıyor ve `ensureCdpCommandSucceeded()` ile doğrulanıyor. Regresyon testi eklendi: `runtimeEnable: does not leak command response`.
+
+---
+
 ## [2026-04-30] — Metadata Parse Fragility: ffprobe Line Position ve 0ch/0bit Hatası
 
 **Hata:** Eski `audio_decoder.zig` kodunda ffprobe çıktısı `-of default=noprint_wrappers=1:nokey=1` ile sabit satır pozisyonuna göre parse ediliyordu (`lines.next()` sırasıyla sample_rate, bit_depth, channels, duration). Sonrasında key=value formatına geçilse de `bits_per_sample=0` (MP3), `N/A` (bazı versiyonlar), eksik alanlar ve `sample_rate` assert (yalnızca 44100/22050/16000 kabul ediyordu) nedeniyle fragility devam etti. Farklı sample_rate (örn. 48000 WAV) crash, MP3 `bits_per_sample=0` durumu ise loglarda "0bit" olarak yansıdı.
