@@ -45,6 +45,7 @@ pub const AudioDownloaderError = error{
     Base64DecodeFailed,
     GameTokenNotFound,
     FetchFailed,
+    EncryptedJsonAudioPayload,
 };
 
 // ---------------------------------------------------------------------------
@@ -579,6 +580,12 @@ fn buildQueuedAudioFetchExpression(
     , .{ AUDIO_FETCH_QUEUE_KEY, game_token, challenge_str, session_token });
 }
 
+fn looksLikeEncryptedJsonAudioPayload(bytes: []const u8) bool {
+    return mem.startsWith(u8, bytes, "{\"ct\":\"") and
+        mem.indexOf(u8, bytes, "\",\"iv\":\"") != null and
+        mem.indexOf(u8, bytes, "\",\"s\":\"") != null;
+}
+
 pub fn fetchAudioViaCdpEvaluate(
     cdp: *browser_bridge.CdpClient,
     allocator: std.mem.Allocator,
@@ -629,6 +636,14 @@ pub fn fetchAudioViaCdpEvaluate(
         std.debug.print("[AUDIO] Base64 decode failed: {}\n", .{err});
         return error.Base64DecodeFailed;
     };
+
+    if (looksLikeEncryptedJsonAudioPayload(mp3_data)) {
+        std.debug.print(
+            "[AUDIO] rtag/audio returned encrypted JSON payload, not direct MP3. Decrypt path unverified; aborting this challenge safely.\n",
+            .{},
+        );
+        return error.EncryptedJsonAudioPayload;
+    }
 
     const path = try saveAudioDataToDisk(allocator, mp3_data, challenge_index);
     errdefer allocator.free(path);

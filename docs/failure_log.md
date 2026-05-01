@@ -2,6 +2,18 @@
 
 ---
 
+## [2026-05-01] — Arkose Audio Segment Extractor Sert Speech Cutoff ile Gerçek Hayvan Kliplerini Attı
+
+**Hata:** `extractThreeLargestSegments()` bazı gerçek Arkose dosyalarında üçüncü hayvan klibi yerine 180ms/390ms kırpıntılar seçiyordu; hatta sentetik announcer+3-klip testinde hiç segment döndüremiyordu.
+
+**Kök sebep:** Extractor, frame-level `centroid >= speech_centroid_cutoff_hz` sert filtresiyle yalnız "animal frame" toplamaya çalışıyordu. Bu tasarım düşük-centroid veya speech'e yakın hayvan kliplerini aday olmadan önce eliyordu. Böylece geç gelen gerçek klipler düşüyor, kalan kısa parçalar üçüncü klip diye seçilebiliyordu.
+
+**Kaynak:** `src/audio/fft_analyzer.zig` eski `extractThreeLargestSegments` uygulaması; canlı dosya kanıtı `tmp/audio_challenge_1777644017_0.f32`; regression test `fft_analyzer: real Arkose file keeps late third animal clip`; build doğrulaması `vendor/zig/zig test src/audio/fft_analyzer.zig`.
+
+**Düzeltme:** Frame-level sert speech elemesi kaldırıldı. Yeni akış: tüm aktif segment adaylarını enerjiyle topla, kısa sessizlik boşluklarını birleştir, segment-level centroid/speech penalty hesapla, 3'ten fazla aday varsa tüm 3'lü kombinasyonları skorlayıp en iyi üçlüyü seç.
+
+---
+
 ## [2026-04-30] — CDP Runtime.enable Yanıtı Serbest Bırakılmadı, Canlı Retries Leak Üretti
 
 **Hata:** Canlı motor `sudo ./zig-out/bin/siege_engine enp37s0` sonunda `DebugAllocator` bellek sızıntısı raporladı. Leak stack'i `src/browser_bridge.zig:581` `runtimeEnable()` -> `sendCommand()` -> `recvWsTextAlloc()` zincirini gösterdi. Her Arkose audio bypass retry'si yeni bir `Runtime.enable` response buffer'ı bırakıyordu.

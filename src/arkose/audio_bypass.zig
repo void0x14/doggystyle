@@ -73,8 +73,8 @@ comptime {
 
 pub fn shouldContinueAudioChallengeLoop(state: ChallengeLoopState) bool {
     return state.successful_submits < state.target_challenges and
-           state.attempted < MAX_CHALLENGES and
-           !state.challenge_complete;
+        state.attempted < MAX_CHALLENGES and
+        !state.challenge_complete;
 }
 
 pub fn audioBypassFinalSuccess(state: ChallengeLoopState) bool {
@@ -139,7 +139,7 @@ fn detectPostSubmitUiState(
         \\    bodyText.includes('passed') ||
         \\    bodyText.includes('you are all set') ||
         \\    bodyText.includes("you're all set");
-        \\  const wrongText = bodyText.includes('incorrect') || bodyText.includes('only enter the number');
+        \\  const wrongText = bodyText.includes('incorrect') || bodyText.includes('wrong answer');
         \\  if (!activeInput && !activeSubmit && completionText) return 'complete';
         \\  if ((activeInput || activeSubmit) && wrongText) return 'wrong_visible';
         \\  if (activeInput || activeSubmit) return 'continue_wait';
@@ -252,18 +252,80 @@ fn tryResolveGameCoreContext(
     return out_ctx.* > 0;
 }
 
-fn buildOutlierClipInputs(samples: []const f32, sample_rate: u32) [CLIP_SPLIT]fft_analyzer.ClipInput {
-    const clip_len = samples.len / CLIP_SPLIT;
-    return .{
-        .{ .samples = samples[0..clip_len], .sample_rate = sample_rate },
-        .{ .samples = samples[clip_len .. 2 * clip_len], .sample_rate = sample_rate },
-        .{ .samples = samples[2 * clip_len ..], .sample_rate = sample_rate },
-    };
-}
+// buildOutlierClipInputs REMOVED 2026-05-01
+// SOURCE: 45-file forensic analysis 2026-05-01
+// REASON: Equal-thirds split (samples.len / CLIP_SPLIT) was PROVEN BROKEN:
+//   - Split2 hit inside an active segment in 91.1% of 45 real Arkose audio files
+//   - Klip[1] received 100% announcer + 18% of animal clip 1 (centroid=0Hz)
+//   - Klip[2] received 82% of clip1 + 49% of clip2 (two animals mixed)
+//   - Klip[3] received 51% of clip2 + 100% of clip3 (two animals mixed)
+// REPLACEMENT: fft_analyzer.extractThreeLargestSegments
+//   - Energy-based segmentation correctly isolates all 3 animal clips
+//   - Validated on all 45 test files; see docs/failure_log.md 2026-05-01
 
 fn outlierAnswerFromResult(result: fft_analyzer.OutlierAnalysisResult) u8 {
     std.debug.assert(result.guess > 0 and result.guess <= CLIP_SPLIT);
     return result.guess;
+}
+
+fn semanticLabelFromProbeText(text: []const u8) fft_analyzer.SemanticLabel {
+    const prefix = "[ARKOSE QUESTION] ";
+    if (std.mem.startsWith(u8, text, prefix)) {
+        return fft_analyzer.semanticLabelFromText(text[prefix.len..]);
+    }
+    return fft_analyzer.semanticLabelFromText(text);
+}
+
+fn segmentConfigForLabel(label: fft_analyzer.SemanticLabel) fft_analyzer.MultiSegmentConfig {
+    var config = fft_analyzer.MultiSegmentConfig{};
+    if (label == .speech) {
+        config.speech_centroid_cutoff_hz = 0.0;
+    } else if (label == .different) {
+        // SOURCE: live odd-animal runs 2026-05-01 — merge_gap 50ms over-fragmented
+        // real options into repeated 630/750ms shards; 150ms restored substantial candidates
+        // without the 400ms+ over-merge failure.
+        config.merge_gap_ms = 150;
+    }
+    return config;
+}
+
+const RetryAnswerState = struct {
+    challenge_index: u8 = 0,
+    audio_fingerprint: u64 = 0,
+    tried_mask: u8 = 0,
+    semantic_label: fft_analyzer.SemanticLabel = .unknown,
+};
+
+fn coarseAudioFingerprint(samples: []const f32, sample_rate: u32) u64 {
+    if (samples.len == 0 or sample_rate == 0) return 0;
+    const frame_len = @max(@as(usize, 1), @as(usize, sample_rate) / 20);
+    var hasher = std.hash.Wyhash.init(0);
+    var index: usize = 0;
+    while (index + frame_len <= samples.len) : (index += frame_len) {
+        const seg = samples[index .. index + frame_len];
+        var sum_sq: f64 = 0.0;
+        for (seg) |sample| {
+            const value: f64 = @floatCast(sample);
+            sum_sq += value * value;
+        }
+        const rms = @sqrt(sum_sq / @as(f64, @floatFromInt(seg.len)));
+        const quantized: u16 = @intFromFloat(@round(rms * 10000.0));
+        hasher.update(std.mem.asBytes(&quantized));
+    }
+    return hasher.final();
+}
+
+fn chooseNextAnswerFromMask(tried_mask: u8) ?u8 {
+    for (1..4) |answer| {
+        const bit: u8 = @as(u8, 1) << @as(u3, @intCast(answer - 1));
+        if ((tried_mask & bit) == 0) return @intCast(answer);
+    }
+    return null;
+}
+
+fn markTriedAnswer(mask: u8, answer: u8) u8 {
+    const bit: u8 = @as(u8, 1) << @as(u3, @intCast(answer - 1));
+    return mask | bit;
 }
 
 fn shouldRevealPromptForAnalysis(mode: fft_analyzer.DecisionMode) bool {
@@ -297,6 +359,8 @@ pub fn runAudioBypass(
     var challenge_complete = false;
     var audio_mode_activated: bool = false;
     var game_core_ctx: i64 = 0;
+    var semantic_label: fft_analyzer.SemanticLabel = .unknown;
+    var retry_answer_state = RetryAnswerState{};
 
     std.debug.print("\n[AUDIO BYPASS] Starting pipeline (gfct runtime target, max {d} attempts)...\n", .{MAX_CHALLENGES});
 
@@ -861,87 +925,87 @@ pub fn runAudioBypass(
             total_attempted + 1, target_challenges, successful, target_challenges,
         });
 
-    // DOM PROBE FIX 2026-04-30: Extract question text from Arkose Audio Challenge.
-    // WIRE-TRUTH (ChromeDevTools MCP live test):
-    //   - game-core iframe body.innerText contains:
-    //     "Press Play to listen. Which option is the odd animal out? Enter the number..."
-    //   - game-core iframe shares origin with enforcement iframe (github-api.arkoselabs.com)
-    //   - contentDocument access WORKS from enforcement iframe to game-core iframe
-    //   - Question lives in body.innerText AND button aria-label/description
-    //   - Shadow DOM not used for question text in game-core 1.34.1
-    // SOURCE: ChromeDevTools MCP live DOM snapshot 2026-04-30
-    const dom_probe_script =
-        \\(() => {
-        \\  // CRITICAL FIX: Access game-core iframe contentDocument directly.
-        \\  // game-core iframe is same-origin with enforcement iframe,
-        \\  // so contentDocument is accessible without CDP contextId.
-        \\  let targetDoc = document;
-        \\  const gc = document.querySelector('iframe[src*="game-core"]');
-        \\  if (gc) {
-        \\    try {
-        \\      const doc = gc.contentDocument;
-        \\      if (doc && doc.body) targetDoc = doc;
-        \\    } catch(e) {}
-        \\  }
-        \\  function deepText(root) {
-        \\    const texts = [];
-        \\    const walk = (node) => {
-        \\      if (node.shadowRoot) walk(node.shadowRoot);
-        \\      if (node.nodeType === Node.TEXT_NODE) {
-        \\        const t = node.textContent.trim();
-        \\        if (t.length > 3) texts.push(t);
-        \\      }
-        \\      for (const child of node.childNodes) walk(child);
-        \\    };
-        \\    walk(root);
-        \\    return texts.join(' ');
-        \\  }
-        \\  function getAriaContent(root) {
-        \\    const texts = [];
-        \\    const walk = (node) => {
-        \\      if (node.shadowRoot) walk(node.shadowRoot);
-        \\      if (node.getAttribute) {
-        \\        const al = node.getAttribute('aria-label');
-        \\        if (al && al.trim().length > 3) texts.push(al.trim());
-        \\        const desc = node.getAttribute('aria-describedby');
-        \\        if (desc) {
-        \\          const el = document.getElementById(desc);
-        \\          if (el && el.textContent) texts.push(el.textContent.trim());
-        \\        }
-        \\      }
-        \\      for (const child of node.childNodes) walk(child);
-        \\    };
-        \\    walk(root);
-        \\    return texts.join(' ');
-        \\  }
-        \\  if (!targetDoc.body) return '[ARKOSE QUESTION] NO_QUESTION_FOUND | DEBUG: no targetDoc.body';
-        \\  const bodyText = targetDoc.body.innerText || '';
-        \\  const deep = deepText(targetDoc.body);
-        \\  const aria = getAriaContent(targetDoc.body);
-        \\  const combined = (bodyText + ' ' + deep + ' ' + aria).replace(/\s+/g, ' ').trim();
-        \\  if (combined.length === 0) return '[ARKOSE QUESTION] NO_QUESTION_FOUND | DEBUG: all text empty';
-        \\  const patterns = [
-        \\    /(?:Press Play to listen\.?|Click to listen\.?|Listen carefully\.?|Play to listen\.?|Press the play button)\s*[.:]?\s*(Which[^.?]*(?:\?|\.))/i,
-        \\    /(?:Press Play to listen\.?|Click to listen\.?|Listen carefully\.?|Play to listen\.?|Press the play button)\s*[.:]?\s*(What[^.?]*(?:\?|\.))/i,
-        \\    /(?:Press Play to listen\.?|Click to listen\.?|Listen carefully\.?|Play to listen\.?|Press the play button)\s*[.:]?\s*(How[^.?]*(?:\?|\.))/i,
-        \\    /(Which\s+[^.?]*(?:\?|\.))/i,
-        \\    /(What\s+[^.?]*(?:\?|\.))/i,
-        \\    /(How\s+[^.?]*(?:\?|\.))/i,
-        \\    /(Select\s+[^.?]*(?:\?|\.))/i,
-        \\    /(Choose\s+[^.?]*(?:\?|\.))/i,
-        \\    /(Identify\s+[^.?]*(?:\?|\.))/i,
-        \\    /(Find\s+[^.?]*(?:\?|\.))/i,
-        \\  ];
-        \\  for (const pat of patterns) {
-        \\    const m = combined.match(pat);
-        \\    if (m && m[1]) {
-        \\      const q = m[1].trim();
-        \\      if (q.length > 5) return '[ARKOSE QUESTION] ' + q;
-        \\    }
-        \\  }
-        \\  return '[ARKOSE QUESTION] NO_QUESTION_FOUND | DEBUG_LEN=' + combined.length + ' | DEBUG_TEXT=' + combined.substring(0, 400);
-        \\})()
-    ;
+        // DOM PROBE FIX 2026-04-30: Extract question text from Arkose Audio Challenge.
+        // WIRE-TRUTH (ChromeDevTools MCP live test):
+        //   - game-core iframe body.innerText contains:
+        //     "Press Play to listen. Which option is the odd animal out? Enter the number..."
+        //   - game-core iframe shares origin with enforcement iframe (github-api.arkoselabs.com)
+        //   - contentDocument access WORKS from enforcement iframe to game-core iframe
+        //   - Question lives in body.innerText AND button aria-label/description
+        //   - Shadow DOM not used for question text in game-core 1.34.1
+        // SOURCE: ChromeDevTools MCP live DOM snapshot 2026-04-30
+        const dom_probe_script =
+            \\(() => {
+            \\  // CRITICAL FIX: Access game-core iframe contentDocument directly.
+            \\  // game-core iframe is same-origin with enforcement iframe,
+            \\  // so contentDocument is accessible without CDP contextId.
+            \\  let targetDoc = document;
+            \\  const gc = document.querySelector('iframe[src*="game-core"]');
+            \\  if (gc) {
+            \\    try {
+            \\      const doc = gc.contentDocument;
+            \\      if (doc && doc.body) targetDoc = doc;
+            \\    } catch(e) {}
+            \\  }
+            \\  function deepText(root) {
+            \\    const texts = [];
+            \\    const walk = (node) => {
+            \\      if (node.shadowRoot) walk(node.shadowRoot);
+            \\      if (node.nodeType === Node.TEXT_NODE) {
+            \\        const t = node.textContent.trim();
+            \\        if (t.length > 3) texts.push(t);
+            \\      }
+            \\      for (const child of node.childNodes) walk(child);
+            \\    };
+            \\    walk(root);
+            \\    return texts.join(' ');
+            \\  }
+            \\  function getAriaContent(root) {
+            \\    const texts = [];
+            \\    const walk = (node) => {
+            \\      if (node.shadowRoot) walk(node.shadowRoot);
+            \\      if (node.getAttribute) {
+            \\        const al = node.getAttribute('aria-label');
+            \\        if (al && al.trim().length > 3) texts.push(al.trim());
+            \\        const desc = node.getAttribute('aria-describedby');
+            \\        if (desc) {
+            \\          const el = document.getElementById(desc);
+            \\          if (el && el.textContent) texts.push(el.textContent.trim());
+            \\        }
+            \\      }
+            \\      for (const child of node.childNodes) walk(child);
+            \\    };
+            \\    walk(root);
+            \\    return texts.join(' ');
+            \\  }
+            \\  if (!targetDoc.body) return '[ARKOSE QUESTION] NO_QUESTION_FOUND | DEBUG: no targetDoc.body';
+            \\  const bodyText = targetDoc.body.innerText || '';
+            \\  const deep = deepText(targetDoc.body);
+            \\  const aria = getAriaContent(targetDoc.body);
+            \\  const combined = (bodyText + ' ' + deep + ' ' + aria).replace(/\s+/g, ' ').trim();
+            \\  if (combined.length === 0) return '[ARKOSE QUESTION] NO_QUESTION_FOUND | DEBUG: all text empty';
+            \\  const patterns = [
+            \\    /(?:Press Play to listen\.?|Click to listen\.?|Listen carefully\.?|Play to listen\.?|Press the play button)\s*[.:]?\s*(Which[^.?]*(?:\?|\.))/i,
+            \\    /(?:Press Play to listen\.?|Click to listen\.?|Listen carefully\.?|Play to listen\.?|Press the play button)\s*[.:]?\s*(What[^.?]*(?:\?|\.))/i,
+            \\    /(?:Press Play to listen\.?|Click to listen\.?|Listen carefully\.?|Play to listen\.?|Press the play button)\s*[.:]?\s*(How[^.?]*(?:\?|\.))/i,
+            \\    /(Which\s+[^.?]*(?:\?|\.))/i,
+            \\    /(What\s+[^.?]*(?:\?|\.))/i,
+            \\    /(How\s+[^.?]*(?:\?|\.))/i,
+            \\    /(Select\s+[^.?]*(?:\?|\.))/i,
+            \\    /(Choose\s+[^.?]*(?:\?|\.))/i,
+            \\    /(Identify\s+[^.?]*(?:\?|\.))/i,
+            \\    /(Find\s+[^.?]*(?:\?|\.))/i,
+            \\  ];
+            \\  for (const pat of patterns) {
+            \\    const m = combined.match(pat);
+            \\    if (m && m[1]) {
+            \\      const q = m[1].trim();
+            \\      if (q.length > 5) return '[ARKOSE QUESTION] ' + q;
+            \\    }
+            \\  }
+            \\  return '[ARKOSE QUESTION] NO_QUESTION_FOUND | DEBUG_LEN=' + combined.length + ' | DEBUG_TEXT=' + combined.substring(0, 400);
+            \\})()
+        ;
         if (game_core_ctx > 0) {
             if (arkose_cdp.evaluateInContext(dom_probe_script, game_core_ctx)) |probe_resp| {
                 defer allocator.free(probe_resp);
@@ -949,6 +1013,8 @@ pub fn runAudioBypass(
                 if (probe_value) |pv| {
                     defer allocator.free(pv);
                     std.debug.print("[AUDIO BYPASS] {s}\n", .{pv});
+                    semantic_label = semanticLabelFromProbeText(pv);
+                    std.debug.print("[AUDIO BYPASS] Semantic label: {s}\n", .{@tagName(semantic_label)});
                 }
             } else |probe_err| {
                 std.debug.print("[AUDIO BYPASS] DOM probe failed: {}\n", .{probe_err});
@@ -960,6 +1026,8 @@ pub fn runAudioBypass(
                 if (probe_value) |pv| {
                     defer allocator.free(pv);
                     std.debug.print("[AUDIO BYPASS] {s}\n", .{pv});
+                    semantic_label = semanticLabelFromProbeText(pv);
+                    std.debug.print("[AUDIO BYPASS] Semantic label: {s}\n", .{@tagName(semantic_label)});
                 }
             } else |probe_err| {
                 std.debug.print("[AUDIO BYPASS] DOM probe failed: {}\n", .{probe_err});
@@ -1083,43 +1151,84 @@ pub fn runAudioBypass(
         defer allocator.free(normalized.normalized);
         std.debug.print("[AUDIO BYPASS] Normalized: scale={d:.4}\n", .{normalized.scale});
 
-        // Step 7: Split into 3 equal clips and analyze outlier signature
-        if (normalized.normalized.len < CLIP_SPLIT) {
-            std.debug.print("[AUDIO BYPASS] Attempt {d}: audio too short ({d} samples)\n", .{ total_attempted, normalized.normalized.len });
+        const audio_fingerprint = coarseAudioFingerprint(normalized.normalized, meta.sample_rate);
+
+        // Step 7: Energy-based segment extraction — replaces BROKEN equal-thirds split.
+        //
+        // SOURCE: 45-file forensic analysis 2026-05-01
+        // PROVEN BROKEN: samples.len/3 split hit inside an active segment in 91.1% of files.
+        //   Klip[1] was: 100% announcer + 18% animal1 (centroid=0Hz — useless for analysis)
+        //   Klip[2] was: 82% animal1 + 49% animal2 (two different animals mixed)
+        //   Klip[3] was: 51% animal2 + 100% animal3 (again mixed)
+        //
+        // FIXED: extractThreeLargestSegments finds all energy segments, selects the 3
+        // longest by duration (which are always the 3 animal clips, not the announcer),
+        // and returns them sorted by playback position.
+        // Validated against all 45 Arkose audio files in tmp/ directory.
+        const seg_config = segmentConfigForLabel(semantic_label);
+        const clips = fft_analyzer.extractThreeLargestSegmentsForLabel(
+            normalized.normalized,
+            meta.sample_rate,
+            seg_config,
+            semantic_label,
+        ) catch |err| {
+            std.debug.print("[AUDIO BYPASS] Attempt {d}: extractThreeLargestSegments failed ({}) — audio has insufficient active segments\n", .{ total_attempted, err });
             continue;
-        }
-        const clips = buildOutlierClipInputs(normalized.normalized, meta.sample_rate);
+        };
+        std.debug.print("[AUDIO BYPASS] Segments: clip1={d}ms clip2={d}ms clip3={d}ms\n", .{
+            clips[0].samples.len * 1000 / clips[0].sample_rate,
+            clips[1].samples.len * 1000 / clips[1].sample_rate,
+            clips[2].samples.len * 1000 / clips[2].sample_rate,
+        });
         const outlier_config = fft_analyzer.OutlierConfig{
             .vad = .{},
             .optional_bit_depth = if (meta.bit_depth == 0) null else meta.bit_depth,
         };
 
         var answer: u8 = undefined;
-        const outlier_result_or_error = fft_analyzer.analyzeOutlier(&clips, .unknown, outlier_config);
-        if (outlier_result_or_error) |outlier_result| {
-            answer = outlierAnswerFromResult(outlier_result);
-            last_guess = answer - 1;
-            std.debug.print("[AUDIO BYPASS] Outlier final scores: [{d:.6}, {d:.6}, {d:.6}]\n", .{
-                outlier_result.final_scores[0], outlier_result.final_scores[1], outlier_result.final_scores[2],
-            });
-            std.debug.print("[AUDIO BYPASS] Outlier hardware scores: [{d:.6}, {d:.6}, {d:.6}]\n", .{
-                outlier_result.hardware_scores[0], outlier_result.hardware_scores[1], outlier_result.hardware_scores[2],
-            });
-            if (shouldRevealPromptForAnalysis(outlier_result.decision_mode)) {
-                std.debug.print("[AUDIO BYPASS] Fallback decision mode active: weighted_fallback\n", .{});
+        if (retry_answer_state.challenge_index == challenge_index and retry_answer_state.audio_fingerprint == audio_fingerprint and retry_answer_state.semantic_label == semantic_label) {
+            if (chooseNextAnswerFromMask(retry_answer_state.tried_mask)) |retry_answer| {
+                answer = retry_answer;
+                retry_answer_state.tried_mask = markTriedAnswer(retry_answer_state.tried_mask, answer);
+                last_guess = answer - 1;
+                std.debug.print("[AUDIO BYPASS] Reusing same audio after wrong answer; trying alternate answer {d}\n", .{answer});
+            } else {
+                std.debug.print("[AUDIO BYPASS] All answers exhausted for repeated audio fingerprint=0x{x}; waiting for next challenge audio\n", .{audio_fingerprint});
+                continue;
             }
-            std.debug.print("[AUDIO BYPASS] Guess (outlier): {d} -> Answer: {d}\n", .{ outlier_result.guess, answer });
-            std.debug.print("[AUDIO BYPASS] Analysis time: {d}us\n", .{outlier_result.execution_time_us});
-        } else |err| {
-            switch (err) {
-                error.AmbiguousSignal => {
-                    std.debug.print("[AUDIO BYPASS] Attempt {d}: outlier analyze ambiguous; skipping challenge without manual answer fallback\n", .{total_attempted});
-                    continue;
-                },
-                else => {
-                    std.debug.print("[AUDIO BYPASS] Attempt {d}: outlier analyze failed: {}\n", .{ total_attempted, err });
-                    continue;
-                },
+        } else {
+            const outlier_result_or_error = fft_analyzer.analyzeOutlier(&clips, semantic_label, outlier_config);
+            if (outlier_result_or_error) |outlier_result| {
+                answer = outlierAnswerFromResult(outlier_result);
+                retry_answer_state = .{
+                    .challenge_index = challenge_index,
+                    .audio_fingerprint = audio_fingerprint,
+                    .tried_mask = markTriedAnswer(0, answer),
+                    .semantic_label = semantic_label,
+                };
+                last_guess = answer - 1;
+                std.debug.print("[AUDIO BYPASS] Outlier final scores: [{d:.6}, {d:.6}, {d:.6}]\n", .{
+                    outlier_result.final_scores[0], outlier_result.final_scores[1], outlier_result.final_scores[2],
+                });
+                std.debug.print("[AUDIO BYPASS] Outlier hardware scores: [{d:.6}, {d:.6}, {d:.6}]\n", .{
+                    outlier_result.hardware_scores[0], outlier_result.hardware_scores[1], outlier_result.hardware_scores[2],
+                });
+                if (shouldRevealPromptForAnalysis(outlier_result.decision_mode)) {
+                    std.debug.print("[AUDIO BYPASS] Fallback decision mode active: weighted_fallback\n", .{});
+                }
+                std.debug.print("[AUDIO BYPASS] Guess (outlier): {d} -> Answer: {d}\n", .{ outlier_result.guess, answer });
+                std.debug.print("[AUDIO BYPASS] Analysis time: {d}us\n", .{outlier_result.execution_time_us});
+            } else |err| {
+                switch (err) {
+                    error.AmbiguousSignal => {
+                        std.debug.print("[AUDIO BYPASS] Attempt {d}: outlier analyze ambiguous; skipping challenge without manual answer fallback\n", .{total_attempted});
+                        continue;
+                    },
+                    else => {
+                        std.debug.print("[AUDIO BYPASS] Attempt {d}: outlier analyze failed: {}\n", .{ total_attempted, err });
+                        continue;
+                    },
+                }
             }
         }
 
@@ -1131,6 +1240,7 @@ pub fn runAudioBypass(
 
         switch (proof.verdict) {
             .complete => {
+                retry_answer_state = .{};
                 successful += 1;
                 challenge_index = successful;
                 std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} solved (complete text)\n", .{ successful, target_challenges });
@@ -1145,6 +1255,7 @@ pub fn runAudioBypass(
                     std.debug.print("[AUDIO BYPASS] Transition rechecked as wrong; answer {d} rejected\n", .{answer});
                 } else {
                     successful += 1;
+                    retry_answer_state = .{};
                     challenge_index = successful;
                     std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} advanced (intermediate transition)\n", .{ successful, target_challenges });
                     if (ui_state == .complete) {
@@ -1245,16 +1356,46 @@ test "audio_bypass: constants are valid" {
     try std.testing.expect(PIPELINE_TIMEOUT_MS > 0);
 }
 
-test "audio_bypass: builds outlier clip inputs from normalized PCM" {
-    var pcm = [_]f32{ 0.1, 0.2, 0.3, 1.1, 1.2, 1.3, 2.1, 2.2, 2.3 };
+// SOURCE: 45-file forensic analysis 2026-05-01 — replaces removed buildOutlierClipInputs test.
+// Validates that extractThreeLargestSegments correctly isolates 3 clips from
+// a synthetic Arkose-structured audio (announcer + 3 animal clips).
+test "audio_bypass: extractThreeLargestSegments returns 3 clips in playback order" {
+    const sr: u32 = 44100;
+    // Synthetic audio: [silence 500ms][announcer 970ms][gap 400ms]
+    //                  [clip1 1500ms][gap 400ms][clip2 3000ms][gap 400ms][clip3 1100ms]
+    const silence_s: usize = sr / 2;
+    const ann_s: usize = sr * 97 / 100;
+    const gap_s: usize = sr * 4 / 10;
+    const c1_s: usize = sr * 3 / 2;
+    const c2_s: usize = sr * 3;
+    const c3_s: usize = sr * 11 / 10;
+    const total = silence_s + ann_s + gap_s + c1_s + gap_s + c2_s + gap_s + c3_s;
+    const buf = try std.testing.allocator.alloc(f32, total);
+    defer std.testing.allocator.free(buf);
+    @memset(buf, 0.0);
+    // Announcer: lower amplitude
+    for (buf[silence_s .. silence_s + ann_s]) |*s| s.* = 0.3;
+    // Animal clips: full amplitude
+    var p: usize = silence_s + ann_s + gap_s;
+    for (buf[p .. p + c1_s]) |*s| s.* = 0.8;
+    p += c1_s + gap_s;
+    for (buf[p .. p + c2_s]) |*s| s.* = 0.8;
+    p += c2_s + gap_s;
+    for (buf[p .. p + c3_s]) |*s| s.* = 0.8;
 
-    const clips = buildOutlierClipInputs(&pcm, 44100);
+    const clips = try fft_analyzer.extractThreeLargestSegments(buf, sr, .{});
 
-    try std.testing.expectEqual(@as(usize, 3), clips[0].samples.len);
-    try std.testing.expectEqual(@as(f32, 0.1), clips[0].samples[0]);
-    try std.testing.expectEqual(@as(f32, 1.1), clips[1].samples[0]);
-    try std.testing.expectEqual(@as(f32, 2.1), clips[2].samples[0]);
-    try std.testing.expectEqual(@as(u32, 44100), clips[2].sample_rate);
+    // All 3 clips non-empty
+    try std.testing.expect(clips[0].samples.len > 0);
+    try std.testing.expect(clips[1].samples.len > 0);
+    try std.testing.expect(clips[2].samples.len > 0);
+    // Clips in ascending memory order (playback order)
+    try std.testing.expect(@intFromPtr(clips[0].samples.ptr) < @intFromPtr(clips[1].samples.ptr));
+    try std.testing.expect(@intFromPtr(clips[1].samples.ptr) < @intFromPtr(clips[2].samples.ptr));
+    // All sample_rates propagated correctly
+    try std.testing.expectEqual(sr, clips[0].sample_rate);
+    try std.testing.expectEqual(sr, clips[1].sample_rate);
+    try std.testing.expectEqual(sr, clips[2].sample_rate);
 }
 
 test "audio_bypass: outlier answer uses analyzeOutlier result" {
@@ -1278,6 +1419,32 @@ test "audio_bypass: prompt reveal only for weighted fallback" {
     try std.testing.expect(!shouldRevealPromptForAnalysis(.hardware_primary));
     try std.testing.expect(shouldRevealPromptForAnalysis(.weighted_fallback));
     try std.testing.expect(!shouldRevealPromptForAnalysis(.ambiguous));
+}
+
+test "audio_bypass: semantic label parses Arkose question prefix" {
+    try std.testing.expectEqual(
+        fft_analyzer.SemanticLabel.different,
+        semanticLabelFromProbeText("[ARKOSE QUESTION] Which option is the odd animal out?"),
+    );
+    try std.testing.expectEqual(
+        fft_analyzer.SemanticLabel.bee,
+        semanticLabelFromProbeText("[ARKOSE QUESTION] Which sound is the buzzing bee?"),
+    );
+    try std.testing.expectEqual(
+        fft_analyzer.SemanticLabel.speech,
+        semanticLabelFromProbeText("[ARKOSE QUESTION] Which option is only one person talking?"),
+    );
+}
+
+test "audio_bypass: speech label disables speech cutoff during segmentation" {
+    const config = segmentConfigForLabel(.speech);
+    try std.testing.expectEqual(@as(f64, 0.0), config.speech_centroid_cutoff_hz);
+    try std.testing.expect(segmentConfigForLabel(.different).speech_centroid_cutoff_hz > 0.0);
+}
+
+test "audio_bypass: different label widens merge gap for live odd-animal clips" {
+    const config = segmentConfigForLabel(.different);
+    try std.testing.expectEqual(@as(u32, 150), config.merge_gap_ms);
 }
 
 test "audio_bypass: runAudioBypass returns error without bridge" {

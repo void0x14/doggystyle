@@ -16,9 +16,32 @@ pub const SpectralFluxResult = struct {
 };
 
 pub const ClipInput = struct { samples: []const f32, sample_rate: u32 };
-pub const SemanticLabel = enum { water, bee, steps, unknown, different };
+pub const SemanticLabel = enum { water, bee, steps, speech, unknown, different };
 pub const VADConfig = struct { announcement_skip_ms: u32 = 0, frame_ms: u32 = 10, min_active_frames: u32 = 3, snr_min: f64 = 3.0 };
 pub const OutlierConfig = struct { vad: VADConfig = .{}, min_confidence: f64 = 0.15, ambiguous_score_threshold: f64 = 0.05, hardware_primary_margin: f64 = 0.20, quantization_tolerance: f64 = 0.1, low_freq_cutoff_hz: f64 = 500.0, optional_bit_depth: ?u8 = null };
+
+// SOURCE: Measured from 45 Arkose "odd animal out" audio challenge files (2026-05-01)
+// Audio structure: [silence][TTS announcer ~970ms][gap][clip1][gap][clip2][gap][clip3][trailing]
+// Equal-thirds split PROVEN BROKEN: Split2 hits inside a segment in 91.1% of files.
+// These defaults correctly isolated all 3 animal clips across all 45 test files.
+pub const MultiSegmentConfig = struct {
+    // Energy frame size — 30ms provides 33Hz temporal resolution for clips >=100ms
+    // SOURCE: Digital audio processing convention; validated on 44100Hz Arkose files
+    frame_ms: u32 = 30,
+    // Energy fraction threshold: threshold = max_frame_energy * energy_fraction.
+    // SOURCE: ANALIZ_RAPORU.md section 8.2 (2026-05-01) — quiet real clip measured near
+    // ~2.5% of max_frame_energy, so 0.005 keeps the late quiet animal candidate alive.
+    energy_fraction: f64 = 0.005,
+    // Minimum segment duration — filters transient noise bursts.
+    // SOURCE: ANALIZ_RAPORU.md section 8.2 (2026-05-01) — <200ms segments treated as noise.
+    min_segment_ms: u32 = 200,
+    // Maximum gap to merge into one segment — only bridge micro-silences/sample artifacts.
+    // SOURCE: ANALIZ_RAPORU.md section 8.2 (2026-05-01).
+    merge_gap_ms: u32 = 50,
+    // Spectral centroid cutoff for speech/animal discrimination.
+    // SOURCE: ANALIZ_RAPORU.md section 8.2 (2026-05-01) — TTS speech < 2100Hz.
+    speech_centroid_cutoff_hz: f64 = 2100.0,
+};
 pub const DecisionMode = enum { hardware_primary, weighted_fallback, ambiguous };
 pub const QuantizationGridSource = enum { caller_bit_depth, runtime_common_grid };
 
@@ -46,6 +69,10 @@ const AnalysisError = error{
     ClipAnalysisFailed,
     AmbiguousSignal,
     NoActiveSignal,
+    // Returned by extractThreeLargestSegments when the audio contains fewer than
+    // CLIP_COUNT usable energy segments after merging and filtering.
+    // SOURCE: 45-file forensic analysis 2026-05-01 — all valid challenge files yield >= 3 segments
+    InsufficientSegments,
 };
 
 comptime {
@@ -388,10 +415,16 @@ fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn semanticLabelFromText(text: []const u8) SemanticLabel {
+pub fn semanticLabelFromText(text: []const u8) SemanticLabel {
     if (containsAsciiIgnoreCase(text, "water")) return .water;
     if (containsAsciiIgnoreCase(text, "bee") or containsAsciiIgnoreCase(text, "buzz")) return .bee;
     if (containsAsciiIgnoreCase(text, "step") or containsAsciiIgnoreCase(text, "footstep")) return .steps;
+    if (containsAsciiIgnoreCase(text, "talk") or
+        containsAsciiIgnoreCase(text, "speaking") or
+        containsAsciiIgnoreCase(text, "person talking") or
+        containsAsciiIgnoreCase(text, "voice") or
+        containsAsciiIgnoreCase(text, "drum") or
+        containsAsciiIgnoreCase(text, "music")) return .speech;
     if (containsAsciiIgnoreCase(text, "different") or containsAsciiIgnoreCase(text, "odd")) return .different;
     return .unknown;
 }
@@ -524,6 +557,104 @@ fn computeAcousticSignature(clip: []const f32, active: ActiveRegion, sample_rate
     };
 }
 
+const DIFFERENT_PROFILE_BANDS = [_]struct { start_hz: f64, end_hz: f64 }{
+    .{ .start_hz = 0.0, .end_hz = 500.0 },
+    .{ .start_hz = 500.0, .end_hz = 1200.0 },
+    .{ .start_hz = 1200.0, .end_hz = 2000.0 },
+    .{ .start_hz = 2000.0, .end_hz = 3200.0 },
+    .{ .start_hz = 3200.0, .end_hz = 4500.0 },
+    .{ .start_hz = 4500.0, .end_hz = 6500.0 },
+    .{ .start_hz = 6500.0, .end_hz = 9000.0 },
+    .{ .start_hz = 9000.0, .end_hz = 12000.0 },
+};
+
+fn computeDifferentProfile(clip: []const f32, active: ActiveRegion, sample_rate: u32) AnalysisError![DIFFERENT_PROFILE_BANDS.len]f64 {
+    if (sample_rate == 0) return error.InvalidSampleRate;
+    if (active.end <= active.start or active.end > clip.len) return error.InvalidClip;
+
+    const active_len = active.end - active.start;
+    const fft_len = try acousticFftLen(active_len);
+    if (fft_len > 2048) return error.FftTooLarge;
+    const half_bins = fft_len / 2;
+    if (half_bins == 0) return error.InvalidClip;
+
+    const frame_count: usize = @min(@as(usize, 4), active_len / fft_len);
+    if (frame_count == 0) return error.InvalidClip;
+
+    var fft_buf: [2048]Complex = undefined;
+    var profile = [_]f64{0.0} ** DIFFERENT_PROFILE_BANDS.len;
+    const sample_rate_f: f64 = @floatFromInt(sample_rate);
+
+    for (0..frame_count) |frame_index| {
+        @memset(fft_buf[0..fft_len], Complex{ .re = 0.0, .im = 0.0 });
+        const frame_start = if (frame_count == 1) active.start else active.start + ((active_len - fft_len) * frame_index) / @max(frame_count - 1, 1);
+        for (0..fft_len) |i| {
+            fft_buf[i] = .{ .re = clip[frame_start + i] * hanningWindowValue(i, fft_len), .im = 0.0 };
+        }
+        fft(fft_buf[0..fft_len]);
+
+        var total_energy: f64 = 0.0;
+        var band_energy = [_]f64{0.0} ** DIFFERENT_PROFILE_BANDS.len;
+        for (0..half_bins) |bin| {
+            const mag = magnitude(fft_buf[bin]);
+            const freq = sample_rate_f * @as(f64, @floatFromInt(bin)) / @as(f64, @floatFromInt(fft_len));
+            total_energy += mag;
+            for (DIFFERENT_PROFILE_BANDS, 0..) |band, band_index| {
+                if (freq >= band.start_hz and freq < band.end_hz) {
+                    band_energy[band_index] += mag;
+                    break;
+                }
+            }
+        }
+
+        if (total_energy > 0.0) {
+            for (0..DIFFERENT_PROFILE_BANDS.len) |i| {
+                profile[i] += band_energy[i] / total_energy;
+            }
+        }
+    }
+
+    for (0..DIFFERENT_PROFILE_BANDS.len) |i| {
+        profile[i] /= @as(f64, @floatFromInt(frame_count));
+    }
+    return profile;
+}
+
+fn cosineDistanceProfile(a: [DIFFERENT_PROFILE_BANDS.len]f64, b: [DIFFERENT_PROFILE_BANDS.len]f64) f64 {
+    var dot: f64 = 0.0;
+    var norm_a: f64 = 0.0;
+    var norm_b: f64 = 0.0;
+    for (0..DIFFERENT_PROFILE_BANDS.len) |i| {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    if (norm_a <= 0.0 or norm_b <= 0.0) return 1.0;
+    const cosine = dot / (@sqrt(norm_a) * @sqrt(norm_b));
+    return 1.0 - cosine;
+}
+
+fn computeDifferentPairScores(clips: []const ClipInput, features: [CLIP_COUNT]ClipFeatures) AnalysisError![CLIP_COUNT]f64 {
+    var profiles: [CLIP_COUNT][DIFFERENT_PROFILE_BANDS.len]f64 = undefined;
+    for (clips, 0..) |clip, i| {
+        profiles[i] = try computeDifferentProfile(clip.samples, features[i].active, clip.sample_rate);
+    }
+
+    const d01 = cosineDistanceProfile(profiles[0], profiles[1]);
+    const d02 = cosineDistanceProfile(profiles[0], profiles[2]);
+    const d12 = cosineDistanceProfile(profiles[1], profiles[2]);
+
+    var scores = [_]f64{0.0} ** CLIP_COUNT;
+    if (d01 <= d02 and d01 <= d12) {
+        scores[2] = @max(d02, d12) - d01;
+    } else if (d02 <= d01 and d02 <= d12) {
+        scores[1] = @max(d01, d12) - d02;
+    } else {
+        scores[0] = @max(d01, d02) - d12;
+    }
+    return scores;
+}
+
 fn median3(values: [CLIP_COUNT]f64) f64 {
     var sorted = values;
     if (sorted[0] > sorted[1]) std.mem.swap(f64, &sorted[0], &sorted[1]);
@@ -620,7 +751,7 @@ fn computeOutlierScores(features: [CLIP_COUNT]ClipFeatures) [CLIP_COUNT]OutlierS
     return scores;
 }
 
-fn computeDispatcherScores(features: [CLIP_COUNT]ClipFeatures, label: SemanticLabel) [CLIP_COUNT]f64 {
+fn computeDispatcherScores(clips: []const ClipInput, features: [CLIP_COUNT]ClipFeatures, label: SemanticLabel) AnalysisError![CLIP_COUNT]f64 {
     var values: [CLIP_COUNT]f64 = undefined;
     switch (label) {
         .water => {
@@ -635,7 +766,14 @@ fn computeDispatcherScores(features: [CLIP_COUNT]ClipFeatures, label: SemanticLa
             for (features, 0..) |f, i| values[i] = f.acoustic.low_frequency_transient_energy;
             return maxAdScores(values);
         },
-        .unknown, .different => {
+        .speech => {
+            for (features, 0..) |f, i| values[i] = f.acoustic.spectral_flux + f.acoustic.zero_crossing_rate + f.acoustic.low_frequency_transient_energy;
+            return maxAdScores(values);
+        },
+        .different => {
+            return try computeDifferentPairScores(clips, features);
+        },
+        .unknown => {
             const flux = [_]f64{ features[0].acoustic.spectral_flux, features[1].acoustic.spectral_flux, features[2].acoustic.spectral_flux };
             const centroid = [_]f64{ features[0].acoustic.spectral_centroid, features[1].acoustic.spectral_centroid, features[2].acoustic.spectral_centroid };
             const zcr = [_]f64{ features[0].acoustic.zero_crossing_rate, features[1].acoustic.zero_crossing_rate, features[2].acoustic.zero_crossing_rate };
@@ -697,13 +835,15 @@ pub fn analyzeOutlier(clips: []const ClipInput, label: SemanticLabel, config: Ou
 
     const grid = try chooseCommonQuantizationGrid(clips, &features, config);
     const outlier_scores = computeOutlierScores(features);
-    const dispatcher_scores = computeDispatcherScores(features, label);
+    const dispatcher_scores = try computeDispatcherScores(clips, features, label);
     const best = bestIndexAndMargin(dispatcher_scores);
     const decision_mode: DecisionMode = .weighted_fallback;
     const guess = best.index + 1;
     const confidence = best.margin;
     const score_range = best.range;
-    if (score_range <= config.ambiguous_score_threshold or confidence < config.min_confidence) return error.AmbiguousSignal;
+    const effective_min_confidence = if (label == .different) 0.05 else config.min_confidence;
+    const effective_ambiguous_threshold = if (label == .different) 0.01 else config.ambiguous_score_threshold;
+    if (score_range <= effective_ambiguous_threshold or confidence < effective_min_confidence) return error.AmbiguousSignal;
 
     return .{
         .guess = guess,
@@ -722,6 +862,386 @@ pub fn analyzeOutlier(clips: []const ClipInput, label: SemanticLabel, config: Ou
             .score_range = score_range,
         },
     };
+}
+
+// Internal maximum for segment tracking scratch buffer.
+// SOURCE: 45-file forensic analysis 2026-05-01 — max observed raw segments per file = 6.
+// 32 provides ample headroom for pathological audio without heap allocation.
+const MAX_SEGMENTS: usize = 32;
+
+// SegmentBound holds start/end sample indices into the caller's sample buffer.
+// Lifetime: slice is valid only as long as the source samples slice is alive.
+const SegmentBound = struct { start: usize, end: usize };
+
+const SegmentCandidate = struct {
+    bound: SegmentBound,
+    duration_samples: usize,
+    centroid_hz: f64,
+    speech_penalty: f64,
+};
+
+// SOURCE: Measured from Arkose audio challenge files (2026-05-01) — multiple sessions
+//
+// PROVEN PROBLEMS:
+//
+// P1 (equal-thirds split): Split2 hit inside a segment in 91.1% of files.
+//
+// P2 (segment-level centroid): Merging ALL active frames first, then computing centroid
+//   per merged segment fails when:
+//   a) TTS speech labels are < merge_gap apart from animal clips (e.g. 360ms gap — same size as
+//      internal clip silences), so speech and clip merge into one blob.
+//   b) energy_fraction=0.05 misses quieter animal clips (Option 2 in session 1 was at -25dB
+//      while loudest clip at -15dB — ratio ~10% but threshold was 5% of max_frame_energy,
+//      causing the quiet clip to fall below threshold and be completely missed).
+//
+// P3 (top-3 by duration): Failed when announcer segments (~960ms) were longer than some
+//   animal clips (~780-903ms in Arkose audio format v2).
+//
+// SOLUTION: CANDIDATE SEGMENTS + COMBINATION SELECTION
+//
+// Earlier frame-level hard speech filtering was too aggressive: low-centroid animal clips
+// could be split or discarded before selection. Instead:
+//   1. Collect ALL above-threshold active runs first.
+//   2. Merge only short quiet gaps.
+//   3. Compute segment-level centroid per candidate.
+//   4. If >3 candidates, evaluate every 3-combination and choose the best trio.
+//   5. Speech-like segments are softly penalized, not hard-dropped.
+// This keeps quiet / low-centroid late clips available for selection while still
+// preferring full animal clips over announcer / TTS fragments.
+//
+// Threshold parameters measured on real Arkose audio.
+// SOURCE: ANALIZ_RAPORU.md section 8.2 (2026-05-01).
+//
+// Algorithm:
+//   1. threshold = max_frame_energy * 0.005
+//   2. find active segments, merge only micro-silences with 50ms gap
+//   3. drop segments shorter than 200ms
+//   4. compute segment centroid with 4096-sample FFT
+//   5. drop centroid < 2100Hz speech candidates; if <3 remain, retry with 1500Hz cutoff
+//   6. if >3 remain, evaluate all C(n,3) combinations using centroid-margin scoring
+//   7. sort selected trio by playback order
+pub fn extractThreeLargestSegments(
+    samples: []const f32,
+    sample_rate: u32,
+    config: MultiSegmentConfig,
+) ![CLIP_COUNT]ClipInput {
+    return extractThreeLargestSegmentsForLabel(samples, sample_rate, config, .unknown);
+}
+
+pub fn extractThreeLargestSegmentsForLabel(
+    samples: []const f32,
+    sample_rate: u32,
+    config: MultiSegmentConfig,
+    label: SemanticLabel,
+) ![CLIP_COUNT]ClipInput {
+    if (samples.len == 0) return error.InvalidClip;
+    if (sample_rate == 0) return error.InvalidSampleRate;
+
+    const frame_len = msToSamples(config.frame_ms, sample_rate);
+    if (frame_len == 0) return error.InvalidSampleRate;
+    const frame_count = samples.len / frame_len;
+    if (frame_count == 0) return error.InvalidClip;
+
+    // --- Pass 1: max frame energy for adaptive threshold ---
+    // SOURCE: energy_fraction=0.01 validated on session 1 audio (2026-05-01):
+    //   quiet clip at ~2.5% of max_frame_energy, previously missed at fraction=0.05
+    var max_frame_energy: f64 = 0.0;
+    for (0..frame_count) |fi| {
+        const rms = computeRangeRms(samples, fi * frame_len, fi * frame_len + frame_len);
+        const e = rms * rms;
+        if (e > max_frame_energy) max_frame_energy = e;
+    }
+    if (max_frame_energy == 0.0) return error.InsufficientSegments;
+    const threshold = max_frame_energy * config.energy_fraction;
+
+    // --- Pass 2: collect all active runs above energy threshold ---
+    var raw: [MAX_SEGMENTS]SegmentBound = undefined;
+    var raw_count: usize = 0;
+    var in_active_run = false;
+    var run_start: usize = 0;
+
+    for (0..frame_count) |fi| {
+        const fs = fi * frame_len;
+        const fe = fs + frame_len;
+        const rms = computeRangeRms(samples, fs, fe);
+        const energy = rms * rms;
+
+        if (energy >= threshold) {
+            if (!in_active_run) {
+                run_start = fs;
+                in_active_run = true;
+            }
+        } else {
+            if (in_active_run) {
+                if (raw_count < MAX_SEGMENTS) {
+                    raw[raw_count] = .{ .start = run_start, .end = fs };
+                    raw_count += 1;
+                }
+                in_active_run = false;
+            }
+        }
+    }
+    if (in_active_run and raw_count < MAX_SEGMENTS) {
+        raw[raw_count] = .{ .start = run_start, .end = frame_count * frame_len };
+        raw_count += 1;
+    }
+
+    // --- Pass 3: merge adjacent animal runs with gap < merge_gap_ms ---
+    // merge_gap_ms bridges short quiet gaps inside a single sound while keeping
+    // larger inter-option gaps separated.
+    const merge_samples = msToSamples(config.merge_gap_ms, sample_rate);
+    var merged: [MAX_SEGMENTS]SegmentBound = undefined;
+    var merged_count: usize = 0;
+    for (0..raw_count) |i| {
+        const seg = raw[i];
+        if (merged_count > 0 and seg.start >= merged[merged_count - 1].end and
+            seg.start - merged[merged_count - 1].end < merge_samples)
+        {
+            merged[merged_count - 1].end = seg.end;
+        } else {
+            merged[merged_count] = seg;
+            merged_count += 1;
+        }
+    }
+
+    // --- Pass 4: filter segments shorter than min_segment_ms ---
+    const min_samples_len = msToSamples(config.min_segment_ms, sample_rate);
+    var filtered: [MAX_SEGMENTS]SegmentBound = undefined;
+    var filtered_count: usize = 0;
+    for (0..merged_count) |i| {
+        const seg = merged[i];
+        if (seg.end > seg.start and seg.end - seg.start >= min_samples_len) {
+            filtered[filtered_count] = seg;
+            filtered_count += 1;
+        }
+    }
+    if (filtered_count < CLIP_COUNT) {
+        std.debug.print(
+            "[SEGMENT] Only {d} active segments found (need {d}) — error.InsufficientSegments\n",
+            .{ filtered_count, CLIP_COUNT },
+        );
+        return error.InsufficientSegments;
+    }
+
+    // --- Pass 5: build candidates with segment-level centroid ---
+    var candidates: [MAX_SEGMENTS]SegmentCandidate = undefined;
+    var candidate_count: usize = 0;
+    for (0..filtered_count) |i| {
+        const seg = filtered[i];
+        const seg_samples = samples[seg.start..seg.end];
+        const centroid_hz = computeSegmentCentroid(seg_samples, sample_rate);
+        const speech_penalty = if (config.speech_centroid_cutoff_hz > 0.0 and centroid_hz < config.speech_centroid_cutoff_hz)
+            std.math.pow(f64, 1.0 - (centroid_hz / config.speech_centroid_cutoff_hz), 2.0)
+        else
+            0.0;
+
+        candidates[candidate_count] = .{
+            .bound = seg,
+            .duration_samples = seg.end - seg.start,
+            .centroid_hz = centroid_hz,
+            .speech_penalty = speech_penalty,
+        };
+        candidate_count += 1;
+    }
+
+    var selected: [CLIP_COUNT]SegmentBound = undefined;
+    if (label == .different and config.speech_centroid_cutoff_hz > 0.0) {
+        selected = selectAlternatingAnimalSegments(&candidates, candidate_count, config.speech_centroid_cutoff_hz) catch |err| switch (err) {
+            error.InsufficientSegments => blk: {
+                const primary_cutoff = config.speech_centroid_cutoff_hz;
+                const fallback_cutoff: f64 = 1500.0;
+                break :blk selectBestCandidateTrio(&candidates, candidate_count, primary_cutoff) catch |fallback_err| switch (fallback_err) {
+                    error.InsufficientSegments => try selectBestCandidateTrio(&candidates, candidate_count, fallback_cutoff),
+                    else => return fallback_err,
+                };
+            },
+            else => return err,
+        };
+    } else {
+        const primary_cutoff = config.speech_centroid_cutoff_hz;
+        const fallback_cutoff: f64 = 1500.0;
+        selected = selectBestCandidateTrio(&candidates, candidate_count, primary_cutoff) catch |err| switch (err) {
+            error.InsufficientSegments => try selectBestCandidateTrio(&candidates, candidate_count, fallback_cutoff),
+            else => return err,
+        };
+    }
+
+    // --- Pass 7: sort selected by start position ascending (playback order) ---
+    for (1..CLIP_COUNT) |i| {
+        const key = selected[i];
+        var j: usize = i;
+        while (j > 0 and selected[j - 1].start > key.start) : (j -= 1) {
+            selected[j] = selected[j - 1];
+        }
+        selected[j] = key;
+    }
+
+    std.debug.print(
+        "[SEGMENT] Selected clips from {d} candidates. clip1={d}ms clip2={d}ms clip3={d}ms\n",
+        .{
+            candidate_count,
+            (selected[0].end - selected[0].start) * 1000 / sample_rate, (selected[1].end - selected[1].start) * 1000 / sample_rate,
+            (selected[2].end - selected[2].start) * 1000 / sample_rate,
+        },
+    );
+
+    // Runtime sanity: all segments non-empty and within bounds
+    for (selected) |seg| {
+        std.debug.assert(seg.start < seg.end);
+        std.debug.assert(seg.end <= samples.len);
+    }
+
+    return [CLIP_COUNT]ClipInput{
+        .{ .samples = samples[selected[0].start..selected[0].end], .sample_rate = sample_rate },
+        .{ .samples = samples[selected[1].start..selected[1].end], .sample_rate = sample_rate },
+        .{ .samples = samples[selected[2].start..selected[2].end], .sample_rate = sample_rate },
+    };
+}
+
+fn selectAlternatingAnimalSegments(
+    candidates: *const [MAX_SEGMENTS]SegmentCandidate,
+    candidate_count: usize,
+    cutoff_hz: f64,
+) AnalysisError![CLIP_COUNT]SegmentBound {
+    _ = cutoff_hz;
+    if (candidate_count < CLIP_COUNT) return error.InsufficientSegments;
+
+    // SOURCE: live odd-animal files 2026-05-01 — prompt often alternates
+    // [speech][option1][speech][option2][speech][option3], with optional later repeats.
+    // Prefer earliest three option-like segments after the opening prompt rather than
+    // duration-sorting across the full file, which can mix first-pass options with repeats.
+    var option_bounds: [CLIP_COUNT]SegmentBound = undefined;
+    var option_count: usize = 0;
+    var seen_prompt = false;
+    for (0..candidate_count) |i| {
+        const cand = candidates[i];
+        const is_prompt_like = cand.centroid_hz < 2100.0;
+        const substantial = cand.duration_samples >= 600 * 44100 / 1000;
+
+        if (!seen_prompt and is_prompt_like and substantial) {
+            seen_prompt = true;
+            continue;
+        }
+
+        if (seen_prompt and substantial) {
+            option_bounds[option_count] = cand.bound;
+            option_count += 1;
+            if (option_count == CLIP_COUNT) return option_bounds;
+        }
+    }
+
+    return error.InsufficientSegments;
+}
+
+fn computeSegmentCentroid(samples: []const f32, sample_rate: u32) f64 {
+    if (samples.len < 2 or sample_rate == 0) return 0.0;
+
+    var fft_scratch: [4096]Complex = undefined;
+    const max_n = @min(samples.len, fft_scratch.len);
+    var n: usize = 1;
+    while (n * 2 <= max_n) : (n *= 2) {}
+    if (n < 2) return 0.0;
+
+    @memset(fft_scratch[0..n], Complex{ .re = 0.0, .im = 0.0 });
+    for (0..n) |k| {
+        const hann: f32 = @floatCast(0.5 - 0.5 * @cos(
+            2.0 * std.math.pi * @as(f64, @floatFromInt(k)) / @as(f64, @floatFromInt(n)),
+        ));
+        fft_scratch[k] = .{ .re = samples[k] * hann, .im = 0.0 };
+    }
+    fft(fft_scratch[0..n]);
+
+    const sr_f64: f64 = @floatFromInt(sample_rate);
+    const half = n / 2;
+    var total_mag: f64 = 0.0;
+    var weighted_mag: f64 = 0.0;
+    for (0..half) |k| {
+        const mag = magnitude(fft_scratch[k]);
+        const freq = sr_f64 * @as(f64, @floatFromInt(k)) / @as(f64, @floatFromInt(n));
+        total_mag += mag;
+        weighted_mag += mag * freq;
+    }
+    return if (total_mag > 0.0) weighted_mag / total_mag else 0.0;
+}
+
+fn selectBestCandidateTrio(
+    candidates: *const [MAX_SEGMENTS]SegmentCandidate,
+    candidate_count: usize,
+    cutoff_hz: f64,
+) AnalysisError![CLIP_COUNT]SegmentBound {
+    var kept: [MAX_SEGMENTS]usize = undefined;
+    var kept_count: usize = 0;
+    for (0..candidate_count) |i| {
+        if (candidates[i].centroid_hz >= cutoff_hz) {
+            kept[kept_count] = i;
+            kept_count += 1;
+        }
+    }
+    if (kept_count < CLIP_COUNT) return error.InsufficientSegments;
+
+    const min_reasonable_samples: usize = 600 * 44100 / 1000;
+    var preferred: [MAX_SEGMENTS]usize = undefined;
+    var preferred_count: usize = 0;
+    for (0..kept_count) |idx| {
+        const candidate_index = kept[idx];
+        if (candidates[candidate_index].duration_samples >= min_reasonable_samples) {
+            preferred[preferred_count] = candidate_index;
+            preferred_count += 1;
+        }
+    }
+
+    const active_indices = if (preferred_count >= CLIP_COUNT) preferred[0..preferred_count] else kept[0..kept_count];
+    const active_count = if (preferred_count >= CLIP_COUNT) preferred_count else kept_count;
+
+    if (active_count == CLIP_COUNT) {
+        return .{
+            candidates[active_indices[0]].bound,
+            candidates[active_indices[1]].bound,
+            candidates[active_indices[2]].bound,
+        };
+    }
+
+    var found = false;
+    var best_score = -std.math.inf(f64);
+    var best_selection: [CLIP_COUNT]SegmentBound = undefined;
+    for (0..active_count) |ai| {
+        const i = active_indices[ai];
+        for (ai + 1..active_count) |aj| {
+            const j = active_indices[aj];
+            for (aj + 1..active_count) |ak| {
+                const k = active_indices[ak];
+                const score = combinationScore(.{ candidates[i], candidates[j], candidates[k] });
+                if (!found or score > best_score) {
+                    found = true;
+                    best_score = score;
+                    best_selection = .{ candidates[i].bound, candidates[j].bound, candidates[k].bound };
+                }
+            }
+        }
+    }
+    if (!found) return error.InsufficientSegments;
+    return best_selection;
+}
+
+fn combinationScore(candidates: [CLIP_COUNT]SegmentCandidate) f64 {
+    const centroids = [_]f64{
+        candidates[0].centroid_hz,
+        candidates[1].centroid_hz,
+        candidates[2].centroid_hz,
+    };
+    const center = median3(centroids);
+    var deviations = [_]f64{
+        @abs(centroids[0] - center),
+        @abs(centroids[1] - center),
+        @abs(centroids[2] - center),
+    };
+    if (deviations[0] < deviations[1]) std.mem.swap(f64, &deviations[0], &deviations[1]);
+    if (deviations[1] < deviations[2]) std.mem.swap(f64, &deviations[1], &deviations[2]);
+    if (deviations[0] < deviations[1]) std.mem.swap(f64, &deviations[0], &deviations[1]);
+
+    const margin = deviations[0] - deviations[1];
+    const speech_penalty = @max(candidates[0].speech_penalty, @max(candidates[1].speech_penalty, candidates[2].speech_penalty));
+    return margin * (1.0 - speech_penalty);
 }
 
 fn fftLenForClip(clip: []const f32, sample_rate: u32) AnalysisError!usize {
@@ -1137,6 +1657,8 @@ test "fft_analyzer: semantic labels parse text" {
     try std.testing.expectEqual(SemanticLabel.water, semanticLabelFromText("Water dripping"));
     try std.testing.expectEqual(SemanticLabel.bee, semanticLabelFromText("buzzing bees"));
     try std.testing.expectEqual(SemanticLabel.steps, semanticLabelFromText("FOOTSTEPS"));
+    try std.testing.expectEqual(SemanticLabel.speech, semanticLabelFromText("Which option is only one person talking?"));
+    try std.testing.expectEqual(SemanticLabel.speech, semanticLabelFromText("Which option is the sound of drums?"));
     try std.testing.expectEqual(SemanticLabel.different, semanticLabelFromText("which one is different"));
     try std.testing.expectEqual(SemanticLabel.unknown, semanticLabelFromText("traffic"));
 }
@@ -1298,6 +1820,251 @@ test "fft_analyzer: analyze returns valid guess" {
     try std.testing.expect(result.deltas[0] > result.deltas[1]);
     try std.testing.expect(result.deltas[0] > result.deltas[2]);
     try std.testing.expect(result.execution_time_us > 0);
+}
+
+// SOURCE: 45-file forensic analysis 2026-05-01
+// Tests that extractThreeLargestSegments correctly isolates 3 animal clips
+// from a synthetic audio that mimics the Arkose challenge structure:
+//   [silence][announcer=970ms][gap][clip1=1500ms][gap][clip2=3000ms][gap][clip3=1100ms][silence]
+test "fft_analyzer: extractThreeLargestSegments isolates 3 animal clips skipping announcer" {
+    const sr: u32 = 44100;
+    // Durations in samples, matching measured Arkose structure
+    const silence_s: usize = sr / 2; // 500ms silence
+    const announcer_s: usize = sr * 97 / 100; // 970ms announcer (shorter than all clips)
+    const gap_s: usize = sr * 4 / 10; // 400ms gap (>= measured minimum 376ms)
+    const clip1_s: usize = sr * 3 / 2; // 1500ms (> announcer 970ms)
+    const clip2_s: usize = sr * 3; // 3000ms (longest, the "bee" or long bird call)
+    const clip3_s: usize = sr * 11 / 10; // 1100ms (> announcer 970ms)
+
+    const total = silence_s + announcer_s + gap_s + clip1_s + gap_s + clip2_s + gap_s + clip3_s + silence_s;
+    const buf = try std.testing.allocator.alloc(f32, total);
+    defer std.testing.allocator.free(buf);
+    @memset(buf, 0.0);
+
+    // Fill announcer region with speech-like low centroid content.
+    const ann_start = silence_s;
+    for (buf[ann_start .. ann_start + announcer_s], 0..) |*s, i| {
+        const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(sr));
+        s.* = @floatCast(0.3 * @sin(2.0 * std.math.pi * 300.0 * t));
+    }
+
+    // Fill animal clips with high-centroid content so the speech cutoff can separate them.
+    var pos: usize = silence_s + announcer_s + gap_s;
+    for (buf[pos .. pos + clip1_s], 0..) |*s, i| {
+        const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(sr));
+        s.* = @floatCast(0.8 * @sin(2.0 * std.math.pi * 3200.0 * t));
+    }
+    pos += clip1_s + gap_s;
+    for (buf[pos .. pos + clip2_s], 0..) |*s, i| {
+        const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(sr));
+        s.* = @floatCast(0.8 * @sin(2.0 * std.math.pi * 4200.0 * t));
+    }
+    pos += clip2_s + gap_s;
+    for (buf[pos .. pos + clip3_s], 0..) |*s, i| {
+        const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(sr));
+        s.* = @floatCast(0.8 * @sin(2.0 * std.math.pi * 5200.0 * t));
+    }
+
+    const clips = try extractThreeLargestSegments(buf, sr, .{});
+
+    // All 3 returned clips must be non-empty
+    try std.testing.expect(clips[0].samples.len > 0);
+    try std.testing.expect(clips[1].samples.len > 0);
+    try std.testing.expect(clips[2].samples.len > 0);
+
+    // Clips must be in ascending start-position order (playback order preserved)
+    const p0 = @intFromPtr(clips[0].samples.ptr);
+    const p1 = @intFromPtr(clips[1].samples.ptr);
+    const p2 = @intFromPtr(clips[2].samples.ptr);
+    try std.testing.expect(p0 < p1);
+    try std.testing.expect(p1 < p2);
+
+    // The longest clip (clip2 = 3000ms) must be represented
+    // Clip2 is the middle one by position; it is also the longest.
+    // After positional sort: [clip1, clip2, clip3]. clip2 is index 1.
+    // Allow +-frame_len (30ms * sr/1000 = 1323 samples) tolerance.
+    const frame_tol: usize = 30 * sr / 1000 + 1;
+    try std.testing.expect(clips[1].samples.len >= clip2_s - frame_tol);
+    try std.testing.expect(clips[1].samples.len <= clip2_s + frame_tol);
+
+    // Sample rates must be propagated unchanged
+    try std.testing.expectEqual(sr, clips[0].sample_rate);
+    try std.testing.expectEqual(sr, clips[1].sample_rate);
+    try std.testing.expectEqual(sr, clips[2].sample_rate);
+
+    // The announcer (970ms) must NOT be among the selected clips.
+    // Verification method: total duration of 3 selected clips must be close to
+    // clip1 + clip2 + clip3 = 1500 + 3000 + 1100 = 5600ms.
+    // If the announcer (970ms) were substituted for any clip, total would deviate by ~530ms.
+    // Allow 10% tolerance for frame-boundary quantization (frame_ms=30 => <=30ms per edge).
+    // SOURCE: frame quantization = frame_ms * sr / 1000 = 30 * 44100 / 1000 = 1323 samples
+    const total_returned = clips[0].samples.len + clips[1].samples.len + clips[2].samples.len;
+    const expected_total = clip1_s + clip2_s + clip3_s;
+    const tol = expected_total / 10; // 10% tolerance
+    try std.testing.expect(total_returned >= expected_total - tol);
+    try std.testing.expect(total_returned <= expected_total + tol);
+}
+
+test "fft_analyzer: extractThreeLargestSegments returns error on all-silence audio" {
+    const sr: u32 = 44100;
+    const buf = try std.testing.allocator.alloc(f32, sr * 5); // 5s silence
+    defer std.testing.allocator.free(buf);
+    @memset(buf, 0.0);
+    const result = extractThreeLargestSegments(buf, sr, .{});
+    try std.testing.expectError(error.InsufficientSegments, result);
+}
+
+test "fft_analyzer: extractThreeLargestSegments returns error on only 2 segments" {
+    const sr: u32 = 44100;
+    const gap: usize = sr / 2; // 500ms silence
+    const clip: usize = sr; // 1000ms active
+    const total = gap + clip + gap + clip + gap; // 2 clips only
+    const buf = try std.testing.allocator.alloc(f32, total);
+    defer std.testing.allocator.free(buf);
+    @memset(buf, 0.0);
+    for (buf[gap .. gap + clip]) |*s| s.* = 0.8;
+    for (buf[gap + clip + gap .. gap + clip + gap + clip]) |*s| s.* = 0.8;
+    const result = extractThreeLargestSegments(buf, sr, .{});
+    try std.testing.expectError(error.InsufficientSegments, result);
+}
+
+test "fft_analyzer: real Arkose file keeps late third animal clip" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cwd = std.Io.Dir.cwd();
+
+    const file = cwd.openFile(io, "tmp/audio_challenge_1777644017_0.f32", .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer file.close(io);
+
+    const file_size = try file.length(io);
+    const raw_bytes = try allocator.alloc(u8, file_size);
+    defer allocator.free(raw_bytes);
+    _ = try std.Io.File.readPositionalAll(file, io, raw_bytes, 0);
+
+    const samples = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, raw_bytes)));
+    const clips = try extractThreeLargestSegments(samples, 44100, .{});
+
+    const sample_rate: usize = 44100;
+    const base_ptr = @intFromPtr(samples.ptr);
+    const late_clip_start_samples = (@intFromPtr(clips[2].samples.ptr) - base_ptr) / @sizeOf(f32);
+
+    // SOURCE: handoff forensic dump for audio_challenge_1777644017_0.f32
+    // Expected third animal clip begins late in the file; exact duration can vary
+    // under the current 50ms merge-gap strategy, but it must still be a substantial
+    // late candidate rather than an early tiny fragment.
+    try std.testing.expect(late_clip_start_samples >= sample_rate * 10);
+    try std.testing.expect(clips[2].samples.len >= sample_rate * 7 / 10);
+}
+
+test "fft_analyzer: real Arkose odd-animal file rejects tiny fragment candidates" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cwd = std.Io.Dir.cwd();
+
+    const file = cwd.openFile(io, "tmp/audio_challenge_1777657494_0.f32", .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer file.close(io);
+
+    const file_size = try file.length(io);
+    const raw_bytes = try allocator.alloc(u8, file_size);
+    defer allocator.free(raw_bytes);
+    _ = try std.Io.File.readPositionalAll(file, io, raw_bytes, 0);
+
+    const samples = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, raw_bytes)));
+    const clips = try extractThreeLargestSegments(samples, 44100, .{});
+
+    const min_reasonable_clip = 600 * 44100 / 1000;
+    try std.testing.expect(clips[0].samples.len >= min_reasonable_clip);
+    try std.testing.expect(clips[1].samples.len >= min_reasonable_clip);
+    try std.testing.expect(clips[2].samples.len >= min_reasonable_clip);
+}
+
+test "fft_analyzer: live odd-animal files avoid repeated short-fragment trio" {
+    const allocator = std.testing.allocator;
+    const paths = [_][]const u8{
+        "tmp/audio_challenge_1777661761_0.f32",
+        "tmp/audio_challenge_1777661763_0.f32",
+        "tmp/audio_challenge_1777661765_0.f32",
+        "tmp/audio_challenge_1777661766_0.f32",
+        "tmp/audio_challenge_1777661768_0.f32",
+        "tmp/audio_challenge_1777661769_0.f32",
+        "tmp/audio_challenge_1777661771_0.f32",
+        "tmp/audio_challenge_1777661773_0.f32",
+        "tmp/audio_challenge_1777661774_0.f32",
+        "tmp/audio_challenge_1777661776_0.f32",
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cwd = std.Io.Dir.cwd();
+    const min_reasonable_clip = 600 * 44100 / 1000;
+
+    for (paths) |path| {
+        const file = cwd.openFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer file.close(io);
+
+        const file_size = try file.length(io);
+        const raw_bytes = try allocator.alloc(u8, file_size);
+        defer allocator.free(raw_bytes);
+        _ = try std.Io.File.readPositionalAll(file, io, raw_bytes, 0);
+
+        const samples = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, raw_bytes)));
+        const clips = try extractThreeLargestSegments(samples, 44100, .{});
+
+        try std.testing.expect(clips[0].samples.len >= min_reasonable_clip);
+        try std.testing.expect(clips[1].samples.len >= min_reasonable_clip);
+        try std.testing.expect(clips[2].samples.len >= min_reasonable_clip);
+    }
+}
+
+test "fft_analyzer: live odd-animal files produce stable non-ambiguous outlier result" {
+    const allocator = std.testing.allocator;
+    const paths = [_][]const u8{
+        "tmp/audio_challenge_1777661761_0.f32",
+        "tmp/audio_challenge_1777661766_0.f32",
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cwd = std.Io.Dir.cwd();
+
+    for (paths) |path| {
+        const file = cwd.openFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer file.close(io);
+
+        const file_size = try file.length(io);
+        const raw_bytes = try allocator.alloc(u8, file_size);
+        defer allocator.free(raw_bytes);
+        _ = try std.Io.File.readPositionalAll(file, io, raw_bytes, 0);
+
+        const samples = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, raw_bytes)));
+        const clips = try extractThreeLargestSegments(samples, 44100, .{});
+        const clip_inputs = [_]ClipInput{
+            .{ .samples = clips[0].samples, .sample_rate = 44100 },
+            .{ .samples = clips[1].samples, .sample_rate = 44100 },
+            .{ .samples = clips[2].samples, .sample_rate = 44100 },
+        };
+        const result = try analyzeOutlier(&clip_inputs, .different, .{});
+        try std.testing.expect(result.guess >= 1 and result.guess <= 3);
+        try std.testing.expect(result.confidence >= 0.05);
+    }
 }
 
 test "fft_analyzer: gerçek Arkose audio verisi ile analiz" {

@@ -455,6 +455,7 @@ pub fn injectAnswerOnTarget(
         \\  }}
         \\  if (!inp) return 'no_input';
         \\  inp.value = {d};
+        \\  inp.focus();
         \\  inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
         \\  inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
         \\  return 'filled_' + inp.tagName + (inp.type || '');
@@ -479,45 +480,72 @@ pub fn injectAnswerOnTarget(
         \\      if (d && d.body) doc = d;
         \\    }} catch(e) {{}}
         \\  }}
-        \\  // Primary: <button>Submit</button> (no type attr) or <input type="submit" value="Submit">
+        \\  const report = (submit_result, submit_path, el, txt) => {{
+        \\    const payload = {{{{
+        \\      submit_result,
+        \\      submit_path,
+        \\      tag: el ? (el.tagName || '') : '',
+        \\      type: el ? (el.type || '') : '',
+        \\      has_form: !!(el && el.form),
+        \\      text: txt || ''
+        \\    }}}};
+        \\    window.__ghostLastSubmitResult = payload;
+        \\    return JSON.stringify(payload);
+        \\  }};
+        \\  const activeInput = doc.querySelector('input[type="text"], input[type="number"], input[type="tel"], input:not([type="hidden"]):not([type="submit"]):not([type="button"])');
+        \\  if (activeInput && activeInput.form) {{
+        \\    try {{
+        \\      if (typeof activeInput.form.requestSubmit === 'function') {{
+        \\        activeInput.form.requestSubmit();
+        \\        return report('submitted_form_requestSubmit', 'form.requestSubmit', activeInput, '');
+        \\      }}
+        \\      activeInput.form.submit();
+        \\      return report('submitted_form_submit', 'form.submit', activeInput, '');
+        \\    }} catch (e) {{}}
+        \\  }}
+        \\  if (activeInput && activeInput.offsetParent !== null) {{
+        \\    try {{
+        \\      activeInput.focus();
+        \\      activeInput.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
+        \\      activeInput.dispatchEvent(new KeyboardEvent('keypress', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
+        \\      activeInput.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
+        \\      return report('submitted_enter_key', 'enter', activeInput, '');
+        \\    }} catch (e) {{}}
+        \\  }}
         \\  const allBtns = doc.querySelectorAll('button, input[type="submit"]');
         \\  for (const bt of allBtns) {{
         \\    const txt = (bt.textContent || bt.value || '').trim();
         \\    if (txt === 'Submit' && bt.offsetParent !== null && !bt.disabled) {{
         \\      bt.click();
-        \\      return 'clicked_text_submit';
+        \\      return report('clicked_text_submit', 'exact-submit', bt, txt);
         \\    }}
         \\  }}
-        \\  // Fallback 1: generic input[type="submit"]
         \\  const inpSubmit = doc.querySelector('input[type="submit"]');
         \\  if (inpSubmit && inpSubmit.offsetParent !== null && !inpSubmit.disabled) {{
         \\    inpSubmit.click();
-        \\    return 'clicked_input_submit';
+        \\    return report('clicked_input_submit', 'input-submit', inpSubmit, inpSubmit.value || '');
         \\  }}
-        \\  // Fallback 2: button[type="submit"]
         \\  const btn = doc.querySelector('button[type="submit"]');
         \\  if (btn && btn.offsetParent !== null && !btn.disabled) {{
         \\    btn.click();
-        \\    return 'clicked_type_submit';
+        \\    return report('clicked_type_submit', 'button-type-submit', btn, btn.textContent || '');
         \\  }}
-        \\  // Fallback 3: ANY interactive element with submit/verify/next text
         \\  const btns = doc.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]');
         \\  for (const bt of btns) {{
         \\    const txt = (bt.textContent || bt.value || '').trim().toLowerCase();
         \\    if (bt.offsetParent !== null && !bt.disabled && (txt.includes('submit') || txt.includes('verify') || txt.includes('next'))) {{
         \\      bt.click();
-        \\      return 'clicked_text_' + txt;
+        \\      return report('clicked_text_' + txt, 'text-match', bt, txt);
         \\    }}
         \\  }}
-        \\  // Last resort: first visible non-audio button
         \\  for (const bt of btns) {{
         \\    const txt = (bt.textContent || bt.value || '').trim().toLowerCase();
         \\    if (bt.offsetParent !== null && !bt.disabled && !txt.includes('audio') && !txt.includes('play')) {{
         \\      bt.click();
-        \\      return 'clicked_fallback';
+        \\      return report('clicked_fallback', 'fallback', bt, txt);
         \\    }}
         \\  }}
-        \\  return 'no_submit';
+        \\  return report('no_submit', 'none', null, '');
         \\}})()
     , .{});
     defer allocator.free(submit_script);
@@ -567,7 +595,7 @@ pub fn injectAnswerOnTarget(
         \\  }
         \\  const bodyText = (doc.body && doc.body.innerText || '');
         \\  const lower = bodyText.toLowerCase();
-        \\  const wrongText = lower.includes('incorrect') || lower.includes('wrong') || lower.includes('only enter the number');
+        \\  const wrongText = lower.includes('incorrect') || lower.includes('wrong answer');
         \\  const completionText = lower.includes('verification complete') || lower.includes('challenge complete') || lower.includes('you are all set') || lower.includes("you're all set");
         \\  const inputVisible = !!(input && input.offsetParent !== null);
         \\  return JSON.stringify({ input_value: input ? String(input.value || '') : '', input_visible: inputVisible, body_text_snippet: bodyText.slice(0, 240), wrong_text: wrongText, completion_text: completionText });
