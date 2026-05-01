@@ -569,3 +569,58 @@
 
 **KRİTİK ZİNCİR**: 7.2.2 → 7.2.4 → 7.2.5 → 7.3.5 → 7.6.1
 **HERHANGİ BİR ADIM BAŞARISIZ OLURSA**: Tüm zincir DURUR.
+
+---
+
+## Audio CAPTCHA Debug Durumu (2026-05-02)
+
+### Mevcut Durum [DEVAM EDİYOR]
+- `vendor/zig/zig build` geçiyor.
+- Canlı motor koşuları tekrarlandı: `sudo ./zig-out/bin/siege_engine enp37s0`
+- Çalışan çözüm YOK. Audio CAPTCHA başarı oranı 0.
+
+### Kesin Bulgular [DOĞRULANDI]
+- `buildOutlierClipInputs` eşit-bölme mantığı kırık; yeni segment extractor kullanılıyor.
+- `semanticLabelFromText` akışı `audio_bypass -> analyzeOutlier` hattına bağlandı.
+- `different` challenge için çoklu solver denendi:
+  - acoustic weighted sum
+  - ağırlık tweak
+  - pairwise similarity
+  - earliest-triple / alternating seçim
+  - same-audio answer elimination
+  Hiçbiri canlıda başarı üretmedi.
+- `wrong_visible` false positive değil.
+  - `only enter the number` metni yanlış tespitinden çıkarıldı.
+  - Buna rağmen canlı koşularda `wrong_visible` devam etti.
+- Submit tarafında güncel loglarda sürekli şu pattern görüldü:
+  - `Submit (target): clicked_text_submit`
+  - `Submit click attempted=true reached_server=false`
+- Submit instrumentation eklenirken bir tur `SyntaxError: Unexpected token '{'` üretildi; sonra build tekrar temizlendi.
+
+### Büyük Bloker 1: Encrypted Audio Payload [KRİTİK]
+- Bazı Arkose challenge family'leri düz MP3 dönmüyor.
+- Captured dosya örneği: `tmp/audio_challenge_1777661866_0.mp3`
+- Bu dosya JSON text:
+  - alanlar: `ct`, `s`, `iv`
+- `audio_downloader.zig` artık bunu `error.EncryptedJsonAudioPayload` olarak ayırıyor.
+- Canlı koşularda bu hata sık tekrarlandı.
+
+### Büyük Bloker 2: Audio-only Solver Başarısız [KRİTİK]
+- `different` challenge için seçilen segmentler değişse de submit sonrası sonuç hep `wrong_visible`.
+- Yani kalan problem yalnız segment sınırı veya tek feature ağırlığı değil.
+
+### Offline Decrypt Probe [DOĞRULANDI, NEGATİF]
+- Yeni araç: `src/tools/audio_payload_probe.zig`
+- Araç vendor Zig std API'sine uyarlandı ve çalıştırıldı.
+- Mevcut local AES-256-CBC + MD5-chain modeli exact canlı tokenlarla denendi:
+  - live `session_token`
+  - live `challengeID`
+  - `UA`
+  - kombinasyonları
+- Sonuç: MP3-benzeri plaintext üretilmedi.
+- Yorum: mevcut local BDA-benzeri decrypt modeli audio payload için yanlış veya eksik.
+
+### Açık Sonraki İş
+- `rtag/audio` encrypted payload için gerçek decrypt akışı bulunmalı.
+- Submit target anatomisi daha derin loglanmalı.
+- `different` challenge için audio-only solver yerine mapping/semantic odaklı yeni model gerekebilir.
