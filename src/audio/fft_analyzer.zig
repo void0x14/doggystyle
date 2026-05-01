@@ -16,7 +16,7 @@ pub const SpectralFluxResult = struct {
 };
 
 pub const ClipInput = struct { samples: []const f32, sample_rate: u32 };
-pub const SemanticLabel = enum { water, bee, steps, unknown };
+pub const SemanticLabel = enum { water, bee, steps, unknown, different };
 pub const VADConfig = struct { announcement_skip_ms: u32 = 0, frame_ms: u32 = 10, min_active_frames: u32 = 3, snr_min: f64 = 3.0 };
 pub const OutlierConfig = struct { vad: VADConfig = .{}, min_confidence: f64 = 0.15, ambiguous_score_threshold: f64 = 0.05, hardware_primary_margin: f64 = 0.20, quantization_tolerance: f64 = 0.1, low_freq_cutoff_hz: f64 = 500.0, optional_bit_depth: ?u8 = null };
 pub const DecisionMode = enum { hardware_primary, weighted_fallback, ambiguous };
@@ -392,6 +392,7 @@ fn semanticLabelFromText(text: []const u8) SemanticLabel {
     if (containsAsciiIgnoreCase(text, "water")) return .water;
     if (containsAsciiIgnoreCase(text, "bee") or containsAsciiIgnoreCase(text, "buzz")) return .bee;
     if (containsAsciiIgnoreCase(text, "step") or containsAsciiIgnoreCase(text, "footstep")) return .steps;
+    if (containsAsciiIgnoreCase(text, "different") or containsAsciiIgnoreCase(text, "odd")) return .different;
     return .unknown;
 }
 
@@ -619,78 +620,44 @@ fn computeOutlierScores(features: [CLIP_COUNT]ClipFeatures) [CLIP_COUNT]OutlierS
     return scores;
 }
 
-const WeightedMetric = struct { value: f64, weight: f64, confidence: f64 };
+fn computeDispatcherScores(features: [CLIP_COUNT]ClipFeatures, label: SemanticLabel) [CLIP_COUNT]f64 {
+    var values: [CLIP_COUNT]f64 = undefined;
+    switch (label) {
+        .water => {
+            for (features, 0..) |f, i| values[i] = f.acoustic.spectral_centroid;
+            return maxAdScores(values);
+        },
+        .bee => {
+            for (features, 0..) |f, i| values[i] = f.acoustic.harmonic_peak_ratio + f.acoustic.narrowband_stability;
+            return maxAdScores(values);
+        },
+        .steps => {
+            for (features, 0..) |f, i| values[i] = f.acoustic.low_frequency_transient_energy;
+            return maxAdScores(values);
+        },
+        .unknown, .different => {
+            const flux = [_]f64{ features[0].acoustic.spectral_flux, features[1].acoustic.spectral_flux, features[2].acoustic.spectral_flux };
+            const centroid = [_]f64{ features[0].acoustic.spectral_centroid, features[1].acoustic.spectral_centroid, features[2].acoustic.spectral_centroid };
+            const zcr = [_]f64{ features[0].acoustic.zero_crossing_rate, features[1].acoustic.zero_crossing_rate, features[2].acoustic.zero_crossing_rate };
+            const harmonic = [_]f64{ features[0].acoustic.harmonic_peak_ratio, features[1].acoustic.harmonic_peak_ratio, features[2].acoustic.harmonic_peak_ratio };
+            const rolloff = [_]f64{ features[0].acoustic.spectral_rolloff, features[1].acoustic.spectral_rolloff, features[2].acoustic.spectral_rolloff };
+            const narrowband = [_]f64{ features[0].acoustic.narrowband_stability, features[1].acoustic.narrowband_stability, features[2].acoustic.narrowband_stability };
+            const lowfreq = [_]f64{ features[0].acoustic.low_frequency_transient_energy, features[1].acoustic.low_frequency_transient_energy, features[2].acoustic.low_frequency_transient_energy };
 
-fn weightedScore(weighted_values: []const WeightedMetric) f64 {
-    var weighted_sum: f64 = 0.0;
-    var effective_weight_sum: f64 = 0.0;
-    for (weighted_values) |item| {
-        const effective_weight = item.weight * item.confidence;
-        weighted_sum += item.value * effective_weight;
-        effective_weight_sum += effective_weight;
+            const flux_scores = maxAdScores(flux);
+            const centroid_scores = maxAdScores(centroid);
+            const zcr_scores = maxAdScores(zcr);
+            const harmonic_scores = maxAdScores(harmonic);
+            const rolloff_scores = maxAdScores(rolloff);
+            const narrowband_scores = maxAdScores(narrowband);
+            const lowfreq_scores = maxAdScores(lowfreq);
+
+            for (0..CLIP_COUNT) |i| {
+                values[i] = flux_scores[i] + centroid_scores[i] + zcr_scores[i] + harmonic_scores[i] + rolloff_scores[i] + narrowband_scores[i] + lowfreq_scores[i];
+            }
+            return values;
+        },
     }
-    if (effective_weight_sum == 0.0) return 0.0;
-    return weighted_sum / effective_weight_sum;
-}
-
-fn computeHardwareScores(scores: [CLIP_COUNT]OutlierScore, features: [CLIP_COUNT]ClipFeatures) [CLIP_COUNT]f64 {
-    var result: [CLIP_COUNT]f64 = undefined;
-    for (0..CLIP_COUNT) |i| {
-        const items = [_]WeightedMetric{
-            .{ .value = scores[i].dc_offset_score, .weight = 0.35, .confidence = features[i].hardware.dc_bias_confidence },
-            .{ .value = scores[i].noise_floor_score, .weight = 0.25, .confidence = features[i].hardware.noise_floor_confidence },
-            .{ .value = scores[i].quantization_uniformity_score, .weight = 0.20, .confidence = 1.0 },
-            .{ .value = scores[i].crest_factor_score, .weight = 0.10, .confidence = 1.0 },
-            .{ .value = scores[i].rms_energy_score, .weight = 0.10, .confidence = 1.0 },
-        };
-        result[i] = weightedScore(&items);
-    }
-    return result;
-}
-
-fn computeAcousticScores(scores: [CLIP_COUNT]OutlierScore, label: SemanticLabel) [CLIP_COUNT]f64 {
-    var result: [CLIP_COUNT]f64 = undefined;
-    for (0..CLIP_COUNT) |i| {
-        result[i] = switch (label) {
-            .water => weightedScore(&[_]WeightedMetric{
-                .{ .value = scores[i].spectral_flux_score, .weight = 0.30, .confidence = 1.0 },
-                .{ .value = scores[i].spectral_rolloff_score, .weight = 0.20, .confidence = 1.0 },
-                .{ .value = scores[i].zero_crossing_rate_score, .weight = 0.20, .confidence = 1.0 },
-                .{ .value = scores[i].spectral_centroid_score, .weight = 0.15, .confidence = 1.0 },
-                .{ .value = scores[i].low_frequency_transient_score, .weight = 0.15, .confidence = 1.0 },
-            }),
-            .bee => weightedScore(&[_]WeightedMetric{
-                .{ .value = scores[i].harmonic_peak_score, .weight = 0.30, .confidence = 1.0 },
-                .{ .value = scores[i].narrowband_stability_score, .weight = 0.30, .confidence = 1.0 },
-                .{ .value = scores[i].spectral_centroid_score, .weight = 0.20, .confidence = 1.0 },
-                .{ .value = scores[i].spectral_flux_score, .weight = 0.10, .confidence = 1.0 },
-                .{ .value = scores[i].spectral_rolloff_score, .weight = 0.10, .confidence = 1.0 },
-            }),
-            .steps => weightedScore(&[_]WeightedMetric{
-                .{ .value = scores[i].low_frequency_transient_score, .weight = 0.35, .confidence = 1.0 },
-                .{ .value = scores[i].spectral_flux_score, .weight = 0.25, .confidence = 1.0 },
-                .{ .value = scores[i].crest_factor_score, .weight = 0.15, .confidence = 1.0 },
-                .{ .value = scores[i].zero_crossing_rate_score, .weight = 0.15, .confidence = 1.0 },
-                .{ .value = scores[i].spectral_rolloff_score, .weight = 0.10, .confidence = 1.0 },
-            }),
-            .unknown => weightedScore(&[_]WeightedMetric{
-                .{ .value = scores[i].spectral_flux_score, .weight = 0.15, .confidence = 1.0 },
-                .{ .value = scores[i].spectral_rolloff_score, .weight = 0.15, .confidence = 1.0 },
-                .{ .value = scores[i].zero_crossing_rate_score, .weight = 0.15, .confidence = 1.0 },
-                .{ .value = scores[i].harmonic_peak_score, .weight = 0.15, .confidence = 1.0 },
-                .{ .value = scores[i].spectral_centroid_score, .weight = 0.15, .confidence = 1.0 },
-                .{ .value = scores[i].narrowband_stability_score, .weight = 0.10, .confidence = 1.0 },
-                .{ .value = scores[i].low_frequency_transient_score, .weight = 0.15, .confidence = 1.0 },
-            }),
-        };
-    }
-    return result;
-}
-
-fn computeFinalScores(hardware_scores: [CLIP_COUNT]f64, acoustic_scores: [CLIP_COUNT]f64) [CLIP_COUNT]f64 {
-    var final_scores: [CLIP_COUNT]f64 = undefined;
-    for (0..CLIP_COUNT) |i| final_scores[i] = hardware_scores[i] * 0.70 + acoustic_scores[i] * 0.30;
-    return final_scores;
 }
 
 fn bestIndexAndMargin(values: [CLIP_COUNT]f64) struct { index: u8, margin: f64, range: f64 } {
@@ -730,15 +697,12 @@ pub fn analyzeOutlier(clips: []const ClipInput, label: SemanticLabel, config: Ou
 
     const grid = try chooseCommonQuantizationGrid(clips, &features, config);
     const outlier_scores = computeOutlierScores(features);
-    const hardware_scores = computeHardwareScores(outlier_scores, features);
-    const acoustic_scores = computeAcousticScores(outlier_scores, label);
-    const final_scores = computeFinalScores(hardware_scores, acoustic_scores);
-    const hardware_best = bestIndexAndMargin(hardware_scores);
-    const final_best = bestIndexAndMargin(final_scores);
-    const decision_mode: DecisionMode = if (hardware_best.margin >= config.hardware_primary_margin) .hardware_primary else .weighted_fallback;
-    const guess = (if (decision_mode == .hardware_primary) hardware_best.index else final_best.index) + 1;
-    const confidence = if (decision_mode == .hardware_primary) hardware_best.margin else final_best.margin;
-    const score_range = if (decision_mode == .hardware_primary) hardware_best.range else final_best.range;
+    const dispatcher_scores = computeDispatcherScores(features, label);
+    const best = bestIndexAndMargin(dispatcher_scores);
+    const decision_mode: DecisionMode = .weighted_fallback;
+    const guess = best.index + 1;
+    const confidence = best.margin;
+    const score_range = best.range;
     if (score_range <= config.ambiguous_score_threshold or confidence < config.min_confidence) return error.AmbiguousSignal;
 
     return .{
@@ -746,9 +710,9 @@ pub fn analyzeOutlier(clips: []const ClipInput, label: SemanticLabel, config: Ou
         .execution_time_us = @intCast((monotonicNowNs() - start_ns) / 1_000),
         .features = features,
         .outlier_scores = outlier_scores,
-        .hardware_scores = hardware_scores,
-        .acoustic_scores = acoustic_scores,
-        .final_scores = final_scores,
+        .hardware_scores = .{0.0} ** CLIP_COUNT,
+        .acoustic_scores = dispatcher_scores,
+        .final_scores = dispatcher_scores,
         .confidence = confidence,
         .decision_mode = decision_mode,
         .diagnostics = .{
@@ -797,11 +761,11 @@ fn computeSpectralFlux(scratch_allocator: std.mem.Allocator, clip: []const f32, 
     std.debug.assert(std.math.isPowerOfTwo(fft_len));
     const half_bins = fft_len / 2;
 
-    const bands = [_]struct { start_hz: f64, end_hz: f64, weight: f64 }{
-        .{ .start_hz = 0.0, .end_hz = 500.0, .weight = 0.15 },
-        .{ .start_hz = 500.0, .end_hz = 2000.0, .weight = 0.35 },
-        .{ .start_hz = 2000.0, .end_hz = 8000.0, .weight = 0.35 },
-        .{ .start_hz = 8000.0, .end_hz = 22000.0, .weight = 0.15 },
+    const bands = [_]struct { start_hz: f64, end_hz: f64 }{
+        .{ .start_hz = 0.0, .end_hz = 500.0 },
+        .{ .start_hz = 500.0, .end_hz = 2000.0 },
+        .{ .start_hz = 2000.0, .end_hz = 8000.0 },
+        .{ .start_hz = 8000.0, .end_hz = 22000.0 },
     };
     const sample_rate_f = @as(f64, @floatFromInt(sample_rate));
 
@@ -846,7 +810,7 @@ fn computeSpectralFlux(scratch_allocator: std.mem.Allocator, clip: []const f32, 
         }
 
         const delta = @abs(second_half_energy - first_half_energy[band_index]) / (first_half_energy[band_index] + 1e-10);
-        total_score += delta * band.weight;
+        total_score += delta;
     }
 
     return total_score;
@@ -1173,6 +1137,7 @@ test "fft_analyzer: semantic labels parse text" {
     try std.testing.expectEqual(SemanticLabel.water, semanticLabelFromText("Water dripping"));
     try std.testing.expectEqual(SemanticLabel.bee, semanticLabelFromText("buzzing bees"));
     try std.testing.expectEqual(SemanticLabel.steps, semanticLabelFromText("FOOTSTEPS"));
+    try std.testing.expectEqual(SemanticLabel.different, semanticLabelFromText("which one is different"));
     try std.testing.expectEqual(SemanticLabel.unknown, semanticLabelFromText("traffic"));
 }
 
@@ -1255,14 +1220,6 @@ test "fft_analyzer: harmonic peak raw feature maps to harmonic peak score" {
     try std.testing.expect(scores[2].harmonic_peak_score > scores[1].harmonic_peak_score);
 }
 
-test "fft_analyzer: final score combines hardware and acoustic with 70 30 weighting" {
-    const final_scores = computeFinalScores(.{ 1.0, 0.0, 0.0 }, .{ 0.0, 1.0, 0.0 });
-
-    try std.testing.expectApproxEqAbs(@as(f64, 0.7), final_scores[0], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.3), final_scores[1], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), final_scores[2], 0.0001);
-}
-
 test "fft_analyzer: analyzeOutlier returns ambiguous for identical clips" {
     var clip = [_]f32{0.01} ** 4096;
     for (512..4096) |i| {
@@ -1301,30 +1258,6 @@ test "fft_analyzer: analyzeOutlier uses whole clip when VAD rejects low SNR acti
     try std.testing.expectEqual(@as(u8, 3), result.guess);
     try std.testing.expectEqual(@as(usize, 0), result.features[2].active.start);
     try std.testing.expectEqual(@as(usize, clip2.len), result.features[2].active.end);
-}
-
-test "fft_analyzer: analyzeOutlier DC outlier wins hardware primary" {
-    var clip0 = [_]f32{0.0} ** 4096;
-    var clip1 = [_]f32{0.0} ** 4096;
-    var clip2 = [_]f32{0.0} ** 4096;
-    for (0..4096) |i| {
-        const t = @as(f64, @floatFromInt(i)) / 8192.0;
-        const tone = if (i < 512) 0.0 else 0.2 * @sin(2.0 * std.math.pi * 440.0 * t);
-        clip0[i] = @floatCast(0.01 + tone);
-        clip1[i] = @floatCast(0.01 + tone);
-        clip2[i] = @floatCast(0.25 + tone);
-    }
-    const clips = [_]ClipInput{
-        .{ .samples = &clip0, .sample_rate = 8192 },
-        .{ .samples = &clip1, .sample_rate = 8192 },
-        .{ .samples = &clip2, .sample_rate = 8192 },
-    };
-
-    const result = try analyzeOutlier(&clips, .unknown, .{ .vad = .{ .snr_min = 1.1 }, .hardware_primary_margin = 0.05 });
-
-    try std.testing.expectEqual(@as(u8, 3), result.guess);
-    try std.testing.expectEqual(DecisionMode.hardware_primary, result.decision_mode);
-    try std.testing.expect(result.outlier_scores[2].dc_offset_score > result.outlier_scores[0].dc_offset_score);
 }
 
 test "fft_analyzer: analyze returns valid guess" {
