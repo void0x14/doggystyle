@@ -554,64 +554,31 @@ fn buildQueuedAudioFetchExpression(
     session_token: []const u8,
     game_token: []const u8,
 ) ![]u8 {
-    _ = session_token;
-    _ = game_token;
-
     return std.fmt.allocPrint(allocator,
-        \\(() => {{
-        \\  const key = '{s}_' + '{s}';
-        \\  if (window[key]) return window[key];
-        \\  window[key] = new Promise((resolve, reject) => {{
-        \\    const deadline = Date.now() + 35000;
-        \\
-        \\    const clickPlay = () => {{
-        \\      const btns = document.querySelectorAll('button, [role="button"]');
-        \\      for (const b of btns) {{
-        \\        const txt = (b.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-        \\        if ((txt === 'play' || b.classList.contains('play-button')) && b.offsetParent !== null && !b.disabled) {{
-        \\          b.click();
-        \\          return true;
-        \\        }}
-        \\      }}
-        \\      return false;
-        \\    }};
-        \\    clickPlay();
-        \\
-        \\    const poll = () => {{
-        \\      // Try to find any audio element with blob src
-        \\      const allMedia = document.querySelectorAll('audio, video');
-        \\      for (const m of allMedia) {{
-        \\        if (m.src && m.src.startsWith('blob:')) {{
-        \\          fetch(m.src).then(r => r.arrayBuffer()).then(buf => {{
-        \\            const bytes = new Uint8Array(buf);
-        \\            let bin = '';
-        \\            for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-        \\            resolve(btoa(bin));
-        \\          }}).catch(() => {{ if (Date.now() < deadline) setTimeout(poll, 400); else reject('timeout'); }});
-        \\          return;
-        \\        }}
-        \\      }}
-        \\      // Also check for Audio() instances via prototype hook
-        \\      if (window.__capturedAudioBlob) {{
-        \\        const reader = new FileReader();
-        \\        reader.onload = () => {{
-        \\          const bytes = new Uint8Array(reader.result);
-        \\          let bin = '';
-        \\          for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-        \\          resolve(btoa(bin));
-        \\        }};
-        \\        reader.readAsArrayBuffer(window.__capturedAudioBlob);
-        \\        return;
-        \\      }}
-        \\      clickPlay();
-        \\      if (Date.now() < deadline) setTimeout(poll, 400);
-        \\      else reject('timeout');
-        \\    }};
-        \\    setTimeout(poll, 800);
-        \\  }});
-        \\  return window[key];
+        \\(async () => {{
+        \\  const queueKey = '{s}';
+        \\  const queue = window[queueKey] || (window[queueKey] = {{ tail: Promise.resolve() }});
+        \\  const runFetch = async () => {{
+        \\    const challenge = '{s}';
+        \\    const sessionTok = '{s}';
+        \\    const gt = '{s}';
+        \\    let url = '/rtag/audio?challenge=' + challenge + '&gameToken=' + encodeURIComponent(gt);
+        \\    if (sessionTok) url += '&sessionToken=' + encodeURIComponent(sessionTok);
+        \\    try {{
+        \\      const resp = await fetch(url);
+        \\      if (!resp.ok) return 'ERROR:HTTP_' + resp.status;
+        \\      const buf = await resp.arrayBuffer();
+        \\      const bytes = new Uint8Array(buf);
+        \\      let binary = '';
+        \\      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        \\      return btoa(binary);
+        \\    }} catch(e) {{ return 'ERROR:FETCH'; }}
+        \\  }};
+        \\  const queued = queue.tail.then(runFetch, runFetch);
+        \\  queue.tail = queued.then(() => undefined, () => undefined);
+        \\  return await queued;
         \\}})()
-    , .{ AUDIO_FETCH_QUEUE_KEY, challenge_str });
+    , .{ AUDIO_FETCH_QUEUE_KEY, challenge_str, session_token, game_token });
 }
 
 fn looksLikeEncryptedJsonAudioPayload(bytes: []const u8) bool {
@@ -626,57 +593,108 @@ pub fn fetchAudioViaCdpEvaluate(
     challenge_index: u8,
     session_token: []const u8,
     game_token: []const u8,
-    game_core_ctx: i64,
 ) AudioDownloaderError!FetchResult {
     const challenge_str = try std.fmt.allocPrint(allocator, "{d}", .{challenge_index});
     defer allocator.free(challenge_str);
 
-    // SOURCE: Live test 2026-05-03 — game-core decrypts natively, we intercept via URL.createObjectURL hook
-    // The JS hook waits for game-core to create an audio blob, then captures it as base64
     const js = try buildQueuedAudioFetchExpression(allocator, challenge_str, session_token, game_token);
     defer allocator.free(js);
 
-    std.debug.print("[AUDIO] CDP blob-hook (ctx={d}): challenge={s}, waiting for game-core to decrypt audio...\n", .{ game_core_ctx, challenge_str });
+    std.debug.print("[AUDIO] CDP fetch: challenge={s}, sessionToken={s}\n", .{ challenge_str, session_token });
 
-    // MUST use evaluateInContext to reach the game-core iframe's DOM (cross-origin)
-    const response = cdp.evaluateInContextWithTimeout(js, game_core_ctx, 45000) catch |err| {
-        std.debug.print("[AUDIO] CDP blob-hook evaluate failed: {}\n", .{err});
+    const response = cdp.evaluateWithTimeout(js, AUDIO_FETCH_EVALUATE_TIMEOUT_MS) catch |err| {
+        std.debug.print("[AUDIO] CDP fetch evaluate failed: {}\n", .{err});
         return error.CdpEvalFailed;
     };
     defer allocator.free(response);
 
     const b64_string = browser_bridge.extractRuntimeEvaluateStringValue(allocator, response) catch |err| {
-        std.debug.print("[AUDIO] CDP blob-hook string extraction failed: {}\n", .{err});
+        std.debug.print("[AUDIO] CDP fetch string extraction failed: {}\n", .{err});
         return error.CdpEvalFailed;
     };
     defer allocator.free(b64_string);
 
-    if (mem.startsWith(u8, b64_string, "timeout")) {
-        std.debug.print("[AUDIO] CDP blob-hook: game-core did not create audio blob within timeout\n", .{});
+    if (mem.startsWith(u8, b64_string, "ERROR:")) {
+        std.debug.print("[AUDIO] CDP fetch error: {s}\n", .{b64_string});
+        if (mem.startsWith(u8, b64_string, "ERROR:NO_GAME_TOKEN")) return error.GameTokenNotFound;
+        if (mem.startsWith(u8, b64_string, "ERROR:HTTP_")) return error.FetchFailed;
+        if (mem.startsWith(u8, b64_string, "ERROR:FETCH")) return error.FetchFailed;
         return error.FetchFailed;
     }
 
-    std.debug.print("[AUDIO] CDP blob-hook captured base64 ({d} chars)\n", .{b64_string.len});
+    std.debug.print("[AUDIO] CDP fetch got base64 response ({d} chars)\n", .{b64_string.len});
 
-    // Decode base64 → raw audio bytes (already decrypted by game-core)
     const decoder = std.base64.standard.Decoder;
     const decoded_len = decoder.calcSizeForSlice(b64_string) catch |err| {
         std.debug.print("[AUDIO] Base64 calcSizeForSlice failed: {}\n", .{err});
         return error.Base64DecodeFailed;
     };
-    const mp3_data = try allocator.alloc(u8, decoded_len);
-    errdefer allocator.free(mp3_data);
-    decoder.decode(mp3_data, b64_string) catch |err| {
+    const raw_data = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(raw_data);
+    decoder.decode(raw_data, b64_string) catch |err| {
         std.debug.print("[AUDIO] Base64 decode failed: {}\n", .{err});
         return error.Base64DecodeFailed;
     };
+
+    // Handle both encrypted and unencrypted responses
+    var mp3_data: []u8 = undefined;
+    if (looksLikeEncryptedJsonAudioPayload(raw_data)) {
+        // Encrypted mode: need decryption_key from ekey endpoint
+        // The enforcement page can fetch it same-origin
+        std.debug.print("[AUDIO] Audio is encrypted, fetching decryption_key via CDP...\n", .{});
+        const ekey_js = try std.fmt.allocPrint(allocator,
+            \\(async () => {{
+            \\  try {{
+            \\    const body = 'session_token={s}&game_token={s}&sid=eu-west-1';
+            \\    const r = await fetch('/fc/ekey/', {{ method: 'POST',
+            \\      headers: {{ 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }},
+            \\      body: body }});
+            \\    if (!r.ok) return 'ERROR:EKEY_HTTP_' + r.status;
+            \\    const j = await r.json();
+            \\    return j.decryption_key || 'ERROR:NO_DKEY';
+            \\  }} catch(e) {{ return 'ERROR:EKEY_FETCH'; }}
+            \\}})()
+        , .{ session_token, game_token });
+        defer allocator.free(ekey_js);
+
+        const ekey_resp = cdp.evaluateWithTimeout(ekey_js, 15000) catch |err| {
+            std.debug.print("[AUDIO] ekey fetch failed: {}\n", .{err});
+            allocator.free(raw_data);
+            return error.FetchFailed;
+        };
+        defer allocator.free(ekey_resp);
+
+        const dkey = browser_bridge.extractRuntimeEvaluateStringValue(allocator, ekey_resp) catch |err| {
+            std.debug.print("[AUDIO] ekey result extraction failed: {}\n", .{err});
+            allocator.free(raw_data);
+            return error.FetchFailed;
+        };
+        defer allocator.free(dkey);
+
+        if (mem.startsWith(u8, dkey, "ERROR:")) {
+            std.debug.print("[AUDIO] ekey error: {s}\n", .{dkey});
+            allocator.free(raw_data);
+            return error.EncryptedJsonAudioPayload;
+        }
+
+        std.debug.print("[AUDIO] Decrypting with key={s}\n", .{dkey});
+        mp3_data = audio_decrypt.decryptArkoseAudio(allocator, raw_data, dkey) catch |err| {
+            std.debug.print("[AUDIO] Decrypt failed: {}\n", .{err});
+            allocator.free(raw_data);
+            return error.EncryptedJsonAudioPayload;
+        };
+        allocator.free(raw_data);
+        std.debug.print("[AUDIO] Decrypted: {d} bytes\n", .{mp3_data.len});
+    } else {
+        mp3_data = raw_data;
+    }
 
     const path = try saveAudioDataToDisk(allocator, mp3_data, challenge_index);
     errdefer allocator.free(path);
 
     const url = try std.fmt.allocPrint(allocator, "cdp://challenge_{d}", .{challenge_index});
 
-    std.debug.print("[AUDIO] CDP blob-hook saved challenge {d}: {d} bytes -> {s}\n", .{ challenge_index, mp3_data.len, path });
+    std.debug.print("[AUDIO] CDP fetch saved challenge {d}: {d} bytes -> {s}\n", .{ challenge_index, mp3_data.len, path });
     return .{ .url = url, .path = path, .data = mp3_data };
 }
 

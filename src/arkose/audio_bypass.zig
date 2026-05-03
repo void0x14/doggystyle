@@ -1104,7 +1104,6 @@ pub fn runAudioBypass(
             challenge_index,
             game_core_session_token orelse "",
             game_core_game_token orelse "",
-            game_core_ctx,
         ) catch |err| {
             std.debug.print("[AUDIO BYPASS] Attempt {d}: fetchAudioViaCdpEvaluate failed: {}\n", .{ total_attempted, err });
             if (total_attempted == 0) return err;
