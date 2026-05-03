@@ -481,14 +481,14 @@ pub fn injectAnswerOnTarget(
         \\    }} catch(e) {{}}
         \\  }}
         \\  const report = (submit_result, submit_path, el, txt) => {{
-        \\    const payload = {{{{
-        \\      submit_result,
-        \\      submit_path,
+        \\    const payload = {{
+        \\      submit_result: submit_result,
+        \\      submit_path: submit_path,
         \\      tag: el ? (el.tagName || '') : '',
         \\      type: el ? (el.type || '') : '',
         \\      has_form: !!(el && el.form),
         \\      text: txt || ''
-        \\    }}}};
+        \\    }};
         \\    window.__ghostLastSubmitResult = payload;
         \\    return JSON.stringify(payload);
         \\  }};
