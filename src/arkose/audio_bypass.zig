@@ -1282,41 +1282,68 @@ pub fn runAudioBypass(
                 }
             },
             .clicked => {
-                std.debug.print("[AUDIO BYPASS] Attempt {d}: Submit clicked, waiting for result\n", .{total_attempted});
-                _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 2, .nsec = 0 }, null);
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: Submit clicked, polling for DOM update...\n", .{total_attempted});
+                const re_proof = audio_injector.pollPostSubmitVerdict(&arkose_cdp, allocator, game_core_ctx, 3000);
+                std.debug.print("[AUDIO BYPASS] Re-poll verdict: {s}\n", .{@tagName(re_proof.verdict)});
+                if (re_proof.accepted()) {
+                    successful += 1;
+                    retry_answer_state = .{};
+                    challenge_index = successful;
+                    std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} solved (re-poll)\n", .{ successful, target_challenges });
+                    challenge_complete = detectPostSubmitUiState(&arkose_cdp, allocator, game_core_ctx) == .complete;
+                    if (challenge_complete) {
+                        std.debug.print("[AUDIO BYPASS] Arkose completion confirmed (re-poll)\n", .{});
+                    }
+                } else if (re_proof.verdict == .wrong) {
+                    std.debug.print("[AUDIO BYPASS] Re-poll revealed wrong answer {d}\n", .{answer});
+                } else {
+                    std.debug.print("[AUDIO BYPASS] Re-poll undecided\n", .{});
+                }
             },
             .unknown => {
-                // Unknown state: could be intermediate transition that wasn't detected
-                // by the post-submit proof JS. Check UI state to determine what happened.
-                std.debug.print("[AUDIO BYPASS] Attempt {d}: Unknown post-submit state, checking UI...\n", .{total_attempted});
-
-                _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 1, .nsec = 0 }, null);
-                const ui_state = detectPostSubmitUiState(&arkose_cdp, allocator, game_core_ctx);
-
-                switch (ui_state) {
-                    .complete => {
-                        successful += 1;
-                        challenge_index = successful;
-                        challenge_complete = true;
-                        std.debug.print("[AUDIO BYPASS] UI check revealed completion! Challenge {d}/{d}\n", .{ successful, target_challenges });
-                    },
-                    .transition => {
-                        successful += 1;
-                        challenge_index = successful;
-                        std.debug.print("[AUDIO BYPASS] UI check: intermediate transition confirmed (challenge {d}/{d})\n", .{ successful, target_challenges });
-                    },
-                    .continue_wait => {
-                        std.debug.print("[AUDIO BYPASS] UI check: still same challenge, will retry\n", .{});
-                    },
-                    .wrong_visible => {
-                        std.debug.print("[AUDIO BYPASS] UI check: wrong text visible; answer {d} rejected\n", .{answer});
-                    },
-                    .restarted => {
-                        std.debug.print("[AUDIO BYPASS] UI check: Arkose restarted challenges\n", .{});
-                    },
-                    .query_failed => {
-                        std.debug.print("[AUDIO BYPASS] UI check failed, continuing\n", .{});
-                    },
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: Unknown post-submit state, polling...\n", .{total_attempted});
+                const re_proof = audio_injector.pollPostSubmitVerdict(&arkose_cdp, allocator, game_core_ctx, 3000);
+                std.debug.print("[AUDIO BYPASS] Re-poll verdict: {s}\n", .{@tagName(re_proof.verdict)});
+                if (re_proof.accepted()) {
+                    successful += 1;
+                    retry_answer_state = .{};
+                    challenge_index = successful;
+                    std.debug.print("[AUDIO BYPASS] Challenge {d}/{d} solved (re-poll)\n", .{ successful, target_challenges });
+                    challenge_complete = detectPostSubmitUiState(&arkose_cdp, allocator, game_core_ctx) == .complete;
+                    if (challenge_complete) {
+                        std.debug.print("[AUDIO BYPASS] Arkose completion confirmed (re-poll)\n", .{});
+                    }
+                } else if (re_proof.verdict == .wrong) {
+                    std.debug.print("[AUDIO BYPASS] Re-poll revealed wrong answer {d}\n", .{answer});
+                } else {
+                    std.debug.print("[AUDIO BYPASS] Re-poll undecided, fallback to UI state check\n", .{});
+                    _ = std.os.linux.nanosleep(&std.os.linux.timespec{ .sec = 1, .nsec = 0 }, null);
+                    const ui_state = detectPostSubmitUiState(&arkose_cdp, allocator, game_core_ctx);
+                    switch (ui_state) {
+                        .complete => {
+                            successful += 1;
+                            challenge_index = successful;
+                            challenge_complete = true;
+                            std.debug.print("[AUDIO BYPASS] UI check: completion! Challenge {d}/{d}\n", .{ successful, target_challenges });
+                        },
+                        .transition => {
+                            successful += 1;
+                            challenge_index = successful;
+                            std.debug.print("[AUDIO BYPASS] UI check: transition (challenge {d}/{d})\n", .{ successful, target_challenges });
+                        },
+                        .continue_wait => {
+                            std.debug.print("[AUDIO BYPASS] UI check: still same challenge\n", .{});
+                        },
+                        .wrong_visible => {
+                            std.debug.print("[AUDIO BYPASS] UI check: wrong text; answer {d} rejected\n", .{answer});
+                        },
+                        .restarted => {
+                            std.debug.print("[AUDIO BYPASS] UI check: Arkose restarted\n", .{});
+                        },
+                        .query_failed => {
+                            std.debug.print("[AUDIO BYPASS] UI check failed\n", .{});
+                        },
+                    }
                 }
             },
         }

@@ -2,7 +2,21 @@
 
 ---
 
-## [2026-05-01] — Arkose Audio Segment Extractor Sert Speech Cutoff ile Gerçek Hayvan Kliplerini Attı
+## [2026-05-03] — Post-Submit Feedback Loop: One-Shot Proof Check DOM Gecikmesini Kaçırıyor
+
+**Hata:** `injectAnswerOnTarget()` submit sonrası proof_script'i tek sefer çalıştırıp hemen dönüyordu. Arkose DOM'u 1-3sn gecikmeyle güncellediği için proof_script eski DOM'u görüp `.clicked` veya `.unknown` döndürüyordu. `audio_bypass.zig` loop'unda `.clicked` sadece 2sn sleep yapıp aynı audio'yu tekrar indiriyordu (submit zaten olmuş). `.unknown` ise tek sefer UI check yapıp aynı audio'yu tekrar indiriyordu. Sonuç: motor cevabın doğru/yanlış olduğunu tespit edemeyip sonraki challenge'a geçemiyordu.
+
+**Kök sebep:** `injectAnswerOnTarget()` sonunda proof_script tek sefer çalışıyordu. Arkose'un DOM güncelleme gecikmesi (1-3sn) bu one-shot yaklaşımda sürekli `.clicked`/`.unknown` üretiyordu. `audio_bypass.zig` loop'u bu verdict'leri handle ederken submit'in zaten gerçekleştiğini farketmeyip aynı challenge'ı tekrar işlemeye çalışıyordu.
+
+**Kaynak:** Canlı motor logları — submit sonrası DOM'da hemen değişiklik olmaması; Arkose Labs UI behavior (1-3sn gecikme)
+
+**Düzeltme:**
+1. `pollPostSubmitVerdict()` fonksiyonu eklendi — her 500ms'de bir DOM'u kontrol eder (wrong text, completion text, input disappearance), 5sn timeout.
+2. `injectAnswerOnTarget()` sonundaki one-shot proof_script kaldırıldı; yerine `pollPostSubmitVerdict()` çağrılıyor.
+3. `audio_bypass.zig`'de `.clicked` handler'ı 2sn sleep yerine `pollPostSubmitVerdict()` ile DOM poll yapıyor.
+4. `audio_bypass.zig`'de `.unknown` handler'ı önce `pollPostSubmitVerdict()` dener, sonuç yoksa eski `detectPostSubmitUiState` fallback'ine düşer.
+5. Tüm testler geçiyor (21/21 audio_injector + audio_bypass).
+6. `submitResponseSucceeded()` kullanımı kaldırıldı — Arkose JSON response'ı submit sonrası Runtime.evaluate'de görünmediği için yanlış `.unknown` üretiyordu.
 
 **Hata:** `extractThreeLargestSegments()` bazı gerçek Arkose dosyalarında üçüncü hayvan klibi yerine 180ms/390ms kırpıntılar seçiyordu; hatta sentetik announcer+3-klip testinde hiç segment döndüremiyordu.
 

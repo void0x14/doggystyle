@@ -556,22 +556,30 @@ pub fn injectAnswerOnTarget(
         try cdp.evaluateWithTimeout(submit_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
     defer allocator.free(submit_response);
     std.debug.print("[AUDIO INJECTOR] Submit (target): {s}\n", .{submit_response[0..@min(submit_response.len, 200)]});
-    const click_attempted = mem.indexOf(u8, submit_response, "clicked_") != null;
-    const submit_reached_server = submitResponseSucceeded(submit_response);
-    std.debug.print("[AUDIO INJECTOR] Submit click attempted={} reached_server={}\n", .{ click_attempted, submit_reached_server });
-
-    // If the click happened but Arkose did not accept the submission (no_submit),
-    // treat as unknown so the caller re-checks UI state instead of wasting a retry.
-    if (click_attempted and !submit_reached_server) {
-        std.debug.print("[AUDIO INJECTOR] Submit click without server acceptance → unknown verdict\n", .{});
-        return .{ .verdict = .unknown };
-    }
-
     const submit_grace = std.os.linux.timespec{ .sec = 1, .nsec = 500 * std.time.ns_per_ms };
     _ = std.os.linux.nanosleep(&submit_grace, null);
 
-    // FIX 2026-04-29: Class-agnostic input detection for post-submit proof.
-    const proof_script =
+    // Poll DOM for up to 5s to detect Arkose's response to the submit.
+    // Arkose takes 1-3s to update DOM after correct/incorrect answer.
+    // One-shot proof_script consistently misses this delay → false .clicked/.unknown.
+    // SOURCE: Arkose Labs audio CAPTCHA — DOM transition delay after submit (live test 2026-04-27)
+    const proof = pollPostSubmitVerdict(cdp, allocator, context_id, 5000);
+    std.debug.print("[AUDIO INJECTOR] Post-submit verdict: {s}\n", .{@tagName(proof.verdict)});
+    return proof;
+}
+
+/// Poll the DOM after answer submission to detect Arkose's response.
+/// Checks every 500ms for DOM changes: wrong text, completion text, or input disappearance.
+/// Returns as soon as a definitive verdict is reached (wrong/complete/transition),
+/// else .clicked or .unknown after timeout.
+/// SOURCE: Arkose Labs audio CAPTCHA UI — DOM transitions after answer submit (live test)
+pub fn pollPostSubmitVerdict(
+    cdp: *browser_bridge.CdpClient,
+    allocator: std.mem.Allocator,
+    context_id: i64,
+    timeout_ms: u64,
+) PostSubmitProof {
+    const poll_script =
         \\(() => {
         \\  let doc = document;
         \\  const gc = document.querySelector('iframe[src*="game-core"]');
@@ -601,15 +609,50 @@ pub fn injectAnswerOnTarget(
         \\  return JSON.stringify({ input_value: input ? String(input.value || '') : '', input_visible: inputVisible, body_text_snippet: bodyText.slice(0, 240), wrong_text: wrongText, completion_text: completionText });
         \\})()
     ;
-    const proof_response = if (context_id > 0)
-        try cdp.evaluateInContextWithTimeout(proof_script, context_id, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS)
+
+    // SOURCE: CDP Runtime.evaluate with contextId for subframes
+    // SOURCE: std.os.linux.clock_gettime — monotonic timestamp
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    const start_ms = @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1000000;
+
+    while (true) {
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        const elapsed = (@as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1000000) - start_ms;
+        if (elapsed >= timeout_ms) break;
+
+        const response = if (context_id > 0)
+            cdp.evaluateInContextWithTimeout(poll_script, context_id, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS)
+        else
+            cdp.evaluateWithTimeout(poll_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
+
+        const resp = response catch {
+            const sleep_catch = std.os.linux.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_ms };
+            _ = std.os.linux.nanosleep(&sleep_catch, null);
+            continue;
+        };
+        defer allocator.free(resp);
+        std.debug.print("[AUDIO INJECTOR] Poll verdict ({d}ms): {s}\n", .{ elapsed, resp[0..@min(resp.len, 300)] });
+        const proof = classifyPostSubmitProof(allocator, resp);
+        if (proof.verdict != .unknown and proof.verdict != .clicked) {
+            return proof;
+        }
+
+        const sleep = std.os.linux.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&sleep, null);
+    }
+
+    // Final attempt at timeout boundary
+    const final_response = if (context_id > 0)
+        cdp.evaluateInContextWithTimeout(poll_script, context_id, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS)
     else
-        try cdp.evaluateWithTimeout(proof_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
-    defer allocator.free(proof_response);
-    std.debug.print("[AUDIO INJECTOR] Post-submit proof response: {s}\n", .{proof_response[0..@min(proof_response.len, 300)]});
-    const proof = classifyPostSubmitProof(allocator, proof_response);
-    std.debug.print("[AUDIO INJECTOR] Post-submit verdict: {s}\n", .{@tagName(proof.verdict)});
-    return proof;
+        cdp.evaluateWithTimeout(poll_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
+
+    if (final_response) |resp| {
+        defer allocator.free(resp);
+        return classifyPostSubmitProof(allocator, resp);
+    } else |_| {}
+    return .{ .verdict = .unknown };
 }
 
 pub fn submitResponseSucceeded(response: []const u8) bool {
