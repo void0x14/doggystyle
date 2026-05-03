@@ -285,6 +285,11 @@ fn segmentConfigForLabel(label: fft_analyzer.SemanticLabel) fft_analyzer.MultiSe
         // real options into repeated 630/750ms shards; 150ms restored substantial candidates
         // without the 400ms+ over-merge failure.
         config.merge_gap_ms = 150;
+    } else if (label == .steps) {
+        // SOURCE: Footstep audio consists of short ~50ms transients with 100-400ms
+        // gaps between footfalls within a single 5s segment. 150ms merge gap bridges
+        // common intra-segment footfall gaps without merging different surface segments.
+        config.merge_gap_ms = 150;
     }
     return config;
 }

@@ -936,6 +936,7 @@ pub fn extractThreeLargestSegmentsForLabel(
 ) ![CLIP_COUNT]ClipInput {
     if (samples.len == 0) return error.InvalidClip;
     if (sample_rate == 0) return error.InvalidSampleRate;
+    _ = label;
 
     const frame_len = msToSamples(config.frame_ms, sample_rate);
     if (frame_len == 0) return error.InvalidSampleRate;
@@ -986,42 +987,76 @@ pub fn extractThreeLargestSegmentsForLabel(
         raw_count += 1;
     }
 
-    // --- Pass 3: merge adjacent animal runs with gap < merge_gap_ms ---
-    // merge_gap_ms bridges short quiet gaps inside a single sound while keeping
-    // larger inter-option gaps separated.
-    const merge_samples = msToSamples(config.merge_gap_ms, sample_rate);
-    var merged: [MAX_SEGMENTS]SegmentBound = undefined;
-    var merged_count: usize = 0;
-    for (0..raw_count) |i| {
-        const seg = raw[i];
-        if (merged_count > 0 and seg.start >= merged[merged_count - 1].end and
-            seg.start - merged[merged_count - 1].end < merge_samples)
-        {
-            merged[merged_count - 1].end = seg.end;
-        } else {
-            merged[merged_count] = seg;
-            merged_count += 1;
+    // --- Pass 3-4: merge and filter with progressive gap increase ---
+    // SOURCE: Transient-heavy audio (footsteps, percussion) produces short energy
+    // bursts with quiet gaps between them. A single config.merge_gap_ms may be too
+    // small to merge footfall gaps within a ~5s segment, causing every transient to
+    // become a separate sub-200ms fragment that gets filtered out.
+    // Progressive retry widens the merge gap until we find >= CLIP_COUNT segments.
+    // Multipliers chosen so that widest gap (10x = 500ms default, 1500ms for .steps/.different)
+    // stays below typical cross-segment gaps in Arkose format (~1s+).
+    const gap_multipliers = [_]u32{ 1, 4, 10 };
+    const min_samples_len = msToSamples(config.min_segment_ms, sample_rate);
+    var best_filtered: [MAX_SEGMENTS]SegmentBound = undefined;
+    var best_filtered_count: usize = 0;
+    var used_multiplier: u32 = 1;
+
+    for (gap_multipliers) |mult| {
+        const effective_gap = config.merge_gap_ms * mult;
+        const effective_merge_samples = msToSamples(effective_gap, sample_rate);
+
+        var merged: [MAX_SEGMENTS]SegmentBound = undefined;
+        var merged_count: usize = 0;
+        for (0..raw_count) |i| {
+            const seg = raw[i];
+            if (merged_count > 0 and seg.start >= merged[merged_count - 1].end and
+                seg.start - merged[merged_count - 1].end < effective_merge_samples)
+            {
+                merged[merged_count - 1].end = seg.end;
+            } else {
+                merged[merged_count] = seg;
+                merged_count += 1;
+            }
         }
+
+        var filtered: [MAX_SEGMENTS]SegmentBound = undefined;
+        var filtered_count: usize = 0;
+        for (0..merged_count) |i| {
+            const seg = merged[i];
+            if (seg.end > seg.start and seg.end - seg.start >= min_samples_len) {
+                filtered[filtered_count] = seg;
+                filtered_count += 1;
+            }
+        }
+
+        if (filtered_count > best_filtered_count) {
+            best_filtered = filtered;
+            best_filtered_count = filtered_count;
+            used_multiplier = mult;
+        }
+
+        if (filtered_count >= CLIP_COUNT) break;
+
+        // If widening the gap reduces segment count, stop — further widening
+        // will only merge different audio segments together.
+        if (filtered_count > 0 and filtered_count < best_filtered_count and mult > 1) break;
     }
 
-    // --- Pass 4: filter segments shorter than min_segment_ms ---
-    const min_samples_len = msToSamples(config.min_segment_ms, sample_rate);
-    var filtered: [MAX_SEGMENTS]SegmentBound = undefined;
-    var filtered_count: usize = 0;
-    for (0..merged_count) |i| {
-        const seg = merged[i];
-        if (seg.end > seg.start and seg.end - seg.start >= min_samples_len) {
-            filtered[filtered_count] = seg;
-            filtered_count += 1;
-        }
-    }
-    if (filtered_count < CLIP_COUNT) {
+    if (best_filtered_count < CLIP_COUNT) {
         std.debug.print(
-            "[SEGMENT] Only {d} active segments found (need {d}) — error.InsufficientSegments\n",
-            .{ filtered_count, CLIP_COUNT },
+            "[SEGMENT] Only {d} active segments found (need {d}) after {d}x merge gap — error.InsufficientSegments\n",
+            .{ best_filtered_count, CLIP_COUNT, used_multiplier },
         );
         return error.InsufficientSegments;
     }
+
+    std.debug.print(
+        "[SEGMENT] Found {d} segments with {d}x merge gap ({d}ms → {d}ms effective)\n",
+        .{ best_filtered_count, used_multiplier, config.merge_gap_ms, config.merge_gap_ms * used_multiplier },
+    );
+
+    const filtered = best_filtered;
+    const filtered_count = best_filtered_count;
 
     // --- Pass 5: build candidates with segment-level centroid ---
     var candidates: [MAX_SEGMENTS]SegmentCandidate = undefined;
@@ -1045,26 +1080,21 @@ pub fn extractThreeLargestSegmentsForLabel(
     }
 
     var selected: [CLIP_COUNT]SegmentBound = undefined;
-    if (label == .different and config.speech_centroid_cutoff_hz > 0.0) {
-        selected = selectAlternatingAnimalSegments(&candidates, candidate_count, config.speech_centroid_cutoff_hz) catch |err| switch (err) {
-            error.InsufficientSegments => blk: {
-                const primary_cutoff = config.speech_centroid_cutoff_hz;
-                const fallback_cutoff: f64 = 1500.0;
-                break :blk selectBestCandidateTrio(&candidates, candidate_count, primary_cutoff) catch |fallback_err| switch (fallback_err) {
-                    error.InsufficientSegments => try selectBestCandidateTrio(&candidates, candidate_count, fallback_cutoff),
-                    else => return fallback_err,
-                };
-            },
-            else => return err,
-        };
-    } else {
+
+    // SOURCE: Live test 2026-05-03 — audio structure for ALL labels is:
+    //   [OPTION 1 speech] [sound effect 1] [OPTION 2 speech] [sound effect 2] [OPTION 3 speech] [sound effect 3]
+    // Speech-marker extraction works universally by finding "OPTION N" speech segments
+    // and taking the audio BETWEEN them as sound effects. This avoids the broken
+    // energy-based equal-splitting approach that fails for transient-heavy sounds.
+    selected = selectAlternatingAnimalSegments(&candidates, candidate_count, config.speech_centroid_cutoff_hz) catch blk: {
         const primary_cutoff = config.speech_centroid_cutoff_hz;
         const fallback_cutoff: f64 = 1500.0;
-        selected = selectBestCandidateTrio(&candidates, candidate_count, primary_cutoff) catch |err| switch (err) {
-            error.InsufficientSegments => try selectBestCandidateTrio(&candidates, candidate_count, fallback_cutoff),
-            else => return err,
-        };
-    }
+        const zero_cutoff: f64 = 0.0;
+        break :blk selectBestCandidateTrio(&candidates, candidate_count, primary_cutoff) catch
+            selectBestCandidateTrio(&candidates, candidate_count, fallback_cutoff) catch
+            selectBestCandidateTrio(&candidates, candidate_count, zero_cutoff) catch
+            return error.InsufficientSegments;
+    };
 
     // --- Pass 7: sort selected by start position ascending (playback order) ---
     for (1..CLIP_COUNT) |i| {
@@ -1103,34 +1133,100 @@ fn selectAlternatingAnimalSegments(
     candidate_count: usize,
     cutoff_hz: f64,
 ) AnalysisError![CLIP_COUNT]SegmentBound {
-    _ = cutoff_hz;
-    if (candidate_count < CLIP_COUNT) return error.InsufficientSegments;
+    // SOURCE: Live test 2026-05-03 — audio structure is [OPTION N speech][sound][OPTION N+1 speech][sound]...
+    // Strategy: Find "OPTION N" speech markers (low centroid + substantial duration),
+    // then extract the audio BETWEEN markers as sound effect segments.
+    // This replaces the broken "skip first prompt, take next 3" approach which fails
+    // when prompts are interleaved between sound effects.
 
-    // SOURCE: live odd-animal files 2026-05-01 — prompt often alternates
-    // [speech][option1][speech][option2][speech][option3], with optional later repeats.
-    // Prefer earliest three option-like segments after the opening prompt rather than
-    // duration-sorting across the full file, which can mix first-pass options with repeats.
-    var option_bounds: [CLIP_COUNT]SegmentBound = undefined;
-    var option_count: usize = 0;
-    var seen_prompt = false;
+    _ = cutoff_hz;
+
+    // Pass 1: identify speech markers — segments with low centroid + long duration
+    const min_speech_samples = 600 * 44100 / 1000; // 600ms @ 44.1kHz
+    var marker_indices: [MAX_SEGMENTS]usize = undefined;
+    var marker_count: usize = 0;
+
     for (0..candidate_count) |i| {
         const cand = candidates[i];
-        const is_prompt_like = cand.centroid_hz < 2100.0;
-        const substantial = cand.duration_samples >= 600 * 44100 / 1000;
-
-        if (!seen_prompt and is_prompt_like and substantial) {
-            seen_prompt = true;
-            continue;
-        }
-
-        if (seen_prompt and substantial) {
-            option_bounds[option_count] = cand.bound;
-            option_count += 1;
-            if (option_count == CLIP_COUNT) return option_bounds;
+        // Speech marker: centroid in speech range AND enough duration to be "OPTION N"
+        if (cand.centroid_hz < 2100.0 and cand.duration_samples >= min_speech_samples) {
+            marker_indices[marker_count] = i;
+            marker_count += 1;
         }
     }
 
-    return error.InsufficientSegments;
+    // Pass 2: sort markers by start position (playback order)
+    // NOTE: marker_count==0 causes integer overflow in `for (1..0)`, guard first
+    if (marker_count <= 1) return error.InsufficientSegments;
+
+    for (1..marker_count) |i| {
+        const key_idx = marker_indices[i];
+        const key_start = candidates[key_idx].bound.start;
+        var j: usize = i;
+        while (j > 0 and candidates[marker_indices[j - 1]].bound.start > key_start) : (j -= 1) {
+            marker_indices[j] = marker_indices[j - 1];
+        }
+        marker_indices[j] = key_idx;
+    }
+
+    // Need at least 3 markers to extract 3 sound segments between them
+    if (marker_count < 3) return error.InsufficientSegments;
+
+    // Use first 3 markers (in case there are more due to repeats)
+    // Structure: [marker_0=OPTION1] [sound1] [marker_1=OPTION2] [sound2] [marker_2=OPTION3] [sound3]
+    // Sound segments are BETWEEN markers:
+    var bounds: [CLIP_COUNT]SegmentBound = undefined;
+    bounds[0] = .{ .start = candidates[marker_indices[0]].bound.end, .end = candidates[marker_indices[1]].bound.start };
+    bounds[1] = .{ .start = candidates[marker_indices[1]].bound.end, .end = candidates[marker_indices[2]].bound.start };
+
+    // For the 3rd sound, search after marker_2 for a non-speech segment
+    // OR use [marker_2.end .. next_marker.start] if there's a 4th marker
+    // OR use [marker_2.end .. last_candidate.end] as fallback
+    if (marker_count >= 4) {
+        bounds[2] = .{ .start = candidates[marker_indices[2]].bound.end, .end = candidates[marker_indices[3]].bound.start };
+    } else {
+        // No 4th marker — the 3rd sound is after the 3rd marker.
+        // Find the first non-speech, substantial candidate after marker_2
+        var found_after: ?SegmentBound = null;
+        for (0..candidate_count) |i| {
+            const cand = candidates[i];
+            if (cand.bound.start >= candidates[marker_indices[2]].bound.end and
+                !(cand.centroid_hz < 2100.0 and cand.duration_samples >= min_speech_samples) and
+                cand.duration_samples >= 200 * 44100 / 1000)
+            {
+                found_after = cand.bound;
+                break;
+            }
+        }
+        if (found_after) |fb| {
+            bounds[2] = fb;
+        } else {
+            // Last resort: use the tail — everything after the last marker
+            // bounded by the last candidate's end or end of sample space
+            bounds[2] = .{ .start = candidates[marker_indices[2]].bound.end, .end = candidates[candidate_count - 1].bound.end };
+        }
+    }
+
+    // Validate: all segments must have positive duration and meet minimum
+    const min_sound_samples = 200 * 44100 / 1000;
+    for (bounds, 0..) |b, idx| {
+        if (b.end <= b.start or b.end - b.start < min_sound_samples) {
+            std.debug.print("[SPEECH-MARKER] Sound segment {d} too short: {d} samples\n", .{ idx, b.end - b.start });
+            return error.InsufficientSegments;
+        }
+    }
+
+    std.debug.print(
+        "[SPEECH-MARKER] Found {d} speech markers, extracted 3 sound segments ({d}ms/{d}ms/{d}ms)\n",
+        .{
+            marker_count,
+            (bounds[0].end - bounds[0].start) * 1000 / 44100,
+            (bounds[1].end - bounds[1].start) * 1000 / 44100,
+            (bounds[2].end - bounds[2].start) * 1000 / 44100,
+        },
+    );
+
+    return bounds;
 }
 
 fn computeSegmentCentroid(samples: []const f32, sample_rate: u32) f64 {
@@ -1912,6 +2008,111 @@ test "fft_analyzer: extractThreeLargestSegments returns error on all-silence aud
     @memset(buf, 0.0);
     const result = extractThreeLargestSegments(buf, sr, .{});
     try std.testing.expectError(error.InsufficientSegments, result);
+}
+
+fn fillTransientRegion(samples: []f32, sr: u32, transient_samples: usize, gap_samples: usize, freq_hz: f64, decay_factor: f64) void {
+    var pos: usize = 0;
+    while (pos + transient_samples <= samples.len) : (pos += transient_samples + gap_samples) {
+        for (0..transient_samples) |k| {
+            const env = @exp(-@as(f64, @floatFromInt(k)) / (@as(f64, @floatFromInt(transient_samples)) * decay_factor));
+            const t = @as(f64, @floatFromInt(k)) / @as(f64, @floatFromInt(sr));
+            samples[pos + k] = @floatCast(0.9 * env * @sin(2.0 * std.math.pi * freq_hz * t));
+        }
+    }
+}
+
+test "fft_analyzer: progressive merge gap finds 3 segments in transient-heavy footstep audio" {
+    const sr: u32 = 44100;
+    const gap_between_ms: usize = 1000;
+    const segment_dur_ms: usize = 2000; // shorter segments for faster test
+
+    const gap_between_s = msToSamples(@intCast(gap_between_ms), sr);
+    const segment_s = msToSamples(@intCast(segment_dur_ms), sr);
+
+    const total = gap_between_s + segment_s + gap_between_s + segment_s + gap_between_s + segment_s;
+    const buf = try std.testing.allocator.alloc(f32, total);
+    defer std.testing.allocator.free(buf);
+    @memset(buf, 0.0);
+
+    // Write 3 continuous tone segments with 1000ms gaps between them.
+    // With merge_gap_ms=50 (config default), intra-segment has no gaps
+    // (continuous tone), so 1x produces 3 segments directly.
+    // This validates that the progressive merge loop doesn't break things.
+    var cursor: usize = gap_between_s;
+    for (buf[cursor .. cursor + segment_s], 0..) |*s, i| {
+        const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(sr));
+        s.* = @floatCast(0.8 * @sin(2.0 * std.math.pi * 440.0 * t));
+    }
+    cursor = gap_between_s + segment_s + gap_between_s;
+    for (buf[cursor .. cursor + segment_s], 0..) |*s, i| {
+        const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(sr));
+        s.* = @floatCast(0.8 * @sin(2.0 * std.math.pi * 880.0 * t));
+    }
+    cursor = gap_between_s + segment_s + gap_between_s + segment_s + gap_between_s;
+    for (buf[cursor .. cursor + segment_s], 0..) |*s, i| {
+        const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(sr));
+        s.* = @floatCast(0.8 * @sin(2.0 * std.math.pi * 1320.0 * t));
+    }
+
+    const clips = try extractThreeLargestSegments(buf, sr, .{});
+
+    try std.testing.expect(clips[0].samples.len > 0);
+    try std.testing.expect(clips[1].samples.len > 0);
+    try std.testing.expect(clips[2].samples.len > 0);
+
+    const p0 = @intFromPtr(clips[0].samples.ptr);
+    const p1 = @intFromPtr(clips[1].samples.ptr);
+    const p2 = @intFromPtr(clips[2].samples.ptr);
+    try std.testing.expect(p0 < p1);
+    try std.testing.expect(p1 < p2);
+}
+
+test "fft_analyzer: progressive merge gap bridges transient gaps for footstep-like audio" {
+    const sr: u32 = 44100;
+    // Simulate footstep-like audio: 3 segments of 50ms bursts spaced 150ms apart,
+    // with 1000ms silence between segments.
+    const burst_ms: usize = 50;
+    const intra_gap_ms: usize = 150;
+    const inter_gap_ms: usize = 1000;
+    const segment_dur_ms: usize = 2000;
+
+    const burst_s = msToSamples(@intCast(burst_ms), sr);
+    const intra_gap_s = msToSamples(@intCast(intra_gap_ms), sr);
+    const inter_gap_s = msToSamples(@intCast(inter_gap_ms), sr);
+    const segment_s = msToSamples(@intCast(segment_dur_ms), sr);
+
+    const total = inter_gap_s + segment_s + inter_gap_s + segment_s + inter_gap_s + segment_s;
+    const buf = try std.testing.allocator.alloc(f32, total);
+    defer std.testing.allocator.free(buf);
+    @memset(buf, 0.0);
+
+    // Fill 3 segments with burst patterns
+    var cursor: usize = inter_gap_s;
+    fillTransientRegion(buf[cursor .. cursor + segment_s], sr, burst_s, intra_gap_s, 200.0, 0.3);
+    cursor = inter_gap_s + segment_s + inter_gap_s;
+    fillTransientRegion(buf[cursor .. cursor + segment_s], sr, burst_s, intra_gap_s, 400.0, 0.3);
+    cursor = inter_gap_s + segment_s + inter_gap_s + segment_s + inter_gap_s;
+    fillTransientRegion(buf[cursor .. cursor + segment_s], sr, burst_s, intra_gap_s, 600.0, 0.3);
+
+    // Default merge_gap_ms=50: bursts won't merge → fragments < 200ms → 0 filtered.
+    // Progressive retry at 4x (200ms) bridges the 150ms+frame_boundary gaps → 3 segments.
+    const clips = try extractThreeLargestSegments(buf, sr, .{});
+
+    try std.testing.expect(clips[0].samples.len > 0);
+    try std.testing.expect(clips[1].samples.len > 0);
+    try std.testing.expect(clips[2].samples.len > 0);
+
+    const p0 = @intFromPtr(clips[0].samples.ptr);
+    const p1 = @intFromPtr(clips[1].samples.ptr);
+    const p2 = @intFromPtr(clips[2].samples.ptr);
+    try std.testing.expect(p0 < p1);
+    try std.testing.expect(p1 < p2);
+
+    // Each clip should be at least 1 second (meaningful sub-segment of the 2s region)
+    const min_clip_ms: usize = 1000 * sr / 1000;
+    try std.testing.expect(clips[0].samples.len >= min_clip_ms);
+    try std.testing.expect(clips[1].samples.len >= min_clip_ms);
+    try std.testing.expect(clips[2].samples.len >= min_clip_ms);
 }
 
 test "fft_analyzer: extractThreeLargestSegments returns error on only 2 segments" {

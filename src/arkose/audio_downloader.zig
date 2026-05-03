@@ -587,6 +587,17 @@ fn looksLikeEncryptedJsonAudioPayload(bytes: []const u8) bool {
         mem.indexOf(u8, bytes, "\",\"s\":\"") != null;
 }
 
+fn looksLikeBase64Audio(bytes: []const u8) bool {
+    // CryptoJS output: base64-encoded MP3 starts with SUQz (which decodes to ID3)
+    // Check first 100 bytes are printable ASCII (base64 charset)
+    if (bytes.len < 100) return false;
+    for (bytes[0..100]) |b| {
+        if (b < 32 or b >= 127) return false;
+    }
+    // Must start with base64 characters
+    return std.ascii.isAlphanumeric(bytes[0]) or bytes[0] == '+' or bytes[0] == '/';
+}
+
 pub fn fetchAudioViaCdpEvaluate(
     cdp: *browser_bridge.CdpClient,
     allocator: std.mem.Allocator,
@@ -636,7 +647,7 @@ pub fn fetchAudioViaCdpEvaluate(
         return error.Base64DecodeFailed;
     };
 
-    // Handle both encrypted and unencrypted responses
+    // Handle both encrypted JSON and base64-encoded (SUQz) formats
     var mp3_data: []u8 = undefined;
     if (looksLikeEncryptedJsonAudioPayload(raw_data)) {
         // Encrypted mode: need decryption_key from ekey endpoint
@@ -684,7 +695,39 @@ pub fn fetchAudioViaCdpEvaluate(
             return error.EncryptedJsonAudioPayload;
         };
         allocator.free(raw_data);
-        std.debug.print("[AUDIO] Decrypted: {d} bytes\n", .{mp3_data.len});
+        std.debug.print("[AUDIO] Decrypted {d} bytes, checking if needs base64 decode...\n", .{mp3_data.len});
+
+        // CryptoJS decrypt outputs base64-encoded MP3 (SUQz format) — decode once more
+        if (looksLikeBase64Audio(mp3_data)) {
+            const b64_decoded_len = decoder.calcSizeForSlice(mp3_data) catch {
+                return error.Base64DecodeFailed;
+            };
+            const b64_decoded = try allocator.alloc(u8, b64_decoded_len);
+            decoder.decode(b64_decoded, mp3_data) catch {
+                allocator.free(b64_decoded);
+                return error.Base64DecodeFailed;
+            };
+            allocator.free(mp3_data);
+            mp3_data = b64_decoded;
+            std.debug.print("[AUDIO] Base64 decoded after decrypt: {d} bytes\n", .{mp3_data.len});
+        }
+    } else if (looksLikeBase64Audio(raw_data)) {
+        // CryptoJS decrypt output is base64-encoded MP3 (SUQz format)
+        std.debug.print("[AUDIO] Audio is base64-encoded (SUQz/CryptoJS format), decoding...\n", .{});
+        const decoded_mp3_len = decoder.calcSizeForSlice(raw_data) catch |err| {
+            std.debug.print("[AUDIO] Base64 calcSizeForSlice for SUQz format failed: {}\n", .{err});
+            allocator.free(raw_data);
+            return error.Base64DecodeFailed;
+        };
+        mp3_data = try allocator.alloc(u8, decoded_mp3_len);
+        decoder.decode(mp3_data, raw_data) catch |err| {
+            std.debug.print("[AUDIO] Base64 decode for SUQz format failed: {}\n", .{err});
+            allocator.free(mp3_data);
+            allocator.free(raw_data);
+            return error.Base64DecodeFailed;
+        };
+        allocator.free(raw_data);
+        std.debug.print("[AUDIO] Base64 decoded: {d} bytes\n", .{mp3_data.len});
     } else {
         mp3_data = raw_data;
     }
