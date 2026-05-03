@@ -567,6 +567,31 @@ pub const CdpClient = struct {
         return self.sendCommand("Runtime.evaluate", params);
     }
 
+    // SOURCE: CDP Input.dispatchMouseEvent — generates isTrusted=true events at browser input layer
+    pub fn dispatchMouseClickAt(self: *CdpClient, x: f64, y: f64) !void {
+        // SOURCE: CDP spec — Input.dispatchMouseEvent with type=mousePressed, button=left, clickCount=1
+        var press_buf: [MAX_CDP_BUF]u8 = undefined;
+        const press_params = std.fmt.bufPrint(
+            &press_buf,
+            "{{\"type\":\"mousePressed\",\"x\":{d:.1},\"y\":{d:.1},\"button\":\"left\",\"clickCount\":1}}",
+            .{ x, y },
+        ) catch return error.OutOfMemory;
+        const press_resp = try self.sendCommand("Input.dispatchMouseEvent", press_params);
+        self.allocator.free(press_resp);
+
+        // SOURCE: CDP spec — Input.dispatchMouseEvent with type=mouseReleased completes the click
+        var release_buf: [MAX_CDP_BUF]u8 = undefined;
+        const release_params = std.fmt.bufPrint(
+            &release_buf,
+            "{{\"type\":\"mouseReleased\",\"x\":{d:.1},\"y\":{d:.1},\"button\":\"left\",\"clickCount\":1}}",
+            .{ x, y },
+        ) catch return error.OutOfMemory;
+        const release_resp = try self.sendCommand("Input.dispatchMouseEvent", release_params);
+        self.allocator.free(release_resp);
+
+        std.debug.print("[CDP] Input.dispatchMouseEvent click at ({d:.1}, {d:.1})\n", .{ x, y });
+    }
+
     pub fn drainPendingEvents(self: *CdpClient) void {
         for (self.pending_events.items) |event| {
             self.allocator.free(event);

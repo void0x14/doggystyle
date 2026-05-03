@@ -278,7 +278,10 @@ fn semanticLabelFromProbeText(text: []const u8) fft_analyzer.SemanticLabel {
 
 fn segmentConfigForLabel(label: fft_analyzer.SemanticLabel) fft_analyzer.MultiSegmentConfig {
     var config = fft_analyzer.MultiSegmentConfig{};
-    if (label == .speech) {
+    if (label == .speech or label == .bee) {
+        // SOURCE: Live 2026-05-03 — bee sound is narrowband steady-state; centroid filter
+        // fragments it into 200-400ms shards instead of full 2-5s animal clips.
+        // Bee buzz has similar spectral centroid to human speech (~500-1500Hz).
         config.speech_centroid_cutoff_hz = 0.0;
     } else if (label == .different) {
         // SOURCE: live odd-animal runs 2026-05-01 — merge_gap 50ms over-fragmented
@@ -1101,113 +1104,107 @@ pub fn runAudioBypass(
             audio_mode_activated = audio_clicked;
         }
 
-        // Step 1-3: Download MP3 via CDP evaluate fetch (always works, cookies handled)
-        var dl_result: audio_downloader.FetchResult = undefined;
-        dl_result = audio_downloader.fetchAudioViaCdpEvaluate(
-            &arkose_cdp,
-            allocator,
-            challenge_index,
-            game_core_session_token orelse "",
-            game_core_game_token orelse "",
-        ) catch |err| {
-            std.debug.print("[AUDIO BYPASS] Attempt {d}: fetchAudioViaCdpEvaluate failed: {}\n", .{ total_attempted, err });
-            if (total_attempted == 0) return err;
-            std.debug.print("[AUDIO BYPASS] Skipping to next attempt...\n", .{});
-            continue;
-        };
-        const result = dl_result;
-        defer {
-            allocator.free(result.url);
-            allocator.free(result.path);
-            allocator.free(result.data);
-        }
-
-        // Step 4: Probe metadata
-        const meta = audio_decoder.probeAudioMetadata(allocator, io, result.path) catch |err| {
-            std.debug.print("[AUDIO BYPASS] Attempt {d}: probeAudioMetadata failed: {}\n", .{ total_attempted, err });
-            continue;
-        };
-        std.debug.print("[AUDIO BYPASS] Metadata: {d}Hz, {d}ch, {d}bit, {d:.2}s, {s}\n", .{
-            meta.sample_rate, meta.channels, meta.bit_depth, meta.duration_seconds, meta.format,
-        });
-
-        // Step 5: Convert to PCM f32le
-        const decoded = audio_decoder.convertToPcmF32(allocator, io, result.path, meta.sample_rate) catch |err| {
-            std.debug.print("[AUDIO BYPASS] Attempt {d}: convertToPcmF32 failed: {}\n", .{ total_attempted, err });
-            continue;
-        };
-        defer allocator.free(decoded.samples);
-        std.debug.print("[AUDIO BYPASS] Decoded: {d} f32 samples ({d:.2}s)\n", .{ decoded.total_samples, meta.duration_seconds });
-
-        // Step 5b: Save raw f32 PCM to disk alongside the MP3
-        const dot_pos = std.mem.lastIndexOf(u8, result.path, ".mp3") orelse result.path.len;
-        const f32_path = try std.fmt.allocPrint(allocator, "{s}.f32", .{result.path[0..dot_pos]});
-        defer allocator.free(f32_path);
-        audio_decoder.saveF32ToFile(allocator, io, decoded.samples, f32_path) catch |err| {
-            std.debug.print("[AUDIO BYPASS] Attempt {d}: saveF32ToFile failed: {}\n", .{ total_attempted, err });
-        };
-        std.debug.print("[AUDIO BYPASS] Saved f32 PCM: {s}\n", .{f32_path});
-
-        // Step 6: Peak normalize
-        const normalized = audio_decoder.peakNormalize(allocator, decoded.samples) catch |err| {
-            std.debug.print("[AUDIO BYPASS] Attempt {d}: peakNormalize failed: {}\n", .{ total_attempted, err });
-            continue;
-        };
-        defer allocator.free(normalized.normalized);
-        std.debug.print("[AUDIO BYPASS] Normalized: scale={d:.4}\n", .{normalized.scale});
-
-        const audio_fingerprint = coarseAudioFingerprint(normalized.normalized, meta.sample_rate);
-
-        // Step 7: Energy-based segment extraction — replaces BROKEN equal-thirds split.
-        //
-        // SOURCE: 45-file forensic analysis 2026-05-01
-        // PROVEN BROKEN: samples.len/3 split hit inside an active segment in 91.1% of files.
-        //   Klip[1] was: 100% announcer + 18% animal1 (centroid=0Hz — useless for analysis)
-        //   Klip[2] was: 82% animal1 + 49% animal2 (two different animals mixed)
-        //   Klip[3] was: 51% animal2 + 100% animal3 (again mixed)
-        //
-        // FIXED: extractThreeLargestSegments finds all energy segments, selects the 3
-        // longest by duration (which are always the 3 animal clips, not the announcer),
-        // and returns them sorted by playback position.
-        // Validated against all 45 Arkose audio files in tmp/ directory.
-        const seg_config = segmentConfigForLabel(semantic_label);
-        const clips = fft_analyzer.extractThreeLargestSegmentsForLabel(
-            normalized.normalized,
-            meta.sample_rate,
-            seg_config,
-            semantic_label,
-        ) catch |err| {
-            std.debug.print("[AUDIO BYPASS] Attempt {d}: extractThreeLargestSegments failed ({}) — audio has insufficient active segments\n", .{ total_attempted, err });
-            continue;
-        };
-        std.debug.print("[AUDIO BYPASS] Segments: clip1={d}ms clip2={d}ms clip3={d}ms\n", .{
-            clips[0].samples.len * 1000 / clips[0].sample_rate,
-            clips[1].samples.len * 1000 / clips[1].sample_rate,
-            clips[2].samples.len * 1000 / clips[2].sample_rate,
-        });
-        const outlier_config = fft_analyzer.OutlierConfig{
-            .vad = .{},
-            .optional_bit_depth = if (meta.bit_depth == 0) null else meta.bit_depth,
-        };
-
         var answer: u8 = undefined;
-        if (retry_answer_state.challenge_index == challenge_index and retry_answer_state.audio_fingerprint == audio_fingerprint and retry_answer_state.semantic_label == semantic_label) {
+        // SOURCE: Retry detection — same challenge_index with existing state = retry after wrong answer.
+        // Arkose does NOT advance to next challenge when answer is wrong, so same challenge_index
+        // with a non-zero tried_mask means we're re-attempting the same audio.
+        // No fingerprint comparison needed — DOM probe confirmed same question text.
+        const is_retry = retry_answer_state.tried_mask != 0 and retry_answer_state.challenge_index == challenge_index;
+
+        if (is_retry) {
+            // Retry path: skip audio download, try next untried answer
             if (chooseNextAnswerFromMask(retry_answer_state.tried_mask)) |retry_answer| {
                 answer = retry_answer;
                 retry_answer_state.tried_mask = markTriedAnswer(retry_answer_state.tried_mask, answer);
                 last_guess = answer - 1;
                 std.debug.print("[AUDIO BYPASS] Reusing same audio after wrong answer; trying alternate answer {d}\n", .{answer});
             } else {
-                std.debug.print("[AUDIO BYPASS] All answers exhausted for repeated audio fingerprint=0x{x}; waiting for next challenge audio\n", .{audio_fingerprint});
+                std.debug.print("[AUDIO BYPASS] All answers exhausted; waiting for next challenge audio\n", .{});
                 continue;
             }
         } else {
+            // Step 1-3: Download MP3 via CDP evaluate fetch
+            var dl_result: audio_downloader.FetchResult = undefined;
+            dl_result = audio_downloader.fetchAudioViaCdpEvaluate(
+                &arkose_cdp,
+                allocator,
+                challenge_index,
+                game_core_session_token orelse "",
+                game_core_game_token orelse "",
+            ) catch |err| {
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: fetchAudioViaCdpEvaluate failed: {}\n", .{ total_attempted, err });
+                if (total_attempted == 0) return err;
+                std.debug.print("[AUDIO BYPASS] Skipping to next attempt...\n", .{});
+                continue;
+            };
+            const result = dl_result;
+            defer {
+                allocator.free(result.url);
+                allocator.free(result.path);
+                allocator.free(result.data);
+            }
+
+            // Step 4: Probe metadata
+            const meta = audio_decoder.probeAudioMetadata(allocator, io, result.path) catch |err| {
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: probeAudioMetadata failed: {}\n", .{ total_attempted, err });
+                continue;
+            };
+            std.debug.print("[AUDIO BYPASS] Metadata: {d}Hz, {d}ch, {d}bit, {d:.2}s, {s}\n", .{
+                meta.sample_rate, meta.channels, meta.bit_depth, meta.duration_seconds, meta.format,
+            });
+
+            // Step 5: Convert to PCM f32le
+            const decoded = audio_decoder.convertToPcmF32(allocator, io, result.path, meta.sample_rate) catch |err| {
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: convertToPcmF32 failed: {}\n", .{ total_attempted, err });
+                continue;
+            };
+            defer allocator.free(decoded.samples);
+            std.debug.print("[AUDIO BYPASS] Decoded: {d} f32 samples ({d:.2}s)\n", .{ decoded.total_samples, meta.duration_seconds });
+
+            // Step 5b: Save raw f32 PCM to disk alongside the MP3
+            const dot_pos = std.mem.lastIndexOf(u8, result.path, ".mp3") orelse result.path.len;
+            const f32_path = try std.fmt.allocPrint(allocator, "{s}.f32", .{result.path[0..dot_pos]});
+            defer allocator.free(f32_path);
+            audio_decoder.saveF32ToFile(allocator, io, decoded.samples, f32_path) catch |err| {
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: saveF32ToFile failed: {}\n", .{ total_attempted, err });
+            };
+            std.debug.print("[AUDIO BYPASS] Saved f32 PCM: {s}\n", .{f32_path});
+
+            // Step 6: Peak normalize
+            const normalized = audio_decoder.peakNormalize(allocator, decoded.samples) catch |err| {
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: peakNormalize failed: {}\n", .{ total_attempted, err });
+                continue;
+            };
+            defer allocator.free(normalized.normalized);
+            std.debug.print("[AUDIO BYPASS] Normalized: scale={d:.4}\n", .{normalized.scale});
+
+            // Step 7: Energy-based segment extraction
+            const seg_config = segmentConfigForLabel(semantic_label);
+            const clips = fft_analyzer.extractThreeLargestSegmentsForLabel(
+                normalized.normalized,
+                meta.sample_rate,
+                seg_config,
+                semantic_label,
+            ) catch |err| {
+                std.debug.print("[AUDIO BYPASS] Attempt {d}: extractThreeLargestSegments failed ({}) — audio has insufficient active segments\n", .{ total_attempted, err });
+                continue;
+            };
+            std.debug.print("[AUDIO BYPASS] Segments: clip1={d}ms clip2={d}ms clip3={d}ms\n", .{
+                clips[0].samples.len * 1000 / clips[0].sample_rate,
+                clips[1].samples.len * 1000 / clips[1].sample_rate,
+                clips[2].samples.len * 1000 / clips[2].sample_rate,
+            });
+            const outlier_config = fft_analyzer.OutlierConfig{
+                .vad = .{},
+                .optional_bit_depth = if (meta.bit_depth == 0) null else meta.bit_depth,
+            };
+
             const outlier_result_or_error = fft_analyzer.analyzeOutlier(&clips, semantic_label, outlier_config);
             if (outlier_result_or_error) |outlier_result| {
                 answer = outlierAnswerFromResult(outlier_result);
                 retry_answer_state = .{
                     .challenge_index = challenge_index,
-                    .audio_fingerprint = audio_fingerprint,
+                    .audio_fingerprint = coarseAudioFingerprint(normalized.normalized, meta.sample_rate),
                     .tried_mask = markTriedAnswer(0, answer),
                     .semantic_label = semantic_label,
                 };

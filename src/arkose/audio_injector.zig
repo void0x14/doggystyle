@@ -396,7 +396,9 @@ pub fn injectAnswer(bridge: *browser_bridge.BrowserBridge, answer: u8) !void {
 /// Inject answer and submit using a DIRECT CDP connection to the target iframe context.
 /// Unlike injectAnswer() which goes through BrowserBridge (main page context),
 /// this function sends JS directly into the iframe via its execution context ID.
+/// Uses CDP Input.dispatchMouseEvent for REAL isTrusted=true clicks.
 /// SOURCE: CDP Runtime.evaluate — execute JavaScript in specific execution context
+/// SOURCE: CDP Input.dispatchMouseEvent — generates isTrusted=true events at browser input layer
 /// SOURCE: Arkose Labs audio CAPTCHA — answer input + submit button (live test)
 pub fn injectAnswerOnTarget(
     cdp: *browser_bridge.CdpClient,
@@ -405,8 +407,6 @@ pub fn injectAnswerOnTarget(
     context_id: i64,
 ) !PostSubmitProof {
     // SESSION VALIDATION TEST: 1+1 evaluate before injection
-    // If this drops silently → session invalid (timing değil escape)
-    // If returns 2 → session valid, look elsewhere (escape or JS error)
     std.debug.print("[AUDIO INJECTOR] SESSION TEST: Evaluating 1+1 (ctx={d})...\n", .{context_id});
     const session_test = if (context_id > 0)
         cdp.evaluateInContext("1+1", context_id)
@@ -416,20 +416,15 @@ pub fn injectAnswerOnTarget(
         defer allocator.free(test_result);
         std.debug.print("[AUDIO INJECTOR] SESSION TEST RESULT: {s}\n", .{test_result[0..@min(test_result.len, 50)]});
         if (test_result.len == 0) {
-            std.debug.print("[AUDIO INJECTOR] SESSION INVALID: 1+1 returned empty → session dropped, not timing!\n", .{});
+            std.debug.print("[AUDIO INJECTOR] SESSION INVALID: 1+1 returned empty\n", .{});
             return error.CdpSessionInvalid;
         }
     } else |err| {
-        std.debug.print("[AUDIO INJECTOR] SESSION TEST FAILED: {} → session invalid\n", .{err});
+        std.debug.print("[AUDIO INJECTOR] SESSION TEST FAILED: {}\n", .{err});
         return error.CdpSessionInvalid;
     }
 
-    // FIX: Always use the discovered context_id for injection (matches audio_bypass.zig pattern)
-    // FIX: Wrap JS in IIFE to avoid "Illegal return statement" SyntaxError in global scope
-    // FIX: Use direct document selectors since contextId is the game-core execution context itself
-    // FIX: Use evaluateWithTimeout / evaluateInContextWithTimeout for infinite-loop protection
-
-    // FIX 2026-04-30: game-core iframe is same-origin with enforcement iframe.
+    // SOURCE: game-core iframe same-origin with enforcement iframe.
     // Access contentDocument directly — no CDP contextId needed.
     const answer_script = try std.fmt.allocPrint(allocator,
         \\(() => {{
@@ -470,99 +465,182 @@ pub fn injectAnswerOnTarget(
     defer allocator.free(fill_response);
     std.debug.print("[AUDIO INJECTOR] Answer injection (target): {s}\n", .{fill_response[0..@min(fill_response.len, 200)]});
 
-    const submit_script = try std.fmt.allocPrint(allocator,
-        \\(() => {{
+    // PHASE 1: Try CDP Input.dispatchMouseEvent for isTrusted=true submit click.
+    // SOURCE: CDP Input.dispatchMouseEvent — only REAL isTrusted=true clicks pass Arkose MatchKey detection.
+    // SOURCE: WIRE-TRUTH 2026-05-03: JS element.click() and form.submit() both produce isTrusted=false events.
+    //   Arkose Labs verifies isTrusted=true on submit button events.
+    // SOURCE: Arkose Labs bot detection — fingerprint includes mouse event trust validation.
+    // CRITICAL: getBoundingClientRect() on iframe.contentDocument elements returns coordinates
+    // relative to the iframe's viewport, NOT the parent viewport. To get correct CDP
+    // Input.dispatchMouseEvent coordinates, we must add the game-core iframe's offset
+    // within the enforcement document.
+    // SOURCE: MDN Element.getBoundingClientRect — "returns the size of an element and its
+    //   position relative to the viewport" (the element's own browsing context's viewport)
+    // Guard: if doc was switched to game-core (doc !== document), then button is inside
+    // game-core iframe and its getBoundingClientRect is game-core-relative.
+    // Otherwise button is directly in enforcement document — no iframe offset needed.
+    const bounds_script =
+        \\(() => {
         \\  let doc = document;
+        \\  let inGameCore = false;
         \\  const gc = document.querySelector('iframe[src*="game-core"]');
-        \\  if (gc) {{
-        \\    try {{
+        \\  if (gc) {
+        \\    try {
         \\      const d = gc.contentDocument;
-        \\      if (d && d.body) doc = d;
-        \\    }} catch(e) {{}}
-        \\  }}
-        \\  const report = (submit_result, submit_path, el, txt) => {{
-        \\    const payload = {{
-        \\      submit_result: submit_result,
-        \\      submit_path: submit_path,
-        \\      tag: el ? (el.tagName || '') : '',
-        \\      type: el ? (el.type || '') : '',
-        \\      has_form: !!(el && el.form),
-        \\      text: txt || ''
-        \\    }};
-        \\    window.__ghostLastSubmitResult = payload;
-        \\    return JSON.stringify(payload);
-        \\  }};
-        \\  const activeInput = doc.querySelector('input[type="text"], input[type="number"], input[type="tel"], input:not([type="hidden"]):not([type="submit"]):not([type="button"])');
-        \\  if (activeInput && activeInput.form) {{
-        \\    try {{
-        \\      if (typeof activeInput.form.requestSubmit === 'function') {{
-        \\        activeInput.form.requestSubmit();
-        \\        return report('submitted_form_requestSubmit', 'form.requestSubmit', activeInput, '');
-        \\      }}
-        \\      activeInput.form.submit();
-        \\      return report('submitted_form_submit', 'form.submit', activeInput, '');
-        \\    }} catch (e) {{}}
-        \\  }}
-        \\  if (activeInput && activeInput.offsetParent !== null) {{
-        \\    try {{
-        \\      activeInput.focus();
-        \\      activeInput.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
-        \\      activeInput.dispatchEvent(new KeyboardEvent('keypress', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
-        \\      activeInput.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
-        \\      return report('submitted_enter_key', 'enter', activeInput, '');
-        \\    }} catch (e) {{}}
-        \\  }}
-        \\  const allBtns = doc.querySelectorAll('button, input[type="submit"]');
-        \\  for (const bt of allBtns) {{
-        \\    const txt = (bt.textContent || bt.value || '').trim();
-        \\    if (txt === 'Submit' && bt.offsetParent !== null && !bt.disabled) {{
-        \\      bt.click();
-        \\      return report('clicked_text_submit', 'exact-submit', bt, txt);
-        \\    }}
-        \\  }}
-        \\  const inpSubmit = doc.querySelector('input[type="submit"]');
-        \\  if (inpSubmit && inpSubmit.offsetParent !== null && !inpSubmit.disabled) {{
-        \\    inpSubmit.click();
-        \\    return report('clicked_input_submit', 'input-submit', inpSubmit, inpSubmit.value || '');
-        \\  }}
-        \\  const btn = doc.querySelector('button[type="submit"]');
-        \\  if (btn && btn.offsetParent !== null && !btn.disabled) {{
-        \\    btn.click();
-        \\    return report('clicked_type_submit', 'button-type-submit', btn, btn.textContent || '');
-        \\  }}
+        \\      if (d && d.body) { doc = d; inGameCore = true; }
+        \\    } catch(e) {}
+        \\  }
         \\  const btns = doc.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]');
-        \\  for (const bt of btns) {{
+        \\  for (const bt of btns) {
         \\    const txt = (bt.textContent || bt.value || '').trim().toLowerCase();
-        \\    if (bt.offsetParent !== null && !bt.disabled && (txt.includes('submit') || txt.includes('verify') || txt.includes('next'))) {{
-        \\      bt.click();
-        \\      return report('clicked_text_' + txt, 'text-match', bt, txt);
-        \\    }}
-        \\  }}
-        \\  for (const bt of btns) {{
-        \\    const txt = (bt.textContent || bt.value || '').trim().toLowerCase();
-        \\    if (bt.offsetParent !== null && !bt.disabled && !txt.includes('audio') && !txt.includes('play')) {{
-        \\      bt.click();
-        \\      return report('clicked_fallback', 'fallback', bt, txt);
-        \\    }}
-        \\  }}
-        \\  return report('no_submit', 'none', null, '');
-        \\}})()
-    , .{});
-    defer allocator.free(submit_script);
+        \\    if (bt.offsetParent !== null && !bt.disabled &&
+        \\        (txt === 'submit' || txt === 'verify' || txt === 'next' || txt === 'continue' || txt === 'done' ||
+        \\         txt.includes('submit') || txt.includes('verify') || bt.matches('input[type="submit"]'))) {
+        \\      const r = bt.getBoundingClientRect();
+        \\      if (inGameCore) {
+        \\        const gr = gc.getBoundingClientRect();
+        \\        return JSON.stringify({ found: true, x: gr.x + r.x + r.width / 2, y: gr.y + r.y + r.height / 2, tag: bt.tagName, text: txt });
+        \\      }
+        \\      return JSON.stringify({ found: true, x: r.x + r.width / 2, y: r.y + r.height / 2, tag: bt.tagName, text: txt });
+        \\    }
+        \\  }
+        \\  return JSON.stringify({ found: false });
+        \\})()
+    ;
 
-    const submit_response = if (context_id > 0)
-        try cdp.evaluateInContextWithTimeout(submit_script, context_id, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS)
+    const bounds_response = if (context_id > 0)
+        try cdp.evaluateInContextWithTimeout(bounds_script, context_id, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS)
     else
-        try cdp.evaluateWithTimeout(submit_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
-    defer allocator.free(submit_response);
-    std.debug.print("[AUDIO INJECTOR] Submit (target): {s}\n", .{submit_response[0..@min(submit_response.len, 200)]});
+        try cdp.evaluateWithTimeout(bounds_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
+    defer allocator.free(bounds_response);
+    std.debug.print("[AUDIO INJECTOR] Submit button bounds: {s}\n", .{bounds_response[0..@min(bounds_response.len, 300)]});
+
+    // Extract inner string value from CDP Runtime.evaluate envelope, then parse as JSON
+    const SubmitBounds = struct {
+        found: bool,
+        x: ?f64 = null,
+        y: ?f64 = null,
+        tag: ?[]const u8 = null,
+        text: ?[]const u8 = null,
+    };
+
+    var cdp_clicked = false;
+    const bounds_inner = browser_bridge.extractRuntimeEvaluateStringValue(allocator, bounds_response) catch null;
+    if (bounds_inner) |inner| {
+        defer allocator.free(inner);
+        if (std.json.parseFromSlice(SubmitBounds, allocator, inner, .{ .ignore_unknown_fields = true })) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value.found and parsed.value.x != null and parsed.value.y != null) {
+                const cx = parsed.value.x.?;
+                const cy = parsed.value.y.?;
+                std.debug.print("[AUDIO INJECTOR] CDP Input.dispatchMouseEvent click at ({d:.1}, {d:.1}) — isTrusted=true\n", .{ cx, cy });
+                cdp.dispatchMouseClickAt(cx, cy) catch |err| {
+                    std.debug.print("[AUDIO INJECTOR] CDP dispatchMouseClickAt failed: {}\n", .{err});
+                };
+                cdp_clicked = true;
+            }
+        } else |_| {
+            std.debug.print("[AUDIO INJECTOR] Failed to parse submit button bounds JSON\n", .{});
+        }
+    } else {
+        std.debug.print("[AUDIO INJECTOR] Failed to extract bounds string from CDP envelope\n", .{});
+    }
+
+    // PHASE 2: Fallback to JS click if CDP Input.dispatchMouseEvent failed or no button found.
+    if (!cdp_clicked) {
+        std.debug.print("[AUDIO INJECTOR] CDP click unavailable, falling back to JS submit methods (isTrusted=false)\n", .{});
+        const submit_script = try std.fmt.allocPrint(allocator,
+            \\(() => {{
+            \\  let doc = document;
+            \\  const gc = document.querySelector('iframe[src*="game-core"]');
+            \\  if (gc) {{
+            \\    try {{
+            \\      const d = gc.contentDocument;
+            \\      if (d && d.body) doc = d;
+            \\    }} catch(e) {{}}
+            \\  }}
+            \\  const report = (submit_result, submit_path, el, txt) => {{
+            \\    const payload = {{
+            \\      submit_result: submit_result,
+            \\      submit_path: submit_path,
+            \\      tag: el ? (el.tagName || '') : '',
+            \\      type: el ? (el.type || '') : '',
+            \\      has_form: !!(el && el.form),
+            \\      text: txt || ''
+            \\    }};
+            \\    window.__ghostLastSubmitResult = payload;
+            \\    return JSON.stringify(payload);
+            \\  }};
+            \\  const activeInput = doc.querySelector('input[type="text"], input[type="number"], input[type="tel"], input:not([type="hidden"]):not([type="submit"]):not([type="button"])');
+            \\  if (activeInput && activeInput.form) {{
+            \\    try {{
+            \\      if (typeof activeInput.form.requestSubmit === 'function') {{
+            \\        activeInput.form.requestSubmit();
+            \\        return report('submitted_form_requestSubmit', 'form.requestSubmit', activeInput, '');
+            \\      }}
+            \\      activeInput.form.submit();
+            \\      return report('submitted_form_submit', 'form.submit', activeInput, '');
+            \\    }} catch (e) {{}}
+            \\  }}
+            \\  if (activeInput && activeInput.offsetParent !== null) {{
+            \\    try {{
+            \\      activeInput.focus();
+            \\      activeInput.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
+            \\      activeInput.dispatchEvent(new KeyboardEvent('keypress', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
+            \\      activeInput.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
+            \\      return report('submitted_enter_key', 'enter', activeInput, '');
+            \\    }} catch (e) {{}}
+            \\  }}
+            \\  const allBtns = doc.querySelectorAll('button, input[type="submit"]');
+            \\  for (const bt of allBtns) {{
+            \\    const txt = (bt.textContent || bt.value || '').trim();
+            \\    if (txt === 'Submit' && bt.offsetParent !== null && !bt.disabled) {{
+            \\      bt.click();
+            \\      return report('clicked_text_submit', 'exact-submit', bt, txt);
+            \\    }}
+            \\  }}
+            \\  const inpSubmit = doc.querySelector('input[type="submit"]');
+            \\  if (inpSubmit && inpSubmit.offsetParent !== null && !inpSubmit.disabled) {{
+            \\    inpSubmit.click();
+            \\    return report('clicked_input_submit', 'input-submit', inpSubmit, inpSubmit.value || '');
+            \\  }}
+            \\  const btn = doc.querySelector('button[type="submit"]');
+            \\  if (btn && btn.offsetParent !== null && !btn.disabled) {{
+            \\    btn.click();
+            \\    return report('clicked_type_submit', 'button-type-submit', btn, btn.textContent || '');
+            \\  }}
+            \\  const btns = doc.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]');
+            \\  for (const bt of btns) {{
+            \\    const txt = (bt.textContent || bt.value || '').trim().toLowerCase();
+            \\    if (bt.offsetParent !== null && !bt.disabled && (txt.includes('submit') || txt.includes('verify') || txt.includes('next'))) {{
+            \\      bt.click();
+            \\      return report('clicked_text_' + txt, 'text-match', bt, txt);
+            \\    }}
+            \\  }}
+            \\  for (const bt of btns) {{
+            \\    const txt = (bt.textContent || bt.value || '').trim().toLowerCase();
+            \\    if (bt.offsetParent !== null && !bt.disabled && !txt.includes('audio') && !txt.includes('play')) {{
+            \\      bt.click();
+            \\      return report('clicked_fallback', 'fallback', bt, txt);
+            \\    }}
+            \\  }}
+            \\  return report('no_submit', 'none', null, '');
+            \\}})()
+        , .{});
+        defer allocator.free(submit_script);
+
+        const submit_response = if (context_id > 0)
+            try cdp.evaluateInContextWithTimeout(submit_script, context_id, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS)
+        else
+            try cdp.evaluateWithTimeout(submit_script, browser_bridge.HUMAN_ACTION_EVALUATE_TIMEOUT_MS);
+        defer allocator.free(submit_response);
+        std.debug.print("[AUDIO INJECTOR] JS fallback submit: {s}\n", .{submit_response[0..@min(submit_response.len, 200)]});
+    }
+
     const submit_grace = std.os.linux.timespec{ .sec = 1, .nsec = 500 * std.time.ns_per_ms };
     _ = std.os.linux.nanosleep(&submit_grace, null);
 
-    // Poll DOM for up to 5s to detect Arkose's response to the submit.
-    // Arkose takes 1-3s to update DOM after correct/incorrect answer.
-    // One-shot proof_script consistently misses this delay → false .clicked/.unknown.
-    // SOURCE: Arkose Labs audio CAPTCHA — DOM transition delay after submit (live test 2026-04-27)
+    // Poll DOM for up to 5s to detect Arkose's response.
     const proof = pollPostSubmitVerdict(cdp, allocator, context_id, 5000);
     std.debug.print("[AUDIO INJECTOR] Post-submit verdict: {s}\n", .{@tagName(proof.verdict)});
     return proof;

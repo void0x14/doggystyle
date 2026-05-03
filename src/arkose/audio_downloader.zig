@@ -670,28 +670,24 @@ pub fn fetchAudioViaCdpEvaluate(
 
         const ekey_resp = cdp.evaluateWithTimeout(ekey_js, 15000) catch |err| {
             std.debug.print("[AUDIO] ekey fetch failed: {}\n", .{err});
-            allocator.free(raw_data);
             return error.FetchFailed;
         };
         defer allocator.free(ekey_resp);
 
         const dkey = browser_bridge.extractRuntimeEvaluateStringValue(allocator, ekey_resp) catch |err| {
             std.debug.print("[AUDIO] ekey result extraction failed: {}\n", .{err});
-            allocator.free(raw_data);
             return error.FetchFailed;
         };
         defer allocator.free(dkey);
 
         if (mem.startsWith(u8, dkey, "ERROR:")) {
             std.debug.print("[AUDIO] ekey error: {s}\n", .{dkey});
-            allocator.free(raw_data);
             return error.EncryptedJsonAudioPayload;
         }
 
         std.debug.print("[AUDIO] Decrypting with key={s}\n", .{dkey});
         mp3_data = audio_decrypt.decryptArkoseAudio(allocator, raw_data, dkey) catch |err| {
             std.debug.print("[AUDIO] Decrypt failed: {}\n", .{err});
-            allocator.free(raw_data);
             return error.EncryptedJsonAudioPayload;
         };
         allocator.free(raw_data);
